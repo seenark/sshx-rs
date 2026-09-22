@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
@@ -14,9 +14,11 @@ pub struct SourceIdentity {
     pub line_end: usize,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Provenance {
     pub paths: Vec<String>,
+    pub scope: String,
+    pub project: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -26,12 +28,35 @@ pub struct HostEntry {
     pub source: SourceIdentity,
     pub destination: Option<String>,
     pub provenance: Vec<Provenance>,
+    pub scopes: Vec<String>,
+    pub projects: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Diagnostic {
     pub code: String,
     pub message: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct DiscoveryRoot {
+    pub path: PathBuf,
+    pub scope: String,
+    pub project: Option<String>,
+}
+
+impl DiscoveryRoot {
+    pub fn new(
+        path: impl Into<PathBuf>,
+        scope: impl Into<String>,
+        project: Option<String>,
+    ) -> Self {
+        Self {
+            path: path.into(),
+            scope: scope.into(),
+            project,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -104,24 +129,47 @@ struct State {
 }
 
 pub fn discover(root: &Path) -> Result<Catalog, DiscoveryError> {
-    let root = absolute_path(root)?;
-    if !root.is_file() {
-        return Err(DiscoveryError::new(format!(
-            "config root is not a file: {}",
-            root.display()
-        )));
-    }
-    let home_ssh = match std::env::var_os("HOME") {
-        Some(home) => absolute_path(&PathBuf::from(home).join(".ssh"))?,
-        None => root
-            .parent()
-            .unwrap_or_else(|| Path::new("/"))
-            .to_path_buf(),
+    let scope = if root.components().any(|component| {
+        component
+            .as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(".private-key")
+    }) {
+        "work"
+    } else {
+        "personal"
     };
+    discover_roots(&[DiscoveryRoot::new(root, scope, None)])
+}
 
+pub fn discover_roots(roots: &[DiscoveryRoot]) -> Result<Catalog, DiscoveryError> {
     let mut state = State::default();
-    let chain = vec![display_path(&root)];
-    visit_file(&root, &home_ssh, chain, &mut state)?;
+    for configured in roots {
+        let root = absolute_path(&configured.path)?;
+        if !root.is_file() {
+            return Err(DiscoveryError::new(format!(
+                "config root is not a file: {}",
+                root.display()
+            )));
+        }
+        let root_identity = fs::canonicalize(&root).map_err(|error| {
+            DiscoveryError::new(format!(
+                "cannot read config root {}: {error}",
+                root.display()
+            ))
+        })?;
+        let include_base = root.parent().unwrap_or_else(|| Path::new("/"));
+        let chain = vec![display_path(&root)];
+        visit_file(
+            &root_identity,
+            include_base,
+            &root_identity,
+            &configured.scope,
+            configured.project.as_deref(),
+            chain,
+            &mut state,
+        )?;
+    }
     Ok(Catalog {
         entries: state.entries,
         diagnostics: state.diagnostics,
@@ -131,6 +179,9 @@ pub fn discover(root: &Path) -> Result<Catalog, DiscoveryError> {
 fn visit_file(
     path: &Path,
     include_base: &Path,
+    root: &Path,
+    scope: &str,
+    configured_project: Option<&str>,
     chain: Vec<String>,
     state: &mut State,
 ) -> Result<(), DiscoveryError> {
@@ -162,13 +213,26 @@ fn visit_file(
             Item::Host(index) => {
                 let block = &file.hosts[*index];
                 let key = (identity.clone(), block.byte_start, block.byte_end);
+                let project = configured_project
+                    .map(str::to_owned)
+                    .or_else(|| derive_project(&identity, root));
                 let provenance = Provenance {
                     paths: chain.clone(),
+                    scope: scope.to_owned(),
+                    project: project.clone(),
                 };
                 if let Some(entry_index) = state.entry_indexes.get(&key).copied() {
                     let entry = &mut state.entries[entry_index];
                     if !entry.provenance.contains(&provenance) {
                         entry.provenance.push(provenance);
+                    }
+                    if !entry.scopes.iter().any(|value| value == scope) {
+                        entry.scopes.push(scope.to_owned());
+                    }
+                    if let Some(project) = project
+                        && !entry.projects.iter().any(|value| value == &project)
+                    {
+                        entry.projects.push(project);
                     }
                 } else {
                     let source = SourceIdentity {
@@ -184,6 +248,8 @@ fn visit_file(
                         source,
                         destination: block.destination.clone(),
                         provenance: vec![provenance],
+                        scopes: vec![scope.to_owned()],
+                        projects: project.into_iter().collect(),
                     };
                     state.entry_indexes.insert(key, state.entries.len());
                     state.entries.push(entry);
@@ -194,7 +260,15 @@ fn visit_file(
                     for child in expand_include(pattern, include_base) {
                         let mut child_chain = chain.clone();
                         child_chain.push(display_path(&child));
-                        visit_file(&child, include_base, child_chain, state)?;
+                        visit_file(
+                            &child,
+                            include_base,
+                            root,
+                            scope,
+                            configured_project,
+                            child_chain,
+                            state,
+                        )?;
                     }
                 }
             }
@@ -204,6 +278,16 @@ fn visit_file(
     state.active.pop();
     state.active_set.remove(&identity);
     Ok(())
+}
+fn derive_project(source: &Path, root: &Path) -> Option<String> {
+    let parent = source.parent()?;
+    let root_parent = root.parent()?;
+    if parent == root_parent {
+        return None;
+    }
+    parent
+        .file_name()
+        .map(|value| value.to_string_lossy().into_owned())
 }
 
 fn add_cycle_diagnostic(identity: &Path, state: &mut State) {

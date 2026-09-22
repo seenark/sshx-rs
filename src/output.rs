@@ -61,6 +61,10 @@ pub fn render_human(entries: &[&HostEntry]) -> String {
         }
         rendered.push_str(&format!("{}\n", entry.aliases.join(" ")));
         rendered.push_str(&format!("  id: {}\n", entry.id));
+        rendered.push_str(&format!("  scope: {}\n", entry.scopes.join(", ")));
+        if !entry.projects.is_empty() {
+            rendered.push_str(&format!("  project: {}\n", entry.projects.join(", ")));
+        }
         rendered.push_str(&format!("  source: {}\n", entry.source.path));
         rendered.push_str(&format!(
             "  lines: {}-{}\n",
@@ -74,6 +78,10 @@ pub fn render_human(entries: &[&HostEntry]) -> String {
         for provenance in &entry.provenance {
             rendered.push_str("    ");
             rendered.push_str(&provenance.paths.join(" -> "));
+            rendered.push_str(&format!(" [{}]", provenance.scope));
+            if let Some(project) = &provenance.project {
+                rendered.push_str(&format!(" ({project})"));
+            }
             rendered.push('\n');
         }
     }

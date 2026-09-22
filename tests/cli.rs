@@ -335,3 +335,218 @@ fn include_cycles_report_diagnostic_without_looping() {
 
     fs::remove_dir_all(root).expect("fixture should be removed");
 }
+
+#[test]
+fn setup_registers_existing_roots_and_filters_scope_and_project() {
+    let (root, home) = fixture_root();
+    let personal = home.join(".ssh/config");
+    let work = home.join(".private-key/private-key/config");
+    write(
+        &personal,
+        "Include projects/alpha/hosts.conf\nHost personal\n  HostName personal.example\n",
+    );
+    write(
+        &home.join(".ssh/projects/alpha/hosts.conf"),
+        "Host alpha\n  HostName alpha.example\n",
+    );
+    write(&work, "Host work\n  HostName work.example\n");
+
+    let setup = run(&home, &["setup", "--format", "json"]);
+    assert!(setup.status.success(), "{setup:?}");
+    let document: serde_json::Value =
+        serde_json::from_slice(&setup.stdout).expect("setup JSON should parse");
+    let roots = document["roots"]
+        .as_array()
+        .expect("roots should be an array");
+    assert_eq!(roots.len(), 2);
+    assert!(roots.iter().any(|root| root["scope"] == "personal"));
+    assert!(roots.iter().any(|root| root["scope"] == "work"));
+    assert!(!home.join(".private-key/config").exists());
+
+    let work_list = run(
+        &home,
+        &["host", "list", "--scope", "work", "--format", "json"],
+    );
+    assert!(work_list.status.success(), "{work_list:?}");
+    let work_document: serde_json::Value =
+        serde_json::from_slice(&work_list.stdout).expect("work JSON should parse");
+    assert_eq!(work_document["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        work_document["entries"][0]["scopes"],
+        serde_json::json!(["work"])
+    );
+
+    let project_list = run(
+        &home,
+        &["host", "list", "--project", "alpha", "--format", "json"],
+    );
+    assert!(project_list.status.success(), "{project_list:?}");
+    let project_document: serde_json::Value =
+        serde_json::from_slice(&project_list.stdout).expect("project JSON should parse");
+    assert_eq!(project_document["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        project_document["entries"][0]["projects"],
+        serde_json::json!(["alpha"])
+    );
+
+    fs::remove_dir_all(root).expect("fixture should be removed");
+}
+
+#[test]
+fn connect_requires_host_without_input_and_selects_exact_entries() {
+    let (root, home) = fixture_root();
+    let ssh = home.join(".ssh");
+    write(&ssh.join("config"), "Include one.conf two.conf\n");
+    write(
+        &ssh.join("one.conf"),
+        "Host copied\n  HostName one.example\nHost unique\n  HostName unique.example\n",
+    );
+    write(
+        &ssh.join("two.conf"),
+        "Host copied\n  HostName two.example\n",
+    );
+
+    let missing = run(&home, &["connect", "--no-input"]);
+    assert_eq!(missing.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("HOST_REQUIRED"));
+
+    let ambiguous = run(&home, &["connect", "copied", "--no-input"]);
+    assert_eq!(ambiguous.status.code(), Some(2));
+    let ambiguous_error = String::from_utf8_lossy(&ambiguous.stderr);
+    assert!(ambiguous_error.contains("HOST_AMBIGUOUS"));
+    assert!(ambiguous_error.contains("one.conf"));
+    assert!(ambiguous_error.contains("two.conf"));
+
+    let unique = run(
+        &home,
+        &["connect", "unique", "--no-input", "--format", "json"],
+    );
+    assert!(unique.status.success(), "{unique:?}");
+    let unique_document: serde_json::Value =
+        serde_json::from_slice(&unique.stdout).expect("unique JSON should parse");
+    assert_eq!(unique_document["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        unique_document["entries"][0]["aliases"],
+        serde_json::json!(["unique"])
+    );
+
+    let list = run(&home, &["host", "list", "--format", "json"]);
+    assert!(list.status.success(), "{list:?}");
+    let list_document: serde_json::Value =
+        serde_json::from_slice(&list.stdout).expect("list JSON should parse");
+    let exact = list_document["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| {
+            entry["source"]["path"]
+                .as_str()
+                .unwrap()
+                .ends_with("one.conf")
+        })
+        .expect("one.conf entry should exist");
+    let id = exact["id"].as_str().unwrap();
+    let source = exact["source"]["path"].as_str().unwrap();
+    let line = exact["source"]["line_start"].as_u64().unwrap().to_string();
+
+    let by_id = run(
+        &home,
+        &["connect", "--id", id, "--no-input", "--format", "json"],
+    );
+    assert!(by_id.status.success(), "{by_id:?}");
+    let by_id_document: serde_json::Value =
+        serde_json::from_slice(&by_id.stdout).expect("ID JSON should parse");
+    assert_eq!(by_id_document["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(by_id_document["entries"][0]["id"], id);
+
+    let by_location = run(
+        &home,
+        &[
+            "connect",
+            "copied",
+            "--source",
+            source,
+            "--line",
+            &line,
+            "--no-input",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(by_location.status.success(), "{by_location:?}");
+
+    let partial = run(
+        &home,
+        &["connect", "copied", "--source", source, "--no-input"],
+    );
+    assert_eq!(partial.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&partial.stderr).contains("SELECTOR_INCOMPLETE"));
+
+    let mismatch = run(
+        &home,
+        &[
+            "connect",
+            "copied",
+            "--source",
+            ssh.join("two.conf").to_str().unwrap(),
+            "--line",
+            &line,
+            "--no-input",
+        ],
+    );
+    assert_eq!(mismatch.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&mismatch.stderr).contains("HOST_MISMATCH"));
+
+    fs::remove_dir_all(root).expect("fixture should be removed");
+}
+
+#[test]
+fn shared_entry_keeps_personal_and_work_provenance() {
+    let (root, home) = fixture_root();
+    let personal = home.join(".ssh/config");
+    let work = home.join(".private-key/private-key/config");
+    let shared = root.join("shared.conf");
+    write(
+        &personal,
+        &format!("Include {}\n", shared.to_str().unwrap()),
+    );
+    write(&work, &format!("Include {}\n", shared.to_str().unwrap()));
+    write(&shared, "Host shared\n  HostName shared.example\n");
+
+    let setup = run(
+        &home,
+        &[
+            "setup",
+            "--personal",
+            personal.to_str().unwrap(),
+            "--work",
+            work.to_str().unwrap(),
+            "--format",
+            "json",
+        ],
+    );
+    assert!(setup.status.success(), "{setup:?}");
+
+    let list = run(&home, &["host", "list", "--format", "json"]);
+    assert!(list.status.success(), "{list:?}");
+    let document: serde_json::Value =
+        serde_json::from_slice(&list.stdout).expect("list JSON should parse");
+    let entries = document["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0]["scopes"],
+        serde_json::json!(["personal", "work"])
+    );
+    assert_eq!(entries[0]["provenance"].as_array().unwrap().len(), 2);
+
+    fs::remove_dir_all(root).expect("fixture should be removed");
+}
+
+#[test]
+fn no_input_missing_host_fails_before_config_discovery() {
+    let (root, home) = fixture_root();
+    let output = run(&home, &["connect", "--no-input"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("HOST_REQUIRED"));
+    fs::remove_dir_all(root).expect("fixture should be removed");
+}

@@ -4,7 +4,7 @@
 
 **Blocked by:** 02: Discover and display exact HostEntries.
 
-**Status:** ready-for-agent
+**Status:** claimed
 
 - [ ] Setup registers existing roots without moving files or creating the missing legacy work-root spelling.
 - [ ] The current environment can register the combined root and the discovered work root under `~/.private-key/private-key/config`.

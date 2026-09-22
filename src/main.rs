@@ -1,12 +1,16 @@
-use sshx::discovery::{HostEntry, discover};
+use serde::Serialize;
+use sshx::discovery::{HostEntry, discover_roots};
 use sshx::output::{OutputFormat, render_diagnostic, render_human, render_machine};
+use sshx::settings::{self, RegisteredRoot};
 use std::env;
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::io::{self, IsTerminal, Write};
+use std::path::{Path, PathBuf};
 use std::process;
 
 const USAGE: &str = "Usage: sshx [--version]";
 const HOST_USAGE: &str = "Usage: sshx [--config PATH] host list [--format human|json|yaml]\n       sshx [--config PATH] host show SELECTOR [--format human|json|yaml]";
+const SETUP_USAGE: &str = "Usage: sshx setup [--personal PATH] [--work PATH] [--project NAME]\n       sshx connect [SELECTOR] [--id ID] [--source PATH --line NUMBER] [--no-input]";
 
 fn main() {
     match run(env::args_os().skip(1).collect()) {
@@ -35,31 +39,229 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
     }
 
     let cli = Cli::parse(args)?;
-    let catalog = discover(&cli.config).map_err(|error| error.to_string())?;
+    validate_connect_without_catalog(&cli)?;
+    if matches!(cli.command, Command::Setup) {
+        return run_setup(&cli);
+    }
+
+    let roots = registered_roots(&cli)?;
+    let configured = settings::discovery_roots(&roots);
+    let catalog = discover_roots(&configured).map_err(|error| error.to_string())?;
     for diagnostic in &catalog.diagnostics {
         eprintln!("{}", render_diagnostic(diagnostic));
     }
+    let filtered = filter_entries(&catalog.entries, &cli, &roots);
 
-    let entries = match cli.command {
-        Command::List => catalog.entries.iter().collect::<Vec<_>>(),
-        Command::Show(selector) => select_entries(&catalog.entries, &selector)?,
+    match &cli.command {
+        Command::List => render_entries(&filtered, &catalog.diagnostics, cli.format),
+        Command::Show(selector) => {
+            let entries = select_entries(&filtered, selector)?;
+            render_entries(&entries, &catalog.diagnostics, cli.format)
+        }
+        Command::Connect(selector) => {
+            let entry = select_connect_entry(&filtered, selector.as_deref(), &cli)?;
+            render_entries(&[entry], &catalog.diagnostics, cli.format)
+        }
+        Command::Setup => unreachable!(),
+    }
+}
+
+fn validate_connect_without_catalog(cli: &Cli) -> Result<(), String> {
+    let Command::Connect(selector) = &cli.command else {
+        return Ok(());
     };
-
-    if cli.format.is_machine() {
-        let document = render_machine(entries, &catalog.diagnostics, cli.format)?;
-        print!("{document}");
-    } else {
-        print!("{}", render_human(&entries));
+    if selector.is_some() || cli.id.is_some() {
+        return Ok(());
+    }
+    if cli.source.is_some() != cli.line.is_some() {
+        return Err(
+            "SELECTOR_INCOMPLETE: --source and --line must be provided together".to_string(),
+        );
+    }
+    if cli.source.is_some() {
+        return Err("SELECTOR_INCOMPLETE: alias is required with --source and --line".to_string());
+    }
+    if cli.no_input {
+        return Err("HOST_REQUIRED: connect requires a host in --no-input mode".to_string());
     }
     Ok(())
 }
 
-fn select_entries<'a>(
+fn render_entries(
+    entries: &[&HostEntry],
+    diagnostics: &[sshx::discovery::Diagnostic],
+    format: OutputFormat,
+) -> Result<(), String> {
+    if format.is_machine() {
+        let document = render_machine(entries.to_vec(), diagnostics, format)?;
+        print!("{document}");
+    } else {
+        print!("{}", render_human(entries));
+    }
+    Ok(())
+}
+
+fn run_setup(cli: &Cli) -> Result<(), String> {
+    let home = home_dir()?;
+    let mut roots = settings::load(&home)?;
+    let mut additions = Vec::new();
+    for request in &cli.roots {
+        let path = settings::normalize_path(&request.path, &home);
+        if !path.is_file() {
+            return Err(format!(
+                "SETUP_ROOT_NOT_FOUND: config root is not a file: {}",
+                path.display()
+            ));
+        }
+        additions.push(RegisteredRoot {
+            scope: request.scope.clone(),
+            path,
+            project: request
+                .project
+                .clone()
+                .or_else(|| cli.projects.first().cloned()),
+        });
+    }
+    if additions.is_empty() {
+        additions = settings::auto_detect(&home);
+        if let Some(project) = cli.projects.first() {
+            for root in &mut additions {
+                root.project = Some(project.clone());
+            }
+        }
+    }
+    if let Some(config) = &cli.config {
+        let path = settings::normalize_path(config, &home);
+        if !path.is_file() {
+            return Err(format!(
+                "SETUP_ROOT_NOT_FOUND: config root is not a file: {}",
+                path.display()
+            ));
+        }
+        additions.push(RegisteredRoot {
+            scope: cli
+                .scopes
+                .first()
+                .cloned()
+                .unwrap_or_else(|| scope_for_path(&path)),
+            path,
+            project: cli.projects.first().cloned(),
+        });
+    }
+    if additions.is_empty() {
+        return Err("SETUP_ROOT_REQUIRED: no existing config roots found".to_string());
+    }
+    settings::merge(&mut roots, additions);
+    settings::save(&home, &roots)?;
+    render_roots(&roots, cli.format)
+}
+
+#[derive(Serialize)]
+struct RootDocument<'a> {
+    version: u8,
+    roots: &'a [RegisteredRoot],
+}
+
+fn render_roots(roots: &[RegisteredRoot], format: OutputFormat) -> Result<(), String> {
+    if format.is_machine() {
+        let document = RootDocument { version: 1, roots };
+        let mut rendered = match format {
+            OutputFormat::Json => serde_json::to_string_pretty(&document)
+                .map_err(|error| format!("cannot render JSON output: {error}"))?,
+            OutputFormat::Yaml => serde_yaml::to_string(&document)
+                .map_err(|error| format!("cannot render YAML output: {error}"))?,
+            OutputFormat::Human => unreachable!(),
+        };
+        if !rendered.ends_with('\n') {
+            rendered.push('\n');
+        }
+        print!("{rendered}");
+    } else {
+        for root in roots {
+            println!(
+                "{}: {}{}",
+                root.scope,
+                root.path.display(),
+                root.project
+                    .as_deref()
+                    .map(|project| format!(" ({project})"))
+                    .unwrap_or_default()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn registered_roots(cli: &Cli) -> Result<Vec<RegisteredRoot>, String> {
+    if let Some(config) = &cli.config {
+        let path = settings::normalize_path(config, &home_dir()?);
+        return Ok(vec![RegisteredRoot {
+            scope: scope_for_path(&path),
+            path,
+            project: cli.projects.first().cloned(),
+        }]);
+    }
+    let home = home_dir()?;
+    let roots = settings::load(&home)?;
+    if !roots.is_empty() {
+        return Ok(roots);
+    }
+    let detected = settings::auto_detect(&home);
+    if !detected.is_empty() {
+        return Ok(detected);
+    }
+    Ok(vec![RegisteredRoot {
+        scope: "personal".to_string(),
+        path: home.join(".ssh/config"),
+        project: None,
+    }])
+}
+
+fn filter_entries<'a>(
     entries: &'a [HostEntry],
+    cli: &Cli,
+    roots: &[RegisteredRoot],
+) -> Vec<&'a HostEntry> {
+    let source = cli.source.as_ref().map(|path| {
+        settings::normalize_path(path, &home_dir().unwrap_or_else(|_| PathBuf::from(".")))
+            .to_string_lossy()
+            .into_owned()
+    });
+    entries
+        .iter()
+        .filter(|entry| {
+            (cli.scopes.is_empty()
+                || cli
+                    .scopes
+                    .iter()
+                    .any(|scope| entry.scopes.iter().any(|value| value == scope)))
+                && (cli.projects.is_empty()
+                    || cli
+                        .projects
+                        .iter()
+                        .any(|project| entry.projects.iter().any(|value| value == project)))
+                && source
+                    .as_deref()
+                    .is_none_or(|path| entry.source.path == path)
+                && cli.line.is_none_or(|line| entry.source.line_start == line)
+                && cli.id.as_deref().is_none_or(|id| entry.id == id)
+                && roots.iter().any(|root| {
+                    entry
+                        .provenance
+                        .iter()
+                        .any(|provenance| provenance.scope == root.scope)
+                })
+        })
+        .collect()
+}
+
+fn select_entries<'a>(
+    entries: &[&'a HostEntry],
     selector: &str,
 ) -> Result<Vec<&'a HostEntry>, String> {
     let selected = entries
         .iter()
+        .copied()
         .filter(|entry| entry.id == selector || entry.aliases.iter().any(|alias| alias == selector))
         .collect::<Vec<_>>();
     if selected.is_empty() {
@@ -68,23 +270,234 @@ fn select_entries<'a>(
     Ok(selected)
 }
 
+fn select_connect_entry<'a>(
+    entries: &[&'a HostEntry],
+    positional: Option<&str>,
+    cli: &Cli,
+) -> Result<&'a HostEntry, String> {
+    if cli.id.is_some() && positional.is_some() {
+        return Err("SELECTOR_CONFLICT: use either --id or a positional selector".to_string());
+    }
+    if cli.id.is_some() && (cli.source.is_some() || cli.line.is_some()) {
+        return Err(
+            "SELECTOR_CONFLICT: use either --id or an alias with complete source location"
+                .to_string(),
+        );
+    }
+    let selector = cli.id.as_deref().or(positional);
+    if cli.source.is_some() != cli.line.is_some() {
+        return Err(
+            "SELECTOR_INCOMPLETE: --source and --line must be provided together".to_string(),
+        );
+    }
+    if selector.is_none() && cli.source.is_some() {
+        return Err("SELECTOR_INCOMPLETE: alias is required with --source and --line".to_string());
+    }
+    let Some(selector) = selector else {
+        if cli.no_input {
+            return Err("HOST_REQUIRED: connect requires a host in --no-input mode".to_string());
+        }
+        if !io::stdin().is_terminal() {
+            return Err(
+                "HOST_REQUIRED: connect requires a host outside interactive mode".to_string(),
+            );
+        }
+        return interactive_select(entries);
+    };
+
+    let by_id = cli.id.is_some()
+        || entries.iter().any(|entry| {
+            entry.id == selector && !entry.aliases.iter().any(|alias| alias == selector)
+        });
+    let matches = entries
+        .iter()
+        .copied()
+        .filter(|entry| {
+            if by_id {
+                entry.id == selector
+            } else {
+                entry.aliases.iter().any(|alias| alias == selector)
+            }
+        })
+        .filter(|entry| {
+            cli.source.as_ref().is_none_or(|source| {
+                let home = home_dir().unwrap_or_else(|_| PathBuf::from("."));
+                entry.source.path == settings::normalize_path(source, &home).to_string_lossy()
+            })
+        })
+        .filter(|entry| cli.line.is_none_or(|line| entry.source.line_start == line))
+        .collect::<Vec<_>>();
+
+    match matches.as_slice() {
+        [entry] => Ok(*entry),
+        [] if cli.source.is_some() => Err(format!(
+            "HOST_MISMATCH: selector `{selector}` does not match source and Host line"
+        )),
+        [] => Err(format!(
+            "HOST_NOT_FOUND: selector `{selector}` matched no entries"
+        )),
+        many => Err(format_ambiguous(selector, many)),
+    }
+}
+
+fn interactive_select<'a>(entries: &[&'a HostEntry]) -> Result<&'a HostEntry, String> {
+    if entries.is_empty() {
+        return Err("HOST_NOT_FOUND: no hosts match current filters".to_string());
+    }
+    println!("Search hosts:");
+    for (index, entry) in entries.iter().enumerate() {
+        println!(
+            "  {}. {} ({})",
+            index + 1,
+            entry.aliases.join(" "),
+            entry.source.path
+        );
+    }
+    print!("Search: ");
+    io::stdout()
+        .flush()
+        .map_err(|error| format!("cannot flush selector: {error}"))?;
+    let mut query = String::new();
+    io::stdin()
+        .read_line(&mut query)
+        .map_err(|error| format!("cannot read selector: {error}"))?;
+    let query = query.trim();
+    let matches = entries
+        .iter()
+        .copied()
+        .filter(|entry| searchable(entry, query))
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [entry] => Ok(*entry),
+        [] => Err(format!(
+            "HOST_NOT_FOUND: search `{query}` matched no entries"
+        )),
+        many => {
+            println!("Matches:");
+            for (index, entry) in many.iter().enumerate() {
+                println!(
+                    "  {}. {} ({})",
+                    index + 1,
+                    entry.aliases.join(" "),
+                    entry.id
+                );
+            }
+            print!("Select number: ");
+            io::stdout()
+                .flush()
+                .map_err(|error| format!("cannot flush selector: {error}"))?;
+            let mut selection = String::new();
+            io::stdin()
+                .read_line(&mut selection)
+                .map_err(|error| format!("cannot read selector: {error}"))?;
+            let index = selection
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| "HOST_REQUIRED: selector choice must be a number".to_string())?;
+            many.get(index.saturating_sub(1))
+                .copied()
+                .ok_or_else(|| "HOST_NOT_FOUND: selector choice is out of range".to_string())
+        }
+    }
+}
+
+fn searchable(entry: &HostEntry, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    let query = query.to_ascii_lowercase();
+    entry.id.to_ascii_lowercase().contains(&query)
+        || entry
+            .aliases
+            .iter()
+            .any(|alias| alias.to_ascii_lowercase().contains(&query))
+        || entry.source.path.to_ascii_lowercase().contains(&query)
+        || entry
+            .projects
+            .iter()
+            .any(|project| project.to_ascii_lowercase().contains(&query))
+        || entry
+            .scopes
+            .iter()
+            .any(|scope| scope.to_ascii_lowercase().contains(&query))
+}
+
+fn format_ambiguous(selector: &str, entries: &[&HostEntry]) -> String {
+    let candidates = entries
+        .iter()
+        .map(|entry| {
+            format!(
+                "{}: {} [{}]",
+                entry.aliases.join(" "),
+                entry.id,
+                entry.source.path
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("HOST_AMBIGUOUS: selector `{selector}` matched candidates: {candidates}")
+}
+
+fn scope_for_path(path: &Path) -> String {
+    if path.components().any(|component| {
+        component
+            .as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(".private-key")
+    }) {
+        "work".to_string()
+    } else {
+        "personal".to_string()
+    }
+}
+
+fn home_dir() -> Result<PathBuf, String> {
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| "HOME is not set; pass --config PATH".to_string())
+}
+
 #[derive(Debug)]
 enum Command {
     List,
     Show(String),
+    Connect(Option<String>),
+    Setup,
+}
+
+#[derive(Debug)]
+struct RootRequest {
+    scope: String,
+    path: PathBuf,
+    project: Option<String>,
 }
 
 #[derive(Debug)]
 struct Cli {
-    config: PathBuf,
+    config: Option<PathBuf>,
     format: OutputFormat,
     command: Command,
+    scopes: Vec<String>,
+    projects: Vec<String>,
+    source: Option<PathBuf>,
+    line: Option<usize>,
+    id: Option<String>,
+    no_input: bool,
+    roots: Vec<RootRequest>,
 }
 
 impl Cli {
     fn parse(args: Vec<OsString>) -> Result<Self, String> {
         let mut config = None;
         let mut format = OutputFormat::Human;
+        let mut scopes = Vec::new();
+        let mut projects = Vec::new();
+        let mut source = None;
+        let mut line = None;
+        let mut id = None;
+        let mut host = None;
+        let mut no_input = false;
+        let mut roots = Vec::new();
         let mut positional = Vec::new();
         let mut index = 0;
 
@@ -93,26 +506,78 @@ impl Cli {
             let text = argument
                 .to_str()
                 .ok_or_else(|| "arguments must be valid UTF-8".to_string())?;
-            if text == "--config" {
+            let mut next = |name: &str| -> Result<String, String> {
                 index += 1;
-                let value = args
-                    .get(index)
-                    .ok_or_else(|| format!("{text} requires a path"))?;
-                config = Some(PathBuf::from(value));
+                args.get(index)
+                    .and_then(|argument| argument.to_str())
+                    .map(str::to_owned)
+                    .ok_or_else(|| format!("{name} requires a value"))
+            };
+            if text == "--config" {
+                config = Some(PathBuf::from(next(text)?));
             } else if let Some(value) = text.strip_prefix("--config=") {
-                if value.is_empty() {
-                    return Err("--config requires a path".to_string());
-                }
                 config = Some(PathBuf::from(value));
             } else if text == "--format" {
-                index += 1;
-                let value = args
-                    .get(index)
-                    .and_then(|argument| argument.to_str())
-                    .ok_or_else(|| format!("{text} requires human, json, or yaml"))?;
-                format = OutputFormat::parse(value)?;
+                format = OutputFormat::parse(&next(text)?)?;
             } else if let Some(value) = text.strip_prefix("--format=") {
                 format = OutputFormat::parse(value)?;
+            } else if text == "--scope" {
+                scopes.push(next(text)?);
+            } else if text == "--project" {
+                projects.push(next(text)?);
+            } else if text == "--source" || text == "--source-file" {
+                source = Some(PathBuf::from(next(text)?));
+            } else if text == "--line" || text == "--host-line" {
+                line = Some(
+                    next(text)?
+                        .parse()
+                        .map_err(|_| "--line requires a number".to_string())?,
+                );
+            } else if text == "--host" || text == "--alias" || text == "--selector" {
+                host = Some(next(text)?);
+            } else if text == "--id" || text == "--host-id" {
+                id = Some(next(text)?);
+            } else if text == "--no-input" || text == "--non-interactive" {
+                no_input = true;
+            } else if matches!(
+                text,
+                "--personal"
+                    | "--personal-root"
+                    | "--personal-config"
+                    | "--combined"
+                    | "--combined-root"
+                    | "--combined-config"
+            ) {
+                roots.push(RootRequest {
+                    scope: "personal".to_string(),
+                    path: PathBuf::from(next(text)?),
+                    project: projects.last().cloned(),
+                });
+            } else if matches!(text, "--work" | "--work-root" | "--work-config") {
+                roots.push(RootRequest {
+                    scope: "work".to_string(),
+                    path: PathBuf::from(next(text)?),
+                    project: projects.last().cloned(),
+                });
+            } else if text == "--root" {
+                let value = next(text)?;
+                let (scope, path) = value.split_once('=').map_or_else(
+                    || {
+                        (
+                            scopes.last().map(String::as_str).unwrap_or("personal"),
+                            value.as_str(),
+                        )
+                    },
+                    |(scope, path)| (scope, path),
+                );
+                if scope.is_empty() || path.is_empty() {
+                    return Err("--root requires SCOPE=PATH".to_string());
+                }
+                roots.push(RootRequest {
+                    scope: scope.to_string(),
+                    path: PathBuf::from(path),
+                    project: projects.last().cloned(),
+                });
             } else if text.starts_with('-') {
                 return Err(format!("unexpected argument `{text}`\n{USAGE}"));
             } else {
@@ -129,30 +594,48 @@ impl Cli {
             [host, show] if host == "host" && show == "show" => {
                 return Err("host show requires a selector".to_string());
             }
+            [connect] if connect == "connect" => Command::Connect(None),
+            [connect, selector] if connect == "connect" => Command::Connect(Some(selector.clone())),
+            [setup] if setup == "setup" => Command::Setup,
             _ if positional.len() == 1 => {
                 return Err(format!("unexpected argument `{}`\n{USAGE}", positional[0]));
             }
             _ => {
                 return Err(format!(
-                    "expected `host list` or `host show SELECTOR`\n{HOST_USAGE}"
+                    "expected `host list`, `host show SELECTOR`, `connect`, or `setup`\n{HOST_USAGE}\n{SETUP_USAGE}"
                 ));
             }
         };
 
-        let config = match config {
-            Some(path) => path,
-            None => default_config()?,
+        let command = match command {
+            Command::Connect(Some(_selector)) if host.is_some() => {
+                return Err("SELECTOR_CONFLICT: provide one host selector".to_string());
+            }
+            Command::Connect(selector) => Command::Connect(selector.or(host)),
+            command => {
+                if host.is_some() {
+                    return Err("--host is only valid with connect".to_string());
+                }
+                command
+            }
         };
+
         Ok(Self {
             config,
             format,
             command,
+            scopes,
+            projects,
+            source,
+            line,
+            id,
+            no_input,
+            roots,
         })
     }
 }
 
+#[allow(dead_code)]
 fn default_config() -> Result<PathBuf, String> {
-    let home =
-        env::var_os("HOME").ok_or_else(|| "HOME is not set; pass --config PATH".to_string())?;
-    Ok(PathBuf::from(home).join(".ssh/config"))
+    Ok(home_dir()?.join(".ssh/config"))
 }
