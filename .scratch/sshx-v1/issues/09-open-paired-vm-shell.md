@@ -4,7 +4,7 @@
 
 **Blocked by:** 07: Open a direct password shell without leaking secrets; 08: Create and validate a one-to-one Pair.
 
-**Status:** ready-for-agent
+**Status:** claimed
 
 - [ ] The gateway master opens one app-selected loopback transit port without changing source LocalForward, HostName, or Port values.
 - [ ] The VM master connects to that same temporary port with its own authentication and known-hosts identity.

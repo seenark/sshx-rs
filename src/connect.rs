@@ -1,7 +1,9 @@
 use crate::discovery::HostEntry;
 use crate::mutation::{self, UpdateRequest};
+use crate::pair::PairedRoute;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, IsTerminal, Read, Write};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -117,10 +119,19 @@ struct Runtime {
 
 impl Runtime {
     fn create(entry: &HostEntry, home: &Path, selected_alias: &str) -> Result<Self, String> {
+        let content = compile_config(entry, selected_alias)?;
+        Self::create_with_content(entry, home, selected_alias, content)
+    }
+
+    fn create_with_content(
+        entry: &HostEntry,
+        home: &Path,
+        selected_alias: &str,
+        content: String,
+    ) -> Result<Self, String> {
         if !entry.aliases.iter().any(|alias| alias == selected_alias) {
             return Err("CONFIG_CHANGED: selected alias no longer exists".to_string());
         }
-        let content = compile_config(entry, selected_alias)?;
         let configured_password = selected_password(entry)?;
         let dir = temporary_directory()?;
         let config = dir.join("config");
@@ -244,6 +255,184 @@ fn open_session(
     }
 }
 
+pub fn open_paired(
+    route: &PairedRoute,
+    home: &Path,
+    no_input: bool,
+    gateway_alias: &str,
+    vm_alias: &str,
+    gateway_password_fd: Option<i32>,
+    vm_password_fd: Option<i32>,
+) -> Result<(), String> {
+    SIGNAL.store(0, Ordering::Relaxed);
+    install_signal_handlers();
+    let result = open_paired_session(
+        route,
+        home,
+        no_input,
+        gateway_alias,
+        vm_alias,
+        gateway_password_fd,
+        vm_password_fd,
+    );
+    reset_signal_handlers();
+    result
+}
+
+fn open_paired_session(
+    route: &PairedRoute,
+    home: &Path,
+    no_input: bool,
+    gateway_alias: &str,
+    vm_alias: &str,
+    gateway_password_fd: Option<i32>,
+    vm_password_fd: Option<i32>,
+) -> Result<(), String> {
+    let transit_port = allocate_transit_port()?;
+    let gateway_config = compile_gateway_config(
+        &route.gateway,
+        gateway_alias,
+        &route.transit_host,
+        route.transit_port,
+        transit_port,
+    )?;
+    let vm_config = compile_vm_config(
+        &route.vm,
+        vm_alias,
+        transit_port,
+        &stable_vm_host_key_alias(&route.vm_id),
+    )?;
+    let gateway_runtime =
+        Runtime::create_with_content(&route.gateway, home, gateway_alias, gateway_config)?;
+    let vm_runtime = Runtime::create_with_content(&route.vm, home, vm_alias, vm_config)?;
+    let mut gateway_attempt = password_attempt(&gateway_runtime, gateway_password_fd)
+        .map_err(|error| paired_stage_error("gateway", error))?;
+    let mut vm_attempt = password_attempt(&vm_runtime, vm_password_fd)
+        .map_err(|error| paired_stage_error("VM", error))?;
+
+    let mut gateway_master =
+        authenticate_paired_master(&gateway_runtime, no_input, &mut gateway_attempt, "gateway")?;
+    let mut vm_master =
+        match authenticate_paired_master(&vm_runtime, no_input, &mut vm_attempt, "VM") {
+            Ok(master) => master,
+            Err(error) => {
+                stop_master(&gateway_runtime, &mut gateway_master);
+                return Err(error);
+            }
+        };
+
+    if let Some(attempt) = gateway_attempt.as_ref()
+        && let Err(error) = save_replacement_for(&gateway_runtime, attempt, no_input, "gateway")
+    {
+        stop_master(&vm_runtime, &mut vm_master);
+        stop_master(&gateway_runtime, &mut gateway_master);
+        return Err(error);
+    }
+    if let Some(attempt) = vm_attempt.as_ref()
+        && let Err(error) = save_replacement_for(&vm_runtime, attempt, no_input, "VM")
+    {
+        stop_master(&vm_runtime, &mut vm_master);
+        stop_master(&gateway_runtime, &mut gateway_master);
+        return Err(error);
+    }
+
+    let mut shell = match spawn_shell(&vm_runtime, no_input) {
+        Ok(shell) => shell,
+        Err(error) => {
+            stop_master(&vm_runtime, &mut vm_master);
+            stop_master(&gateway_runtime, &mut gateway_master);
+            return Err(format!("VM_SESSION_FAILED: {error}"));
+        }
+    };
+    let status = match wait_for_shell(&mut shell) {
+        Ok(status) => status,
+        Err(error) => {
+            stop_master(&vm_runtime, &mut vm_master);
+            stop_master(&gateway_runtime, &mut gateway_master);
+            return Err(error);
+        }
+    };
+    stop_master(&vm_runtime, &mut vm_master);
+    stop_master(&gateway_runtime, &mut gateway_master);
+    if let Some(signal) = received_signal() {
+        return Err(format!("SESSION_INTERRUPTED: signal {signal}"));
+    }
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("VM_SESSION_EXIT: {status}"))
+    }
+}
+
+fn password_attempt(
+    runtime: &Runtime,
+    password_fd: Option<i32>,
+) -> Result<Option<PasswordAttempt>, String> {
+    match password_fd {
+        Some(fd) => read_password_fd(fd).map(Some),
+        None => Ok(runtime
+            .configured_password
+            .clone()
+            .map(PasswordAttempt::configured)),
+    }
+}
+
+fn authenticate_paired_master(
+    runtime: &Runtime,
+    no_input: bool,
+    attempt: &mut Option<PasswordAttempt>,
+    role: &str,
+) -> Result<Child, String> {
+    let mut enrolled = false;
+    loop {
+        let mut master = spawn_master(runtime, no_input, attempt.as_ref())
+            .map_err(|error| paired_stage_error(role, error))?;
+        match wait_for_master(runtime, &mut master, no_input) {
+            Ok(()) => return Ok(master),
+            Err(error) => {
+                stop_master(runtime, &mut master);
+                if !enrolled && !no_input && error.starts_with("HOST_KEY_TRUST_REQUIRED") {
+                    enroll_host_key(runtime).map_err(|error| paired_stage_error(role, error))?;
+                    enrolled = true;
+                    continue;
+                }
+                let can_prompt = !no_input
+                    && io::stdin().is_terminal()
+                    && error.starts_with("SSH_AUTH_FAILED")
+                    && attempt
+                        .as_ref()
+                        .is_none_or(|value| value.source != PasswordSource::Prompted);
+                if can_prompt
+                    && let Some(next) = prompt_password_for(role, &runtime.alias, attempt.is_some())
+                        .map_err(|error| paired_stage_error(role, error))?
+                {
+                    *attempt = Some(next);
+                    continue;
+                }
+                return Err(paired_stage_error(role, error));
+            }
+        }
+    }
+}
+
+fn paired_stage_error(role: &str, error: String) -> String {
+    if error.starts_with("SESSION_INTERRUPTED") {
+        return error;
+    }
+    if role.eq_ignore_ascii_case("gateway") && (error.contains("forward") || error.contains("bind"))
+    {
+        return format!("TRANSIT_BIND_FAILED: gateway transit forward failed: {error}");
+    }
+    let stage = if error.starts_with("HOST_KEY_TRUST_REQUIRED") {
+        "TRUST_REQUIRED"
+    } else if error.starts_with("HOST_KEY_CHANGED") {
+        "TRUST_FAILED"
+    } else {
+        "AUTH_FAILED"
+    };
+    format!("{}_{}: {error}", role.to_ascii_uppercase(), stage)
+}
+
 fn spawn_master(
     runtime: &Runtime,
     no_input: bool,
@@ -251,7 +440,7 @@ fn spawn_master(
 ) -> Result<Child, String> {
     let (mut command, password_pipe) = auth_command(runtime, no_input, true, attempt)?;
     command.args(["-M", "-N", "-o", "ControlMaster=yes"]);
-    command.arg(&runtime.alias);
+    command.args(["-o", "ExitOnForwardFailure=yes"]);
     command
         .stdin(if no_input {
             Stdio::null()
@@ -691,6 +880,14 @@ fn read_password_fd(_fd: i32) -> Result<PasswordAttempt, String> {
 }
 
 fn prompt_password(alias: &str, replacement: bool) -> Result<Option<PasswordAttempt>, String> {
+    prompt_password_for("direct host", alias, replacement)
+}
+
+fn prompt_password_for(
+    role: &str,
+    alias: &str,
+    replacement: bool,
+) -> Result<Option<PasswordAttempt>, String> {
     if !io::stdin().is_terminal() {
         return Ok(None);
     }
@@ -700,9 +897,9 @@ fn prompt_password(alias: &str, replacement: bool) -> Result<Option<PasswordAtte
         use std::os::fd::AsRawFd;
 
         let label = if replacement {
-            format!("Password for direct host `{alias}` (replacement): ")
+            format!("Password for {role} `{alias}` (replacement): ")
         } else {
-            format!("Password for direct host `{alias}`: ")
+            format!("Password for {role} `{alias}`: ")
         };
         eprint!("{label}");
         io::stderr()
@@ -735,7 +932,7 @@ fn prompt_password(alias: &str, replacement: bool) -> Result<Option<PasswordAtte
     }
     #[cfg(not(unix))]
     {
-        let _ = (alias, replacement);
+        let _ = (role, alias, replacement);
         Err("PASSWORD_PROMPT_FAILED: hidden password input is unsupported".to_string())
     }
 }
@@ -745,6 +942,15 @@ fn save_replacement(
     attempt: &PasswordAttempt,
     no_input: bool,
 ) -> Result<(), String> {
+    save_replacement_for(runtime, attempt, no_input, "direct host")
+}
+
+fn save_replacement_for(
+    runtime: &Runtime,
+    attempt: &PasswordAttempt,
+    no_input: bool,
+    role: &str,
+) -> Result<(), String> {
     let Some(password) = attempt.replacement.as_deref() else {
         return Ok(());
     };
@@ -752,7 +958,7 @@ fn save_replacement(
         return Ok(());
     }
     eprint!(
-        "Save replacement password for direct host `{}`? [y/N]: ",
+        "Save replacement password for {role} `{}`? [y/N]: ",
         runtime.alias
     );
     io::stderr()
@@ -784,7 +990,63 @@ fn save_replacement(
     mutation::apply_edit(&plan)
 }
 
+#[derive(Clone, Copy)]
+enum RuntimeTransform<'a> {
+    None,
+    Gateway {
+        transit_host: &'a str,
+        transit_port: u16,
+        local_port: u16,
+    },
+    Vm {
+        local_port: u16,
+        host_key_alias: &'a str,
+    },
+}
+
 fn compile_config(entry: &HostEntry, selected_alias: &str) -> Result<String, String> {
+    compile_config_with_transform(entry, selected_alias, RuntimeTransform::None)
+}
+
+fn compile_gateway_config(
+    entry: &HostEntry,
+    selected_alias: &str,
+    transit_host: &str,
+    transit_port: u16,
+    local_port: u16,
+) -> Result<String, String> {
+    compile_config_with_transform(
+        entry,
+        selected_alias,
+        RuntimeTransform::Gateway {
+            transit_host,
+            transit_port,
+            local_port,
+        },
+    )
+}
+
+fn compile_vm_config(
+    entry: &HostEntry,
+    selected_alias: &str,
+    local_port: u16,
+    host_key_alias: &str,
+) -> Result<String, String> {
+    compile_config_with_transform(
+        entry,
+        selected_alias,
+        RuntimeTransform::Vm {
+            local_port,
+            host_key_alias,
+        },
+    )
+}
+
+fn compile_config_with_transform(
+    entry: &HostEntry,
+    selected_alias: &str,
+    transform: RuntimeTransform<'_>,
+) -> Result<String, String> {
     let bytes = fs::read(&entry.source.path).map_err(|error| {
         format!(
             "CONFIG_READ_FAILED: cannot read {}: {error}",
@@ -802,6 +1064,10 @@ fn compile_config(entry: &HostEntry, selected_alias: &str) -> Result<String, Str
     let block = &text[start..end];
     let mut output = String::new();
     let mut host_written = false;
+    let mut hostname_written = false;
+    let mut port_written = false;
+    let mut host_key_alias_written = false;
+    let mut gateway_forward_matches = 0usize;
     for raw in block.lines() {
         let line = strip_inline_comment(raw).trim();
         if line.is_empty() {
@@ -848,6 +1114,49 @@ fn compile_config(entry: &HostEntry, selected_alias: &str) -> Result<String, Str
                 "UNSUPPORTED_DIRECTIVE: {keyword} cannot be preserved in direct runtime config"
             ));
         }
+        if keyword.eq_ignore_ascii_case("localforward")
+            && let RuntimeTransform::Gateway {
+                transit_host,
+                transit_port,
+                local_port,
+            } = transform
+            && local_forward_destination(argument).is_some_and(|destination| {
+                destination.0 == transit_host && destination.1 == transit_port
+            })
+        {
+            gateway_forward_matches += 1;
+            output.push_str("  LocalForward 127.0.0.1:");
+            output.push_str(&local_port.to_string());
+            output.push(' ');
+            output.push_str(argument.split_whitespace().last().unwrap_or_default());
+            output.push('\n');
+            continue;
+        }
+        if keyword.eq_ignore_ascii_case("hostname")
+            && matches!(transform, RuntimeTransform::Vm { .. })
+        {
+            output.push_str("  HostName 127.0.0.1\n");
+            hostname_written = true;
+            continue;
+        }
+        if keyword.eq_ignore_ascii_case("port")
+            && let RuntimeTransform::Vm { local_port, .. } = transform
+        {
+            output.push_str("  Port ");
+            output.push_str(&local_port.to_string());
+            output.push('\n');
+            port_written = true;
+            continue;
+        }
+        if keyword.eq_ignore_ascii_case("hostkeyalias")
+            && let RuntimeTransform::Vm { host_key_alias, .. } = transform
+        {
+            output.push_str("  HostKeyAlias ");
+            output.push_str(host_key_alias);
+            output.push('\n');
+            host_key_alias_written = true;
+            continue;
+        }
         output.push_str("  ");
         output.push_str(keyword);
         if !argument.is_empty() {
@@ -859,10 +1168,59 @@ fn compile_config(entry: &HostEntry, selected_alias: &str) -> Result<String, Str
     if !host_written {
         return Err("CONFIG_INVALID: selected span does not start with Host".to_string());
     }
+    match transform {
+        RuntimeTransform::Gateway { .. } if gateway_forward_matches != 1 => {
+            return Err(format!(
+                "PAIR_ROUTE_CHANGED: approved gateway transit has {gateway_forward_matches} current LocalForward candidates"
+            ));
+        }
+        RuntimeTransform::Vm {
+            local_port,
+            host_key_alias,
+        } => {
+            if !hostname_written {
+                output.push_str("  HostName 127.0.0.1\n");
+            }
+            if !port_written {
+                output.push_str("  Port ");
+                output.push_str(&local_port.to_string());
+                output.push('\n');
+            }
+            if !host_key_alias_written {
+                output.push_str("  HostKeyAlias ");
+                output.push_str(host_key_alias);
+                output.push('\n');
+            }
+        }
+        RuntimeTransform::None | RuntimeTransform::Gateway { .. } => {}
+    }
     output.push_str("Include ");
     output.push_str(SYSTEM_CONFIG);
     output.push('\n');
     Ok(output)
+}
+
+fn local_forward_destination(argument: &str) -> Option<(String, u16)> {
+    let destination = argument.split_whitespace().last()?;
+    if let Some((host, port)) = destination.rsplit_once(':') {
+        return Some((
+            host.trim_matches(['[', ']']).to_string(),
+            port.parse().ok()?,
+        ));
+    }
+    None
+}
+
+fn allocate_transit_port() -> Result<u16, String> {
+    TcpListener::bind(("127.0.0.1", 0))
+        .map_err(|error| format!("TRANSIT_BIND_FAILED: cannot allocate transit port: {error}"))?
+        .local_addr()
+        .map(|address| address.port())
+        .map_err(|error| format!("TRANSIT_BIND_FAILED: cannot inspect transit port: {error}"))
+}
+
+fn stable_vm_host_key_alias(vm_id: &str) -> String {
+    format!("sshx-vm-{vm_id}")
 }
 
 fn validate_source(text: &str, start: usize, entry: &HostEntry) -> Result<(), String> {

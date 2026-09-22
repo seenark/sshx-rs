@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::process;
 const USAGE: &str = "Usage: sshx [--version]";
 const HOST_USAGE: &str = "Usage: sshx [--config PATH] host list [--format human|json|yaml]\n       sshx [--config PATH] host show SELECTOR [--format human|json|yaml]\n       sshx [--config PATH] host create --scope SCOPE --file PATH --alias ALIAS --hostname HOSTNAME [options]\n       sshx [--config PATH] host update SELECTOR [options]\n       sshx [--config PATH] host rename SELECTOR --alias ALIAS [options]\n       sshx [--config PATH] host delete SELECTOR [options]";
-const SETUP_USAGE: &str = "Usage: sshx setup [--personal PATH] [--work PATH] [--project NAME]\n       sshx connect [SELECTOR] [--id ID] [--source PATH --line NUMBER] [--password-fd FD] [--no-input]\n       sshx pair setup [GATEWAY] [VM] [--gateway ID] [--vm ID] [--transit-host HOST --transit-port PORT]";
+const SETUP_USAGE: &str = "Usage: sshx setup [--personal PATH] [--work PATH] [--project NAME]\n       sshx connect [SELECTOR] [--id ID] [--source PATH --line NUMBER] [--password-fd FD] [--gateway-password-fd FD --vm-password-fd FD] [--no-input]\n       sshx pair setup [GATEWAY] [VM] [--gateway ID] [--vm ID] [--transit-host HOST --transit-port PORT]";
 
 fn main() {
     match run(env::args_os().skip(1).collect()) {
@@ -91,13 +91,40 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
                     );
                 }
                 let alias = selected_connect_alias(entry, selector.as_deref(), &cli);
-                sshx::connect::open_with_password_fd(
-                    entry,
-                    &home_dir()?,
-                    cli.no_input,
-                    alias,
-                    cli.password_fd,
-                )
+                if let Some(route) = sshx::pair::paired_route(&catalog.entries, entry)? {
+                    let gateway_alias = route
+                        .gateway
+                        .aliases
+                        .first()
+                        .ok_or_else(|| "PAIR_INVALID: gateway has no alias".to_string())?;
+                    let vm_password_fd = match (cli.password_fd, cli.vm_password_fd) {
+                        (Some(_), Some(_)) => {
+                            return Err(
+                                "PASSWORD_FD_CONFLICT: use only one VM password descriptor"
+                                    .to_string(),
+                            );
+                        }
+                        (Some(fd), None) | (None, Some(fd)) => Some(fd),
+                        (None, None) => None,
+                    };
+                    sshx::connect::open_paired(
+                        &route,
+                        &home_dir()?,
+                        cli.no_input,
+                        gateway_alias,
+                        alias,
+                        cli.gateway_password_fd,
+                        vm_password_fd,
+                    )
+                } else {
+                    sshx::connect::open_with_password_fd(
+                        entry,
+                        &home_dir()?,
+                        cli.no_input,
+                        alias,
+                        cli.password_fd,
+                    )
+                }
             }
         }
         Command::Setup
@@ -1124,6 +1151,8 @@ struct Cli {
     port: Option<u16>,
     password_stdin: bool,
     password_fd: Option<i32>,
+    gateway_password_fd: Option<i32>,
+    vm_password_fd: Option<i32>,
     clear_user: bool,
     clear_port: bool,
     clear_password: bool,
@@ -1159,6 +1188,8 @@ impl Cli {
         let mut clear_password = false;
         let mut password_stdin = false;
         let mut password_fd = None;
+        let mut gateway_password_fd = None;
+        let mut vm_password_fd = None;
         let mut folder = None;
         let mut file = None;
         let mut yes = false;
@@ -1263,6 +1294,30 @@ impl Cli {
                     value
                         .parse()
                         .map_err(|_| "--password-fd requires a number".to_string())?,
+                );
+            } else if text == "--gateway-password-fd" {
+                gateway_password_fd = Some(
+                    next(text)?
+                        .parse()
+                        .map_err(|_| "--gateway-password-fd requires a number".to_string())?,
+                );
+            } else if let Some(value) = text.strip_prefix("--gateway-password-fd=") {
+                gateway_password_fd = Some(
+                    value
+                        .parse()
+                        .map_err(|_| "--gateway-password-fd requires a number".to_string())?,
+                );
+            } else if text == "--vm-password-fd" {
+                vm_password_fd = Some(
+                    next(text)?
+                        .parse()
+                        .map_err(|_| "--vm-password-fd requires a number".to_string())?,
+                );
+            } else if let Some(value) = text.strip_prefix("--vm-password-fd=") {
+                vm_password_fd = Some(
+                    value
+                        .parse()
+                        .map_err(|_| "--vm-password-fd requires a number".to_string())?,
                 );
             } else if text == "--clear-user" {
                 clear_user = true;
@@ -1465,6 +1520,8 @@ impl Cli {
             port,
             password_stdin,
             password_fd,
+            gateway_password_fd,
+            vm_password_fd,
             clear_user,
             clear_port,
             clear_password,

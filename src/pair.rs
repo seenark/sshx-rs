@@ -40,6 +40,111 @@ pub struct PairRecord {
     pub transit_port: u16,
 }
 
+#[derive(Clone, Debug)]
+pub struct PairedRoute {
+    pub gateway: HostEntry,
+    pub vm: HostEntry,
+    pub gateway_id: String,
+    pub vm_id: String,
+    pub transit_host: String,
+    pub transit_port: u16,
+}
+
+pub fn paired_route(
+    entries: &[HostEntry],
+    selected_vm: &HostEntry,
+) -> Result<Option<PairedRoute>, String> {
+    let vm_index = entry_index(entries, selected_vm)?;
+    let parsed = entries
+        .iter()
+        .map(parse_entry)
+        .collect::<Result<Vec<_>, _>>()?;
+    let vm_data = &parsed[vm_index];
+    if !vm_data.gateway_marker && !vm_data.paired_vm_marker && !vm_data.transit_marker {
+        return Ok(None);
+    }
+    if !vm_data.gateway_marker || !vm_data.transit_marker || vm_data.paired_vm_marker {
+        return Err("PAIR_BROKEN: VM pair metadata is incomplete or misplaced".to_string());
+    }
+    if vm_data.id_markers != 1 {
+        return Err("PAIR_BROKEN: VM must have exactly one immutable ID".to_string());
+    }
+
+    let vm_id = vm_data
+        .id
+        .as_deref()
+        .filter(|id| valid_id(id))
+        .ok_or_else(|| "PAIR_INVALID: VM has no valid immutable ID".to_string())?;
+    if selected_vm.id != vm_id {
+        return Err("PAIR_INVALID: selected VM identity changed on disk".to_string());
+    }
+    let gateway_id = vm_data
+        .gateway_id
+        .as_deref()
+        .filter(|id| valid_id(id))
+        .ok_or_else(|| "PAIR_BROKEN: VM has no valid gateway reference".to_string())?;
+    let transit = vm_data
+        .transit
+        .clone()
+        .filter(|(_, port)| *port > 0)
+        .ok_or_else(|| "PAIR_BROKEN: VM has no valid approved transit destination".to_string())?;
+    if vm_data.transit_marker && vm_data.transit.is_none() {
+        return Err("PAIR_BROKEN: VM transit metadata is malformed".to_string());
+    }
+    if vm_data.invalid_port || vm_data.port != transit.1 {
+        return Err("PAIR_ROUTE_CHANGED: VM Port no longer matches approved transit".to_string());
+    }
+
+    let mut id_indexes = HashMap::new();
+    for (index, data) in parsed.iter().enumerate() {
+        let Some(id) = data.id.as_deref().filter(|id| valid_id(id)) else {
+            continue;
+        };
+        if id_indexes.insert(id.to_ascii_lowercase(), index).is_some() {
+            return Err(format!("PAIR_INVALID: duplicate immutable ID `{id}`"));
+        }
+    }
+    let gateway_index = id_indexes
+        .get(&gateway_id.to_ascii_lowercase())
+        .copied()
+        .ok_or_else(|| "PAIR_BROKEN: gateway reference no longer exists".to_string())?;
+    if gateway_index == vm_index {
+        return Err("PAIR_BROKEN: gateway and VM references point to one entry".to_string());
+    }
+    let gateway = &entries[gateway_index];
+    let gateway_data = &parsed[gateway_index];
+    if gateway_data.id_markers != 1
+        || gateway_data.gateway_marker
+        || gateway_data.transit_marker
+        || !gateway_data.paired_vm_marker
+        || gateway_data
+            .paired_vm_id
+            .as_deref()
+            .is_none_or(|id| !id.eq_ignore_ascii_case(vm_id))
+    {
+        return Err("PAIR_BROKEN: gateway has no matching VM reference".to_string());
+    }
+    let candidates = gateway_data
+        .forwards
+        .iter()
+        .filter(|candidate| candidate.host == transit.0 && candidate.port == transit.1)
+        .count();
+    if candidates != 1 {
+        return Err(format!(
+            "PAIR_ROUTE_CHANGED: approved gateway transit {}:{} has {candidates} current LocalForward candidates",
+            transit.0, transit.1
+        ));
+    }
+    Ok(Some(PairedRoute {
+        gateway: gateway.clone(),
+        vm: selected_vm.clone(),
+        gateway_id: gateway_id.to_string(),
+        vm_id: vm_id.to_string(),
+        transit_host: transit.0,
+        transit_port: transit.1,
+    }))
+}
+
 pub fn diagnostics(entries: &[HostEntry]) -> Vec<Diagnostic> {
     let parsed = entries.iter().map(parse_entry).collect::<Vec<_>>();
     let mut diagnostics = Vec::new();

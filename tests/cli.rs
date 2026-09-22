@@ -702,6 +702,490 @@ fn run_fake_ssh(home: &Path, args: &[&str], bin: &Path, root: &Path) -> std::pro
         .expect("sshx binary should run")
 }
 
+fn paired_fake_ssh(root: &Path) -> PathBuf {
+    let bin = root.join("paired-bin");
+    fs::create_dir_all(&bin).expect("paired fake SSH directory should be created");
+    let script = bin.join("ssh");
+    write(
+        &script,
+        r#"#!/bin/sh
+config=
+socket=
+previous=
+for argument in "$@"; do
+  if [ "$previous" = "-F" ]; then config="$argument"; fi
+  if [ "$previous" = "-S" ]; then socket="$argument"; fi
+  previous="$argument"
+done
+if [ -z "$socket" ]; then socket="$config.sock"; fi
+if [ -n "$SSHX_PAIRED_CAPTURE_DIR" ] && printf '%s' "$*" | grep -q -- '-N'; then
+  mkdir -p "$SSHX_PAIRED_CAPTURE_DIR"
+  key=$(printf '%s' "$socket" | cksum | cut -d' ' -f1)
+  cp "$config" "$SSHX_PAIRED_CAPTURE_DIR/$key.config"
+fi
+case " $* " in
+  *" -O check "*) [ -f "$socket.started" ] && exit 0; exit 1 ;;
+  *" -O exit "*)
+    if grep -q '^Host vm$' "$config"; then role=VM; else role=GATEWAY; fi
+    [ -n "$SSHX_PAIRED_CLOSE_LOG" ] && printf '%s\n' "$role" >> "$SSHX_PAIRED_CLOSE_LOG"
+    rm -f "$socket.started"
+    exit 0
+    ;;
+  *" -N "*)
+    if [ "$SSHX_PAIRED_FAIL_ROLE" = "gateway" ] && grep -q '^Host gateway$' "$config"; then
+      echo "Permission denied, please try again." >&2
+      exit 5
+    fi
+    if [ "$SSHX_PAIRED_FAIL_ROLE" = "VM" ] && grep -q '^Host vm$' "$config"; then
+      echo "Permission denied, please try again." >&2
+      exit 5
+    fi
+    : > "$socket.started"
+    trap 'exit 0' INT HUP TERM
+    while :; do sleep 1; done
+    ;;
+  *) if [ "$SSHX_PAIRED_HOLD_SHELL" = "1" ]; then trap 'exit 0' INT HUP TERM; while :; do sleep 1; done; else printf 'paired-shell\n'; fi ;;
+esac
+"#,
+    );
+    let mut permissions = fs::metadata(&script)
+        .expect("paired fake SSH should exist")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&script, permissions).expect("paired fake SSH should be executable");
+    let sshpass = bin.join("sshpass");
+    write(
+        &sshpass,
+        r#"#!/bin/sh
+[ "$1" = "-d" ] || exit 97
+password_fd="$2"
+shift 2
+[ "$1" = "ssh" ] || exit 98
+shift
+config=
+previous=
+for argument in "$@"; do
+  if [ "$previous" = "-F" ]; then config="$argument"; fi
+  previous="$argument"
+done
+if grep -q '^Host gateway$' "$config"; then
+  eval "cat <&$password_fd" > "$SSHX_PAIRED_GATEWAY_PASSWORD"
+else
+  eval "cat <&$password_fd" > "$SSHX_PAIRED_VM_PASSWORD"
+fi
+exec ssh "$@"
+"#,
+    );
+    let mut permissions = fs::metadata(&sshpass)
+        .expect("paired fake sshpass should exist")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&sshpass, permissions).expect("paired fake sshpass should be executable");
+    bin
+}
+
+fn run_paired_fake_ssh(
+    home: &Path,
+    args: &[&str],
+    bin: &Path,
+    root: &Path,
+) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_sshx"))
+        .env("HOME", home)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env("SSHX_PAIRED_CAPTURE_DIR", root.join("captures"))
+        .env("SSHX_PAIRED_CLOSE_LOG", root.join("close-log"))
+        .env(
+            "SSHX_PAIRED_GATEWAY_PASSWORD",
+            root.join("gateway-password"),
+        )
+        .env("SSHX_PAIRED_VM_PASSWORD", root.join("vm-password"))
+        .args(args)
+        .output()
+        .expect("sshx binary should run")
+}
+
+fn run_paired_fake_ssh_with_failure(
+    home: &Path,
+    args: &[&str],
+    bin: &Path,
+    root: &Path,
+    role: &str,
+) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_sshx"))
+        .env("HOME", home)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env("SSHX_PAIRED_CAPTURE_DIR", root.join("captures"))
+        .env("SSHX_PAIRED_CLOSE_LOG", root.join("close-log"))
+        .env(
+            "SSHX_PAIRED_GATEWAY_PASSWORD",
+            root.join("gateway-password"),
+        )
+        .env("SSHX_PAIRED_VM_PASSWORD", root.join("vm-password"))
+        .env("SSHX_PAIRED_FAIL_ROLE", role)
+        .args(args)
+        .output()
+        .expect("sshx binary should run")
+}
+
+fn spawn_paired_fake_ssh(
+    home: &Path,
+    args: &[&str],
+    bin: &Path,
+    root: &Path,
+) -> std::process::Child {
+    Command::new(env!("CARGO_BIN_EXE_sshx"))
+        .env("HOME", home)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env("SSHX_PAIRED_CAPTURE_DIR", root.join("captures"))
+        .env("SSHX_PAIRED_CLOSE_LOG", root.join("close-log"))
+        .env(
+            "SSHX_PAIRED_GATEWAY_PASSWORD",
+            root.join("gateway-password"),
+        )
+        .env("SSHX_PAIRED_VM_PASSWORD", root.join("vm-password"))
+        .env("SSHX_PAIRED_HOLD_SHELL", "1")
+        .args(args)
+        .spawn()
+        .expect("sshx binary should start")
+}
+
+#[test]
+fn paired_connect_uses_isolated_route_and_reverse_cleanup() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    let original = concat!(
+        "##SSHX ID=11111111-1111-4111-8111-111111111111\n",
+        "##SSHX VM=22222222-2222-4222-8222-222222222222\n",
+        "Host gateway\n",
+        "  HostName gateway.example\n",
+        "  User gateway-user\n",
+        "  Port 220\n",
+        "  LocalForward 2200 vm.internal:22\n",
+        "  ##PASSWORD gateway-secret\n",
+        "##SSHX ID=22222222-2222-4222-8222-222222222222\n",
+        "##SSHX GATEWAY=11111111-1111-4111-8111-111111111111\n",
+        "##SSHX TRANSIT=vm.internal:22\n",
+        "Host vm\n",
+        "  HostName vm.internal\n",
+        "  User vm-user\n",
+        "  Port 22\n",
+        "  ##PASSWORD vm-secret\n",
+    );
+    write(&config, original);
+    let bin = paired_fake_ssh(&root);
+    let output = run_paired_fake_ssh(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "connect",
+            "vm",
+            "--no-input",
+        ],
+        &bin,
+        &root,
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "paired-shell\n");
+    assert_eq!(
+        fs::read_to_string(root.join("gateway-password")).unwrap(),
+        "gateway-secret\n"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("vm-password")).unwrap(),
+        "vm-secret\n"
+    );
+    assert_eq!(fs::read_to_string(&config).unwrap(), original);
+
+    let mut gateway_runtime = String::new();
+    let mut vm_runtime = String::new();
+    for capture in fs::read_dir(root.join("captures")).unwrap() {
+        let text = fs::read_to_string(capture.unwrap().path()).unwrap();
+        if text.contains("Host gateway\n") {
+            gateway_runtime = text;
+        } else if text.contains("Host vm\n") {
+            vm_runtime = text;
+        }
+    }
+    assert!(gateway_runtime.contains("HostName gateway.example"));
+    assert!(gateway_runtime.contains("Port 220"));
+    assert!(gateway_runtime.contains("LocalForward 127.0.0.1:"));
+    assert!(gateway_runtime.contains(" vm.internal:22"));
+    assert!(!gateway_runtime.contains("gateway-secret"));
+    assert!(!gateway_runtime.contains("##SSHX"));
+
+    let transit_port = gateway_runtime
+        .lines()
+        .find_map(|line| {
+            let mut fields = line.split_whitespace();
+            (fields.next() == Some("LocalForward"))
+                .then(|| fields.next()?.rsplit_once(':')?.1.parse::<u16>().ok())?
+        })
+        .expect("gateway runtime should select transit port");
+    assert!(transit_port > 0);
+    assert!(vm_runtime.contains("HostName 127.0.0.1"));
+    assert!(vm_runtime.contains(&format!("Port {transit_port}")));
+    assert!(vm_runtime.contains("User vm-user"));
+    assert!(vm_runtime.contains("HostKeyAlias sshx-vm-22222222-2222-4222-8222-222222222222"));
+    assert!(!vm_runtime.contains("vm-secret"));
+    assert!(!vm_runtime.contains("##SSHX"));
+    assert_eq!(
+        fs::read_to_string(root.join("close-log")).unwrap(),
+        "VM\nGATEWAY\n"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn paired_connect_attributes_gateway_auth_failure() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(
+        &config,
+        concat!(
+            "##SSHX ID=11111111-1111-4111-8111-111111111111\n",
+            "##SSHX VM=22222222-2222-4222-8222-222222222222\n",
+            "Host gateway\n",
+            "  HostName gateway.example\n",
+            "  LocalForward 2200 vm.internal:22\n",
+            "  ##PASSWORD gateway-secret\n",
+            "##SSHX ID=22222222-2222-4222-8222-222222222222\n",
+            "##SSHX GATEWAY=11111111-1111-4111-8111-111111111111\n",
+            "##SSHX TRANSIT=vm.internal:22\n",
+            "Host vm\n",
+            "  HostName vm.internal\n",
+            "  Port 22\n",
+        ),
+    );
+    let bin = paired_fake_ssh(&root);
+    let output = run_paired_fake_ssh_with_failure(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "connect",
+            "vm",
+            "--no-input",
+        ],
+        &bin,
+        &root,
+        "gateway",
+    );
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(text.contains("GATEWAY_AUTH_FAILED"), "{text}");
+    assert!(!text.contains("gateway-secret"), "{text}");
+    assert!(!root.join("vm-password").exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn paired_connect_attributes_vm_auth_failure_and_cleans_gateway() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(
+        &config,
+        concat!(
+            "##SSHX ID=11111111-1111-4111-8111-111111111111\n",
+            "##SSHX VM=22222222-2222-4222-8222-222222222222\n",
+            "Host gateway\n",
+            "  HostName gateway.example\n",
+            "  LocalForward 2200 vm.internal:22\n",
+            "  ##PASSWORD gateway-secret\n",
+            "##SSHX ID=22222222-2222-4222-8222-222222222222\n",
+            "##SSHX GATEWAY=11111111-1111-4111-8111-111111111111\n",
+            "##SSHX TRANSIT=vm.internal:22\n",
+            "Host vm\n",
+            "  HostName vm.internal\n",
+            "  Port 22\n",
+            "  ##PASSWORD vm-secret\n",
+        ),
+    );
+    let bin = paired_fake_ssh(&root);
+    let output = run_paired_fake_ssh_with_failure(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "connect",
+            "vm",
+            "--no-input",
+        ],
+        &bin,
+        &root,
+        "VM",
+    );
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(text.contains("VM_AUTH_FAILED"), "{text}");
+    assert!(!text.contains("gateway-secret"), "{text}");
+    assert!(!text.contains("vm-secret"), "{text}");
+    assert_eq!(
+        fs::read_to_string(root.join("close-log")).unwrap(),
+        "VM\nGATEWAY\n"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn paired_connect_rejects_route_changes_before_open_ssh() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(
+        &config,
+        concat!(
+            "##SSHX ID=11111111-1111-4111-8111-111111111111\n",
+            "##SSHX VM=22222222-2222-4222-8222-222222222222\n",
+            "Host gateway\n",
+            "  HostName gateway.example\n",
+            "  LocalForward 2200 changed.internal:22\n",
+            "##SSHX ID=22222222-2222-4222-8222-222222222222\n",
+            "##SSHX GATEWAY=11111111-1111-4111-8111-111111111111\n",
+            "##SSHX TRANSIT=vm.internal:22\n",
+            "Host vm\n",
+            "  HostName vm.internal\n",
+            "  Port 22\n",
+        ),
+    );
+    let bin = paired_fake_ssh(&root);
+    let output = run_paired_fake_ssh(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "connect",
+            "vm",
+            "--no-input",
+        ],
+        &bin,
+        &root,
+    );
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("PAIR_ROUTE_CHANGED"));
+    assert!(!root.join("captures").exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn paired_sessions_use_distinct_ports_and_cleanup_independently() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(
+        &config,
+        concat!(
+            "##SSHX ID=11111111-1111-4111-8111-111111111111\n",
+            "##SSHX VM=22222222-2222-4222-8222-222222222222\n",
+            "Host gateway\n",
+            "  HostName gateway.example\n",
+            "  LocalForward 2200 vm.internal:22\n",
+            "##SSHX ID=22222222-2222-4222-8222-222222222222\n",
+            "##SSHX GATEWAY=11111111-1111-4111-8111-111111111111\n",
+            "##SSHX TRANSIT=vm.internal:22\n",
+            "Host vm\n",
+            "  HostName vm.internal\n",
+            "  User vm-user\n",
+            "  Port 22\n",
+        ),
+    );
+    let bin = paired_fake_ssh(&root);
+    let args = [
+        "--config",
+        config.to_str().unwrap(),
+        "connect",
+        "vm",
+        "--no-input",
+    ];
+    let mut first = spawn_paired_fake_ssh(&home, &args, &bin, &root);
+    for _ in 0..200 {
+        let count = fs::read_dir(root.join("captures"))
+            .map(|entries| entries.count())
+            .unwrap_or_default();
+        if count >= 2 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let mut second = spawn_paired_fake_ssh(&home, &args, &bin, &root);
+    for _ in 0..200 {
+        let count = fs::read_dir(root.join("captures"))
+            .map(|entries| entries.count())
+            .unwrap_or_default();
+        if count >= 4 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let mut ports = Vec::new();
+    for capture in fs::read_dir(root.join("captures")).unwrap() {
+        let text = fs::read_to_string(capture.unwrap().path()).unwrap();
+        if let Some(line) = text
+            .lines()
+            .find(|line| line.starts_with("  LocalForward "))
+        {
+            ports.push(
+                line.split_whitespace()
+                    .nth(1)
+                    .unwrap()
+                    .rsplit_once(':')
+                    .unwrap()
+                    .1
+                    .parse::<u16>()
+                    .unwrap(),
+            );
+        }
+    }
+    assert_eq!(ports.len(), 2);
+    assert_ne!(ports[0], ports[1]);
+
+    assert_eq!(
+        unsafe { libc::kill(first.id() as libc::pid_t, libc::SIGTERM) },
+        0
+    );
+    assert_eq!(first.wait().unwrap().code(), Some(2));
+    thread::sleep(Duration::from_millis(100));
+    assert!(second.try_wait().unwrap().is_none());
+    assert_eq!(
+        unsafe { libc::kill(second.id() as libc::pid_t, libc::SIGTERM) },
+        0
+    );
+    assert_eq!(second.wait().unwrap().code(), Some(2));
+    let close_log = fs::read_to_string(root.join("close-log")).unwrap();
+    let roles = close_log.lines().collect::<Vec<_>>();
+    assert_eq!(roles.len(), 4);
+    assert_eq!(&roles[..2], ["VM", "GATEWAY"]);
+    assert_eq!(&roles[2..], ["VM", "GATEWAY"]);
+    fs::remove_dir_all(root).unwrap();
+}
 #[test]
 fn direct_connect_compiles_exact_block_and_uses_owned_master() {
     let (root, home) = fixture_root();
