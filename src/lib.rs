@@ -1,3 +1,4 @@
+pub mod connect;
 pub mod discovery;
 pub mod output;
 pub mod settings;

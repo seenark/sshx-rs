@@ -60,7 +60,21 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
         }
         Command::Connect(selector) => {
             let entry = select_connect_entry(&filtered, selector.as_deref(), &cli)?;
-            render_entries(&[entry], &catalog.diagnostics, cli.format)
+            if cli.format.is_machine() {
+                render_entries(&[entry], &catalog.diagnostics, cli.format)
+            } else {
+                if catalog
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == "unsupported_match")
+                {
+                    return Err(
+                        "UNSUPPORTED_MATCH: Match prevents exact runtime configuration".to_string(),
+                    );
+                }
+                let alias = selected_connect_alias(entry, selector.as_deref(), &cli);
+                sshx::connect::open(entry, &home_dir()?, cli.no_input, alias)
+            }
         }
         Command::Setup => unreachable!(),
     }
@@ -327,6 +341,23 @@ fn select_connect_entry<'a>(
         )),
         many => Err(format_ambiguous(selector, many)),
     }
+}
+fn selected_connect_alias<'a>(
+    entry: &'a HostEntry,
+    positional: Option<&str>,
+    cli: &Cli,
+) -> &'a str {
+    if cli.id.is_none()
+        && let Some(selector) = positional
+        && let Some(alias) = entry.aliases.iter().find(|alias| alias == &selector)
+    {
+        return alias;
+    }
+    entry
+        .aliases
+        .first()
+        .map(String::as_str)
+        .unwrap_or_default()
 }
 
 fn interactive_select<'a>(entries: &[&'a HostEntry]) -> Result<&'a HostEntry, String> {

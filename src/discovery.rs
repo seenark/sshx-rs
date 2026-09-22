@@ -110,6 +110,7 @@ struct HostBlock {
 enum Item {
     Host(usize),
     Include(Vec<String>),
+    Match,
 }
 
 #[derive(Clone, Debug)]
@@ -284,6 +285,18 @@ fn visit_file(
                     }
                 }
             }
+            Item::Match => {
+                let key = format!("match:{}", display_path(path));
+                if state.diagnostic_keys.insert(key) {
+                    state.diagnostics.push(Diagnostic {
+                        code: "unsupported_match".to_string(),
+                        message: format!(
+                            "Match directive prevents exact runtime config in {}",
+                            display_path(path)
+                        ),
+                    });
+                }
+            }
         }
     }
 
@@ -440,6 +453,11 @@ fn parse_file(path: &Path) -> Result<ParsedFile, DiscoveryError> {
             if !patterns.is_empty() {
                 items.push(Item::Include(patterns));
             }
+        } else if tokens
+            .first()
+            .is_some_and(|token| token.eq_ignore_ascii_case("match"))
+        {
+            items.push(Item::Match);
         }
     }
 

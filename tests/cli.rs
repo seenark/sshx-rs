@@ -1,9 +1,11 @@
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 static FIXTURE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 #[test]
@@ -576,5 +578,215 @@ fn persistent_sshx_id_selects_exact_entry() {
         serde_json::from_slice(&output.stdout).expect("connect JSON should parse");
     assert_eq!(document["entries"][0]["id"], "entry-uuid");
 
+    fs::remove_dir_all(root).expect("fixture should be removed");
+}
+fn fake_ssh(root: &Path) -> PathBuf {
+    let bin = root.join("bin");
+    fs::create_dir_all(&bin).expect("fake SSH directory should be created");
+    let script = bin.join("ssh");
+    write(
+        &script,
+        r#"#!/bin/sh
+args="$*"
+if [ -n "$SSHX_CAPTURE" ] && [ -n "$1" ]; then
+  config=
+  previous=
+  for argument in "$@"; do
+    if [ "$previous" = "-F" ]; then config="$argument"; fi
+    previous="$argument"
+  done
+  if [ -f "$config" ]; then cat "$config" > "$SSHX_CAPTURE"; fi
+fi
+case " $args " in
+  *" -O check "*) if [ -f "$SSHX_STARTED" ]; then exit 0; fi; exit 1 ;;
+  *" -O exit "*)
+    [ -n "$SSHX_CLOSED" ] && : > "$SSHX_CLOSED"
+    exit 0
+    ;;
+  *" -N "*)
+    if [ "$SSHX_UNKNOWN" = "1" ]; then
+      echo "Host key verification failed." >&2
+      exit 255
+    fi
+    [ -n "$SSHX_STARTED" ] && : > "$SSHX_STARTED"
+    trap 'exit 0' INT HUP TERM
+    while :; do sleep 1; done
+    ;;
+  *)
+    if [ "$SSHX_HOLD_SHELL" = "1" ]; then
+      trap 'exit 0' INT HUP TERM
+      while :; do sleep 1; done
+    else
+      printf 'direct-shell\n'
+    fi
+    ;;
+esac
+"#,
+    );
+    let mut permissions = fs::metadata(&script)
+        .expect("fake SSH should exist")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&script, permissions).expect("fake SSH should be executable");
+    bin
+}
+
+fn run_fake_ssh(home: &Path, args: &[&str], bin: &Path, root: &Path) -> std::process::Output {
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    Command::new(env!("CARGO_BIN_EXE_sshx"))
+        .env("HOME", home)
+        .env("PATH", path)
+        .env("SSHX_CAPTURE", root.join("runtime-config").as_os_str())
+        .env("SSHX_STARTED", root.join("master-started").as_os_str())
+        .env("SSHX_CLOSED", root.join("master-closed").as_os_str())
+        .args(args)
+        .output()
+        .expect("sshx binary should run")
+}
+
+#[test]
+fn direct_connect_compiles_exact_block_and_uses_owned_master() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(
+        &config,
+        "##SSHX ID=direct-id\nHost direct\n  HostName direct.example # remove this\n  User alice\n  IdentityFile ~/.ssh/id_ed25519\n  ##PASSWORD never-copy-this\n",
+    );
+    let bin = fake_ssh(&root);
+    let output = run_fake_ssh(&home, &["connect", "direct", "--no-input"], &bin, &root);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "direct-shell\n");
+    let runtime =
+        fs::read_to_string(root.join("runtime-config")).expect("runtime config should be captured");
+    assert!(runtime.contains("Host direct"));
+    assert!(runtime.contains("HostName direct.example"));
+    assert!(runtime.contains("IdentityFile ~/.ssh/id_ed25519"));
+    assert!(runtime.contains("Include /etc/ssh/ssh_config"));
+    assert!(!runtime.contains("##SSHX"));
+    assert!(!runtime.contains("PASSWORD"));
+    assert!(!runtime.contains("remove this"));
+    assert!(root.join("master-started").exists());
+    assert!(root.join("master-closed").exists());
+    fs::remove_dir_all(root).expect("fixture should be removed");
+}
+
+#[test]
+fn unsafe_config_fails_before_open_ssh_evaluation() {
+    let (root, home) = fixture_root();
+    let bin = fake_ssh(&root);
+    let cases = [
+        (
+            "wildcard",
+            "exact*",
+            "Host exact*\n  HostName example.test\n",
+            "UNSUPPORTED_WILDCARD",
+        ),
+        (
+            "match",
+            "exact",
+            "Host exact\n  HostName example.test\nMatch all\n  User inherited\n",
+            "UNSUPPORTED_MATCH",
+        ),
+        (
+            "conditional-include",
+            "exact",
+            "Host exact\n  Include child.conf\n",
+            "UNSUPPORTED_CONDITIONAL_INCLUDE",
+        ),
+        (
+            "global",
+            "exact",
+            "User inherited\nHost exact\n  HostName example.test\n",
+            "UNSUPPORTED_GLOBAL",
+        ),
+        (
+            "token",
+            "exact",
+            "Host exact\n  HostName %h\n",
+            "UNSUPPORTED_TOKEN_SEMANTICS",
+        ),
+    ];
+    for (name, selector, contents, expected) in cases {
+        let config = home.join(".ssh/config");
+        write(&config, contents);
+        let invoked = root.join("master-started");
+        let _ = fs::remove_file(&invoked);
+        let output = run_fake_ssh(&home, &["connect", selector, "--no-input"], &bin, &root);
+        assert_eq!(output.status.code(), Some(2), "{name}: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(expected),
+            "{name}: {output:?}"
+        );
+        assert!(!invoked.exists(), "{name}: OpenSSH was invoked");
+    }
+    fs::remove_dir_all(root).expect("fixture should be removed");
+}
+
+#[test]
+fn unknown_key_in_no_input_mode_returns_stable_trust_error() {
+    let (root, home) = fixture_root();
+    write(
+        &home.join(".ssh/config"),
+        "Host direct\n  HostName direct.example\n",
+    );
+    let bin = fake_ssh(&root);
+    let output = Command::new(env!("CARGO_BIN_EXE_sshx"))
+        .env("HOME", &home)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env("SSHX_UNKNOWN", "1")
+        .args(["connect", "direct", "--no-input"])
+        .output()
+        .expect("sshx binary should run");
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("HOST_KEY_TRUST_REQUIRED"));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("direct-shell"));
+    fs::remove_dir_all(root).expect("fixture should be removed");
+}
+
+#[test]
+fn signal_cleanup_closes_only_owned_master() {
+    let (root, home) = fixture_root();
+    write(
+        &home.join(".ssh/config"),
+        "Host direct\n  HostName direct.example\n",
+    );
+    let bin = fake_ssh(&root);
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sshx"))
+        .env("HOME", &home)
+        .env("PATH", path)
+        .env("SSHX_STARTED", root.join("master-started").as_os_str())
+        .env("SSHX_CLOSED", root.join("master-closed").as_os_str())
+        .env("SSHX_HOLD_SHELL", "1")
+        .args(["connect", "direct", "--no-input"])
+        .spawn()
+        .expect("sshx should start");
+    for _ in 0..100 {
+        if root.join("master-started").exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(root.join("master-started").exists());
+    let result = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+    assert_eq!(result, 0);
+    let status = child.wait().expect("sshx should stop after SIGTERM");
+    assert_eq!(status.code(), Some(2));
+    assert!(root.join("master-closed").exists());
     fs::remove_dir_all(root).expect("fixture should be removed");
 }
