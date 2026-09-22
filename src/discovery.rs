@@ -186,6 +186,99 @@ pub fn discover_roots(roots: &[DiscoveryRoot]) -> Result<Catalog, DiscoveryError
         diagnostics: state.diagnostics,
     })
 }
+pub fn path_reachable(root: &Path, target: &Path) -> Result<bool, DiscoveryError> {
+    let root = absolute_path(root)?;
+    if !root.is_file() {
+        return Ok(false);
+    }
+    let target = absolute_path(target)?;
+    let target_identity = fs::canonicalize(&target).ok();
+    let include_base = match std::env::var_os("HOME") {
+        Some(home) => absolute_path(&PathBuf::from(home).join(".ssh"))?,
+        None => root
+            .parent()
+            .unwrap_or_else(|| Path::new("/"))
+            .to_path_buf(),
+    };
+    let mut active = HashSet::new();
+    reachable_file(
+        &root,
+        &include_base,
+        &target,
+        target_identity.as_deref(),
+        &mut active,
+    )
+}
+
+fn reachable_file(
+    path: &Path,
+    include_base: &Path,
+    target: &Path,
+    target_identity: Option<&Path>,
+    active: &mut HashSet<PathBuf>,
+) -> Result<bool, DiscoveryError> {
+    let identity = fs::canonicalize(path).map_err(|error| {
+        DiscoveryError::new(format!(
+            "cannot read included config {}: {error}",
+            path.display()
+        ))
+    })?;
+    if !active.insert(identity.clone()) {
+        return Ok(false);
+    }
+    if target_identity.is_some_and(|target_identity| target_identity == identity)
+        || lexical_normalize(&identity) == lexical_normalize(target)
+    {
+        active.remove(&identity);
+        return Ok(true);
+    }
+    let file = parse_file(&identity)?;
+    for item in file.items {
+        let Item::Include(patterns) = item else {
+            continue;
+        };
+        for pattern in patterns {
+            if include_pattern_matches(&pattern, include_base, target) {
+                active.remove(&identity);
+                return Ok(true);
+            }
+            for child in expand_include(&pattern, include_base) {
+                if reachable_file(&child, include_base, target, target_identity, active)? {
+                    active.remove(&identity);
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    active.remove(&identity);
+    Ok(false)
+}
+
+fn include_pattern_matches(pattern: &str, base: &Path, target: &Path) -> bool {
+    let pattern = PathBuf::from(expand_tilde(pattern));
+    let pattern = if pattern.is_absolute() {
+        pattern
+    } else {
+        base.join(pattern)
+    };
+    let pattern = lexical_normalize(&pattern);
+    let target = lexical_normalize(target);
+    let pattern_components = pattern.components().collect::<Vec<_>>();
+    let target_components = target.components().collect::<Vec<_>>();
+    pattern_components.len() == target_components.len()
+        && pattern_components
+            .iter()
+            .zip(target_components)
+            .all(|(pattern, target)| {
+                let pattern = pattern.as_os_str().to_string_lossy();
+                let target = target.as_os_str().to_string_lossy();
+                if target.starts_with('.') && !pattern.starts_with('.') {
+                    return false;
+                }
+                has_magic(&pattern) && wildcard_match(&pattern, &target)
+                    || !has_magic(&pattern) && pattern == target
+            })
+}
 
 fn visit_file(
     path: &Path,

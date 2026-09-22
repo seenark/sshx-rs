@@ -1,15 +1,16 @@
 use serde::Serialize;
 use sshx::discovery::{HostEntry, discover_roots, scope_for_path};
-use sshx::output::{OutputFormat, render_diagnostic, render_human, render_machine};
+use sshx::mutation::{self, CreateRequest};
+use sshx::output::{OutputFormat, render_create, render_diagnostic, render_human, render_machine};
 use sshx::settings::{self, RegisteredRoot};
 use std::env;
 use std::ffi::OsString;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::process;
 
 const USAGE: &str = "Usage: sshx [--version]";
-const HOST_USAGE: &str = "Usage: sshx [--config PATH] host list [--format human|json|yaml]\n       sshx [--config PATH] host show SELECTOR [--format human|json|yaml]";
+const HOST_USAGE: &str = "Usage: sshx [--config PATH] host list [--format human|json|yaml]\n       sshx [--config PATH] host show SELECTOR [--format human|json|yaml]\n       sshx host create --scope SCOPE --file PATH --alias ALIAS --hostname HOSTNAME [options]";
 const SETUP_USAGE: &str = "Usage: sshx setup [--personal PATH] [--work PATH] [--project NAME]\n       sshx connect [SELECTOR] [--id ID] [--source PATH --line NUMBER] [--no-input]";
 
 fn main() {
@@ -43,8 +44,10 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
     if matches!(cli.command, Command::Setup) {
         return run_setup(&cli);
     }
-
     let roots = registered_roots(&cli)?;
+    if matches!(&cli.command, Command::CreateHost) {
+        return run_host_create(&cli, &roots);
+    }
     let configured = settings::discovery_roots(&roots);
     let catalog = discover_roots(&configured).map_err(|error| error.to_string())?;
     for diagnostic in &catalog.diagnostics {
@@ -76,7 +79,7 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
                 sshx::connect::open(entry, &home_dir()?, cli.no_input, alias)
             }
         }
-        Command::Setup => unreachable!(),
+        Command::Setup | Command::CreateHost => unreachable!(),
     }
 }
 
@@ -113,6 +116,269 @@ fn render_entries(
         print!("{}", render_human(entries));
     }
     Ok(())
+}
+
+fn run_host_create(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), String> {
+    let interactive = !cli.no_input && io::stdin().is_terminal();
+    if cli.scopes.len() > 1 {
+        return Err("SCOPE_AMBIGUOUS: provide one --scope".to_string());
+    }
+    if cli.projects.len() > 1 {
+        return Err("PROJECT_AMBIGUOUS: provide one --project".to_string());
+    }
+    let scope = if let Some(scope) = cli.scopes.first() {
+        scope.clone()
+    } else if interactive {
+        let mut scopes = roots
+            .iter()
+            .map(|root| root.scope.as_str())
+            .collect::<Vec<_>>();
+        scopes.sort_unstable();
+        scopes.dedup();
+        eprintln!("Scopes:");
+        for (index, scope) in scopes.iter().enumerate() {
+            eprintln!("  {}. {scope}", index + 1);
+        }
+        prompt_value("Scope: ", None)?
+            .ok_or_else(|| "SCOPE_REQUIRED: scope cannot be empty".to_string())?
+    } else {
+        return Err("SCOPE_REQUIRED: provide --scope in non-interactive mode".to_string());
+    };
+    let requested_project = cli.projects.first().cloned();
+    let mut candidates = roots
+        .iter()
+        .filter(|root| root.scope == scope)
+        .filter(|root| {
+            requested_project
+                .as_deref()
+                .is_none_or(|project| root.project.as_deref() == Some(project))
+        })
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return Err(format!(
+            "ROOT_NOT_FOUND: no registered root matches scope `{scope}`{}",
+            requested_project
+                .as_deref()
+                .map(|project| format!(" and project `{project}`"))
+                .unwrap_or_default()
+        ));
+    }
+    let root = if candidates.len() == 1 {
+        candidates.remove(0)
+    } else if interactive {
+        eprintln!("Config roots:");
+        for (index, root) in candidates.iter().enumerate() {
+            eprintln!(
+                "  {}. {}{}",
+                index + 1,
+                root.path.display(),
+                root.project
+                    .as_deref()
+                    .map(|project| format!(" ({project})"))
+                    .unwrap_or_default()
+            );
+        }
+        let choice = prompt_value("Root number: ", None)?
+            .ok_or_else(|| "ROOT_REQUIRED: select one config root".to_string())?
+            .parse::<usize>()
+            .map_err(|_| "ROOT_REQUIRED: root choice must be a number".to_string())?;
+        *candidates
+            .get(choice.saturating_sub(1))
+            .ok_or_else(|| "ROOT_REQUIRED: root choice is out of range".to_string())?
+    } else {
+        return Err("ROOT_AMBIGUOUS: provide --project or one registered root".to_string());
+    };
+    let root_parent = root
+        .path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let folder_text = match &cli.folder {
+        Some(folder) => folder.to_string_lossy().into_owned(),
+        None if interactive => prompt_value(
+            &format!("Folder [{}]: ", root_parent.display()),
+            Some(root_parent.to_string_lossy().into_owned()),
+        )?
+        .ok_or_else(|| "FOLDER_REQUIRED: folder cannot be empty".to_string())?,
+        None => root_parent.to_string_lossy().into_owned(),
+    };
+    let folder = resolve_relative_path(&folder_text, root_parent);
+    let file_text = match &cli.file {
+        Some(file) => file.to_string_lossy().into_owned(),
+        None if interactive => prompt_value("File: ", None)?
+            .ok_or_else(|| "FILE_REQUIRED: provide a target file".to_string())?,
+        None => {
+            return Err("FILE_REQUIRED: provide --file in non-interactive mode".to_string());
+        }
+    };
+    let target = resolve_relative_path(&file_text, &folder);
+    let alias = required_create_value(cli.alias.as_deref(), "Alias", interactive)?;
+    let hostname = required_create_value(cli.hostname.as_deref(), "Hostname", interactive)?;
+    let user = optional_create_value(cli.user.as_deref(), "User", interactive)?;
+    let port = match cli.port {
+        Some(port) => Some(port),
+        None if interactive => optional_create_value(None, "Port", true)?
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                value
+                    .parse::<u16>()
+                    .map_err(|_| "PORT_INVALID: port must be a number".to_string())
+            })
+            .transpose()?,
+        None => None,
+    };
+    let password = create_password(cli, interactive)?;
+    let request = CreateRequest::new(
+        root.path.clone(),
+        target,
+        alias,
+        hostname,
+        user,
+        port,
+        password,
+    );
+    let plan = mutation::plan_create(&request)?;
+    if cli.preview {
+        print!("{}", render_create(&plan, cli.format, false)?);
+        return Ok(());
+    }
+    if !cli.yes {
+        if !interactive {
+            return Err("CONSENT_REQUIRED: non-interactive host create requires --yes".to_string());
+        }
+        eprint!("{}", render_create(&plan, OutputFormat::Human, false)?);
+        if !prompt_yes("Apply changes? [y/N]: ")? {
+            return Err("MUTATION_DECLINED: host create was not applied".to_string());
+        }
+    }
+    mutation::apply(&plan)?;
+    print!("{}", render_create(&plan, cli.format, true)?);
+    Ok(())
+}
+
+fn required_create_value(
+    value: Option<&str>,
+    label: &str,
+    interactive: bool,
+) -> Result<String, String> {
+    if let Some(value) = value {
+        return Ok(value.to_string());
+    }
+    if !interactive {
+        return Err(format!(
+            "{}_REQUIRED: provide --{} in non-interactive mode",
+            label.to_ascii_uppercase(),
+            label.to_ascii_lowercase()
+        ));
+    }
+    prompt_value(&format!("{label}: "), None)?.ok_or_else(|| {
+        format!(
+            "{}_REQUIRED: value cannot be empty",
+            label.to_ascii_uppercase()
+        )
+    })
+}
+
+fn optional_create_value(
+    value: Option<&str>,
+    label: &str,
+    interactive: bool,
+) -> Result<Option<String>, String> {
+    if let Some(value) = value {
+        return Ok(Some(value.to_string()));
+    }
+    if !interactive {
+        return Ok(None);
+    }
+    prompt_value(&format!("{label} [optional]: "), Some(String::new()))
+}
+
+fn create_password(cli: &Cli, interactive: bool) -> Result<Option<String>, String> {
+    if cli.password_stdin {
+        if io::stdin().is_terminal() {
+            return Err("PASSWORD_STDIN: password input must come from a pipe".to_string());
+        }
+        let mut password = String::new();
+        io::stdin()
+            .read_to_string(&mut password)
+            .map_err(|error| format!("PASSWORD_STDIN: cannot read password: {error}"))?;
+        let password = password.trim_end_matches(['\r', '\n']).to_string();
+        return Ok((!password.is_empty()).then_some(password));
+    }
+    if interactive {
+        prompt_password()
+    } else {
+        Ok(None)
+    }
+}
+
+#[cfg(unix)]
+fn prompt_password() -> Result<Option<String>, String> {
+    use std::mem::MaybeUninit;
+    use std::os::fd::AsRawFd;
+
+    eprint!("Password [optional]: ");
+    io::stderr()
+        .flush()
+        .map_err(|error| format!("cannot flush prompt: {error}"))?;
+    let fd = io::stdin().as_raw_fd();
+    let mut original = MaybeUninit::uninit();
+    let hidden = unsafe {
+        if libc::tcgetattr(fd, original.as_mut_ptr()) != 0 {
+            return prompt_value("", Some(String::new()));
+        }
+        let original = original.assume_init();
+        let mut hidden = original;
+        hidden.c_lflag &= !libc::ECHO;
+        if libc::tcsetattr(fd, libc::TCSANOW, &hidden) != 0 {
+            return prompt_value("", Some(String::new()));
+        }
+        (original, hidden)
+    };
+    let mut value = String::new();
+    let read_result = io::stdin().read_line(&mut value);
+    unsafe {
+        let _ = libc::tcsetattr(fd, libc::TCSANOW, &hidden.0);
+    }
+    eprintln!();
+    read_result.map_err(|error| format!("cannot read password: {error}"))?;
+    let value = value.trim().to_string();
+    Ok((!value.is_empty()).then_some(value))
+}
+
+#[cfg(not(unix))]
+fn prompt_password() -> Result<Option<String>, String> {
+    prompt_value("Password [optional]: ", Some(String::new()))
+}
+
+fn prompt_value(prompt: &str, default: Option<String>) -> Result<Option<String>, String> {
+    eprint!("{prompt}");
+    io::stderr()
+        .flush()
+        .map_err(|error| format!("cannot flush prompt: {error}"))?;
+    let mut value = String::new();
+    io::stdin()
+        .read_line(&mut value)
+        .map_err(|error| format!("cannot read prompt: {error}"))?;
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        Ok(default.filter(|default| !default.is_empty()))
+    } else {
+        Ok(Some(value))
+    }
+}
+
+fn prompt_yes(prompt: &str) -> Result<bool, String> {
+    Ok(prompt_value(prompt, None)?
+        .is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "y" | "yes")))
+}
+
+fn resolve_relative_path(value: &str, base: &std::path::Path) -> PathBuf {
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        path
+    } else {
+        base.join(path)
+    }
 }
 
 fn run_setup(cli: &Cli) -> Result<(), String> {
@@ -469,6 +735,7 @@ enum Command {
     List,
     Show(String),
     Connect(Option<String>),
+    CreateHost,
     Setup,
 }
 
@@ -489,6 +756,15 @@ struct Cli {
     source: Option<PathBuf>,
     line: Option<usize>,
     id: Option<String>,
+    alias: Option<String>,
+    hostname: Option<String>,
+    user: Option<String>,
+    port: Option<u16>,
+    password_stdin: bool,
+    folder: Option<PathBuf>,
+    file: Option<PathBuf>,
+    yes: bool,
+    preview: bool,
     no_input: bool,
     roots: Vec<RootRequest>,
 }
@@ -502,6 +778,15 @@ impl Cli {
         let mut source = None;
         let mut line = None;
         let mut id = None;
+        let mut alias = None;
+        let mut hostname = None;
+        let mut user = None;
+        let mut port = None;
+        let mut password_stdin = false;
+        let mut folder = None;
+        let mut file = None;
+        let mut yes = false;
+        let mut preview = false;
         let mut host = None;
         let mut no_input = false;
         let mut roots = Vec::new();
@@ -540,8 +825,30 @@ impl Cli {
                         .parse()
                         .map_err(|_| "--line requires a number".to_string())?,
                 );
-            } else if text == "--host" || text == "--alias" || text == "--selector" {
+            } else if text == "--host" || text == "--selector" {
                 host = Some(next(text)?);
+            } else if text == "--alias" {
+                alias = Some(next(text)?);
+            } else if text == "--hostname" {
+                hostname = Some(next(text)?);
+            } else if text == "--user" {
+                user = Some(next(text)?);
+            } else if text == "--port" {
+                port = Some(
+                    next(text)?
+                        .parse()
+                        .map_err(|_| "--port requires a number".to_string())?,
+                );
+            } else if text == "--password-stdin" {
+                password_stdin = true;
+            } else if text == "--folder" {
+                folder = Some(PathBuf::from(next(text)?));
+            } else if text == "--file" || text == "--target-file" {
+                file = Some(PathBuf::from(next(text)?));
+            } else if text == "--yes" {
+                yes = true;
+            } else if text == "--preview" || text == "--dry-run" {
+                preview = true;
             } else if text == "--id" || text == "--host-id" {
                 id = Some(next(text)?);
             } else if text == "--no-input" || text == "--non-interactive" {
@@ -601,6 +908,7 @@ impl Cli {
             [host, show] if host == "host" && show == "show" => {
                 return Err("host show requires a selector".to_string());
             }
+            [host, create] if host == "host" && create == "create" => Command::CreateHost,
             [connect] if connect == "connect" => Command::Connect(None),
             [connect, selector] if connect == "connect" => Command::Connect(Some(selector.clone())),
             [setup] if setup == "setup" => Command::Setup,
@@ -609,16 +917,25 @@ impl Cli {
             }
             _ => {
                 return Err(format!(
-                    "expected `host list`, `host show SELECTOR`, `connect`, or `setup`\n{HOST_USAGE}\n{SETUP_USAGE}"
+                    "expected `host list`, `host show SELECTOR`, `host create`, `connect`, or `setup`\n{HOST_USAGE}\n{SETUP_USAGE}"
                 ));
             }
         };
-
         let command = match command {
-            Command::Connect(Some(_selector)) if host.is_some() => {
+            Command::Connect(Some(_selector)) if host.is_some() || alias.is_some() => {
                 return Err("SELECTOR_CONFLICT: provide one host selector".to_string());
             }
-            Command::Connect(selector) => Command::Connect(selector.or(host)),
+            Command::Connect(selector) => {
+                Command::Connect(selector.or(host).or_else(|| alias.clone()))
+            }
+            Command::CreateHost => {
+                if host.is_some() || id.is_some() || source.is_some() || line.is_some() {
+                    return Err(
+                        "SELECTOR_CONFLICT: host create does not accept host selectors".to_string(),
+                    );
+                }
+                Command::CreateHost
+            }
             command => {
                 if host.is_some() {
                     return Err("--host is only valid with connect".to_string());
@@ -636,6 +953,15 @@ impl Cli {
             source,
             line,
             id,
+            alias,
+            hostname,
+            user,
+            port,
+            password_stdin,
+            folder,
+            file,
+            yes,
+            preview,
             no_input,
             roots,
         })

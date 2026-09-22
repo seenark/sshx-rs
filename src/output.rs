@@ -1,4 +1,5 @@
 use crate::discovery::{Diagnostic, HostEntry};
+use crate::mutation::{CreatePlan, FileOperation};
 use serde::Serialize;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -90,6 +91,57 @@ pub fn render_human(entries: &[&HostEntry]) -> String {
 
 pub fn render_diagnostic(diagnostic: &Diagnostic) -> String {
     format!("warning [{}]: {}", diagnostic.code, diagnostic.message)
+}
+
+pub fn render_create(
+    plan: &CreatePlan,
+    format: OutputFormat,
+    applied: bool,
+) -> Result<String, String> {
+    if format.is_machine() {
+        #[derive(Serialize)]
+        struct Document<'a> {
+            version: u8,
+            applied: bool,
+            id: &'a str,
+            files: &'a [crate::mutation::FileChange],
+        }
+        let mut rendered = match format {
+            OutputFormat::Json => serde_json::to_string_pretty(&Document {
+                version: 1,
+                applied,
+                id: &plan.id,
+                files: &plan.files,
+            })
+            .map_err(|error| format!("cannot render JSON output: {error}"))?,
+            OutputFormat::Yaml => serde_yaml::to_string(&Document {
+                version: 1,
+                applied,
+                id: &plan.id,
+                files: &plan.files,
+            })
+            .map_err(|error| format!("cannot render YAML output: {error}"))?,
+            OutputFormat::Human => unreachable!(),
+        };
+        if !rendered.ends_with('\n') {
+            rendered.push('\n');
+        }
+        return Ok(rendered);
+    }
+
+    let mut rendered = format!(
+        "{} host entry {}\n",
+        if applied { "Applied" } else { "Preview" },
+        plan.id
+    );
+    for file in &plan.files {
+        let operation = match file.operation {
+            FileOperation::Create => "create",
+            FileOperation::Modify => "modify",
+        };
+        rendered.push_str(&format!("{operation} {}\n{}", file.path, file.patch));
+    }
+    Ok(rendered)
 }
 
 #[cfg(test)]

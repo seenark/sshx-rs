@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
@@ -74,6 +75,24 @@ fn run(home: &Path, args: &[&str]) -> std::process::Output {
         .args(args)
         .output()
         .expect("sshx binary should run")
+}
+
+fn run_with_stdin(home: &Path, args: &[&str], input: &[u8]) -> std::process::Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sshx"))
+        .env("HOME", home)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("sshx binary should run");
+    child
+        .stdin
+        .take()
+        .expect("stdin should be piped")
+        .write_all(input)
+        .expect("password should be written");
+    child.wait_with_output().expect("sshx binary should finish")
 }
 
 #[test]
@@ -789,4 +808,294 @@ fn signal_cleanup_closes_only_owned_master() {
     assert_eq!(status.code(), Some(2));
     assert!(root.join("master-closed").exists());
     fs::remove_dir_all(root).expect("fixture should be removed");
+}
+
+#[test]
+fn host_create_preview_redacts_and_applies_unique_ids() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    let original = b"# keep\nHost existing\n  HostName old.example\n";
+    write(&config, std::str::from_utf8(original).unwrap());
+    let config_text = config.to_str().unwrap();
+    let preview = run_with_stdin(
+        &home,
+        &[
+            "--config",
+            config_text,
+            "host",
+            "create",
+            "--scope",
+            "personal",
+            "--folder",
+            home.join(".ssh").to_str().unwrap(),
+            "--file",
+            "created.conf",
+            "--alias",
+            "created",
+            "--hostname",
+            "created.example",
+            "--user",
+            "alice",
+            "--port",
+            "2222",
+            "--password-stdin",
+            "--preview",
+            "--no-input",
+            "--format",
+            "json",
+        ],
+        b"secret-value\n",
+    );
+    assert!(preview.status.success(), "{preview:?}");
+    assert!(!home.join(".ssh/created.conf").exists());
+    let preview_text = String::from_utf8_lossy(&preview.stdout);
+    assert!(preview_text.contains("created.conf"));
+    assert!(preview_text.contains("<redacted>"));
+    assert!(!preview_text.contains("secret-value"));
+    let preview_document: serde_json::Value =
+        serde_json::from_slice(&preview.stdout).expect("preview should be one JSON document");
+    assert_eq!(preview_document["applied"], false);
+    assert_eq!(fs::read(&config).unwrap(), original);
+
+    let apply = run_with_stdin(
+        &home,
+        &[
+            "--config",
+            config_text,
+            "host",
+            "create",
+            "--scope",
+            "personal",
+            "--folder",
+            home.join(".ssh").to_str().unwrap(),
+            "--file",
+            "created.conf",
+            "--alias",
+            "created",
+            "--hostname",
+            "created.example",
+            "--user",
+            "alice",
+            "--port",
+            "2222",
+            "--password-stdin",
+            "--yes",
+            "--no-input",
+            "--format",
+            "json",
+        ],
+        b"secret-value\n",
+    );
+    assert!(apply.status.success(), "{apply:?}");
+    let apply_text = String::from_utf8_lossy(&apply.stdout);
+    assert!(!apply_text.contains("secret-value"));
+    let created = home.join(".ssh/created.conf");
+    let created_text = fs::read_to_string(&created).unwrap();
+    assert!(created_text.contains("##PASSWORD secret-value"));
+    assert_eq!(&fs::read(&config).unwrap()[..original.len()], original);
+    assert!(
+        fs::read_to_string(&config)
+            .unwrap()
+            .ends_with("Include created.conf\n")
+    );
+    assert_eq!(
+        fs::metadata(&created).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+
+    let second = run(
+        &home,
+        &[
+            "--config",
+            config_text,
+            "host",
+            "create",
+            "--scope",
+            "personal",
+            "--folder",
+            home.join(".ssh").to_str().unwrap(),
+            "--file",
+            "created.conf",
+            "--alias",
+            "created-two",
+            "--hostname",
+            "created-two.example",
+            "--yes",
+            "--no-input",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(second.status.success(), "{second:?}");
+    let list = run(
+        &home,
+        &["--config", config_text, "host", "list", "--format", "json"],
+    );
+    assert!(list.status.success(), "{list:?}");
+    let document: serde_json::Value =
+        serde_json::from_slice(&list.stdout).expect("host list should parse");
+    let ids = document["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| {
+            entry["aliases"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|alias| alias == "created" || alias == "created-two")
+        })
+        .map(|entry| entry["id"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(ids.len(), 2);
+    assert_ne!(ids[0], ids[1]);
+    assert_eq!(
+        fs::read_to_string(&config)
+            .unwrap()
+            .matches("Include created.conf")
+            .count(),
+        1
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn host_create_respects_wildcard_include_and_crlf_modes() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    let original = b"Include hosts/*.conf\r\n# unrelated\r\n";
+    fs::create_dir_all(home.join(".ssh/hosts")).unwrap();
+    fs::write(&config, original).unwrap();
+    let mut permissions = fs::metadata(&config).unwrap().permissions();
+    permissions.set_mode(0o640);
+    fs::set_permissions(&config, permissions).unwrap();
+    let output = run(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "host",
+            "create",
+            "--scope",
+            "personal",
+            "--folder",
+            home.join(".ssh/hosts").to_str().unwrap(),
+            "--file",
+            "new.conf",
+            "--alias",
+            "wild",
+            "--hostname",
+            "wild.example",
+            "--yes",
+            "--no-input",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(output.status.success(), "{output:?}");
+    let document: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("create output should parse");
+    assert_eq!(document["files"].as_array().unwrap().len(), 1);
+    assert_eq!(fs::read(&config).unwrap(), original);
+    let target = home.join(".ssh/hosts/new.conf");
+    let target_bytes = fs::read(&target).unwrap();
+    assert!(target_bytes.windows(2).any(|window| window == b"\r\n"));
+    assert!(!target_bytes.windows(2).any(|window| window == b"\n\n"));
+    assert_eq!(
+        fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        fs::metadata(&config).unwrap().permissions().mode() & 0o777,
+        0o640
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn host_create_selects_registered_project_root() {
+    let (root, home) = fixture_root();
+    let work = home.join("work/config");
+    write(&work, "Host work\n  HostName work.example\n");
+    let setup = run(
+        &home,
+        &[
+            "setup",
+            "--project",
+            "alpha",
+            "--work",
+            work.to_str().unwrap(),
+            "--format",
+            "json",
+        ],
+    );
+    assert!(setup.status.success(), "{setup:?}");
+    let target_folder = home.join("work/hosts");
+    let create = run(
+        &home,
+        &[
+            "host",
+            "create",
+            "--scope",
+            "work",
+            "--project",
+            "alpha",
+            "--folder",
+            target_folder.to_str().unwrap(),
+            "--file",
+            "created.conf",
+            "--alias",
+            "created",
+            "--hostname",
+            "created.example",
+            "--yes",
+            "--no-input",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(create.status.success(), "{create:?}");
+    assert!(target_folder.join("created.conf").is_file());
+    let document: serde_json::Value =
+        serde_json::from_slice(&create.stdout).expect("create output should parse");
+    assert_eq!(document["files"].as_array().unwrap().len(), 2);
+    assert!(
+        document["files"][1]["patch"]
+            .as_str()
+            .unwrap()
+            .contains(target_folder.join("created.conf").to_str().unwrap())
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn host_create_requires_consent_without_prompting() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(&config, "Host root\n  HostName root.example\n");
+    let output = run(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "host",
+            "create",
+            "--scope",
+            "personal",
+            "--folder",
+            home.join(".ssh").to_str().unwrap(),
+            "--file",
+            "new.conf",
+            "--alias",
+            "new",
+            "--hostname",
+            "new.example",
+            "--no-input",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("CONSENT_REQUIRED"));
+    assert!(!home.join(".ssh/new.conf").exists());
+
+    fs::remove_dir_all(root).unwrap();
 }
