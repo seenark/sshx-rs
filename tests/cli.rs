@@ -627,6 +627,10 @@ case " $args " in
       echo "Host key verification failed." >&2
       exit 255
     fi
+    if [ "$SSHX_AUTH_FAIL" = "1" ]; then
+      echo "Permission denied, please try again." >&2
+      exit 5
+    fi
     [ -n "$SSHX_STARTED" ] && : > "$SSHX_STARTED"
     trap 'exit 0' INT HUP TERM
     while :; do sleep 1; done
@@ -649,6 +653,28 @@ esac
     fs::set_permissions(&script, permissions).expect("fake SSH should be executable");
     bin
 }
+fn fake_sshpass(root: &Path) {
+    let script = root.join("bin/sshpass");
+    write(
+        &script,
+        r#"#!/bin/sh
+if [ "$1" != "-d" ] || [ -z "$2" ]; then exit 97; fi
+password_fd="$2"
+shift 2
+[ "$1" = "ssh" ] || exit 98
+shift
+[ -n "$SSHX_PASSPASS_COUNT" ] && printf '1' >> "$SSHX_PASSPASS_COUNT"
+[ -n "$SSHX_PASSWORD_CAPTURE" ] && eval "cat <&$password_fd" > "$SSHX_PASSWORD_CAPTURE"
+[ -n "$SSHX_ARG_CAPTURE" ] && printf '%s\n' "$*" > "$SSHX_ARG_CAPTURE"
+exec ssh "$@"
+"#,
+    );
+    let mut permissions = fs::metadata(&script)
+        .expect("fake sshpass should exist")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&script, permissions).expect("fake sshpass should be executable");
+}
 
 fn run_fake_ssh(home: &Path, args: &[&str], bin: &Path, root: &Path) -> std::process::Output {
     let path = format!(
@@ -662,6 +688,15 @@ fn run_fake_ssh(home: &Path, args: &[&str], bin: &Path, root: &Path) -> std::pro
         .env("SSHX_CAPTURE", root.join("runtime-config").as_os_str())
         .env("SSHX_STARTED", root.join("master-started").as_os_str())
         .env("SSHX_CLOSED", root.join("master-closed").as_os_str())
+        .env(
+            "SSHX_PASSWORD_CAPTURE",
+            root.join("password-capture").as_os_str(),
+        )
+        .env("SSHX_ARG_CAPTURE", root.join("sshpass-args").as_os_str())
+        .env(
+            "SSHX_PASSPASS_COUNT",
+            root.join("sshpass-count").as_os_str(),
+        )
         .args(args)
         .output()
         .expect("sshx binary should run")
@@ -676,6 +711,7 @@ fn direct_connect_compiles_exact_block_and_uses_owned_master() {
         "##SSHX ID=direct-id\nHost direct\n  HostName direct.example # remove this\n  User alice\n  IdentityFile ~/.ssh/id_ed25519\n  ##PASSWORD never-copy-this\n",
     );
     let bin = fake_ssh(&root);
+    fake_sshpass(&root);
     let output = run_fake_ssh(&home, &["connect", "direct", "--no-input"], &bin, &root);
     assert!(output.status.success(), "{output:?}");
     assert_eq!(String::from_utf8_lossy(&output.stdout), "direct-shell\n");
@@ -691,6 +727,153 @@ fn direct_connect_compiles_exact_block_and_uses_owned_master() {
     assert!(root.join("master-started").exists());
     assert!(root.join("master-closed").exists());
     fs::remove_dir_all(root).expect("fixture should be removed");
+}
+
+#[test]
+fn direct_password_uses_selected_metadata_once_through_anonymous_fd() {
+    let (root, home) = fixture_root();
+    write(
+        &home.join(".ssh/config"),
+        "Host sibling\n  HostName sibling.example\n  ##PASSWORD sibling-secret\nHost selected\n  HostName selected.example\n  ##PASSWORD selected-secret\n",
+    );
+    let bin = fake_ssh(&root);
+    fake_sshpass(&root);
+    let output = run_fake_ssh(&home, &["connect", "selected", "--no-input"], &bin, &root);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        fs::read_to_string(root.join("password-capture")).unwrap(),
+        "selected-secret\n"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("sshpass-count"))
+            .unwrap()
+            .len(),
+        1
+    );
+    let args = fs::read_to_string(root.join("sshpass-args")).unwrap();
+    assert!(!args.contains("selected-secret"));
+    assert!(!args.contains("sibling-secret"));
+    let runtime = fs::read_to_string(root.join("runtime-config")).unwrap();
+    assert!(!runtime.contains("selected-secret"));
+    assert!(!runtime.contains("sibling-secret"));
+    let output_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!output_text.contains("selected-secret"));
+    assert!(!output_text.contains("sibling-secret"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn wrong_configured_password_fails_without_retry_in_no_input_mode() {
+    let (root, home) = fixture_root();
+    write(
+        &home.join(".ssh/config"),
+        "Host selected\n  HostName selected.example\n  ##PASSWORD configured-secret\n",
+    );
+    let bin = fake_ssh(&root);
+    fake_sshpass(&root);
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_sshx"))
+        .env("HOME", &home)
+        .env("PATH", path)
+        .env("SSHX_CAPTURE", root.join("runtime-config").as_os_str())
+        .env("SSHX_STARTED", root.join("master-started").as_os_str())
+        .env("SSHX_CLOSED", root.join("master-closed").as_os_str())
+        .env("SSHX_AUTH_FAIL", "1")
+        .env(
+            "SSHX_PASSWORD_CAPTURE",
+            root.join("password-capture").as_os_str(),
+        )
+        .env(
+            "SSHX_PASSPASS_COUNT",
+            root.join("sshpass-count").as_os_str(),
+        )
+        .args(["connect", "selected", "--no-input"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("SSH_AUTH_FAILED"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("Password for direct host"));
+    assert_eq!(
+        fs::read_to_string(root.join("password-capture")).unwrap(),
+        "configured-secret\n"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("sshpass-count"))
+            .unwrap()
+            .len(),
+        1
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn explicit_password_fd_is_consumed_without_password_argument() {
+    let (root, home) = fixture_root();
+    write(
+        &home.join(".ssh/config"),
+        "Host selected\n  HostName selected.example\n",
+    );
+    let password_file = root.join("caller-password");
+    write(&password_file, "fd-secret\n");
+    let bin = fake_ssh(&root);
+    fake_sshpass(&root);
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let output = Command::new("sh")
+        .env("HOME", &home)
+        .env("PATH", path)
+        .env("SSHX_CAPTURE", root.join("runtime-config").as_os_str())
+        .env("SSHX_STARTED", root.join("master-started").as_os_str())
+        .env("SSHX_CLOSED", root.join("master-closed").as_os_str())
+        .env(
+            "SSHX_PASSWORD_CAPTURE",
+            root.join("password-capture").as_os_str(),
+        )
+        .env("SSHX_ARG_CAPTURE", root.join("sshpass-args").as_os_str())
+        .arg("-c")
+        .arg(r#"exec 3<"$1"; exec "$2" connect selected --password-fd 3 --no-input"#)
+        .arg("sshx-fd-test")
+        .arg(password_file.as_os_str())
+        .arg(env!("CARGO_BIN_EXE_sshx"))
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        fs::read_to_string(root.join("password-capture")).unwrap(),
+        "fd-secret\n"
+    );
+    assert!(
+        !fs::read_to_string(root.join("sshpass-args"))
+            .unwrap()
+            .contains("fd-secret")
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn key_only_entry_uses_plain_ssh_without_sshpass() {
+    let (root, home) = fixture_root();
+    write(
+        &home.join(".ssh/config"),
+        "Host selected\n  HostName selected.example\n  IdentityFile ~/.ssh/id_ed25519\n",
+    );
+    let bin = fake_ssh(&root);
+    fake_sshpass(&root);
+    let output = run_fake_ssh(&home, &["connect", "selected", "--no-input"], &bin, &root);
+    assert!(output.status.success(), "{output:?}");
+    assert!(!root.join("sshpass-count").exists());
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

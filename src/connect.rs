@@ -1,6 +1,7 @@
 use crate::discovery::HostEntry;
-use std::fs::{self, OpenOptions};
-use std::io::Read;
+use crate::mutation::{self, UpdateRequest};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -8,7 +9,11 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
+use std::os::fd::{FromRawFd, RawFd};
+#[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 const SYSTEM_CONFIG: &str = "/etc/ssh/ssh_config";
 const MASTER_TIMEOUT: Duration = Duration::from_secs(30);
@@ -61,12 +66,53 @@ fn received_signal() -> Option<i32> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PasswordSource {
+    Configured,
+    Supplied,
+    Prompted,
+}
+
+struct PasswordAttempt {
+    bytes: Vec<u8>,
+    source: PasswordSource,
+    replacement: Option<String>,
+}
+
+impl PasswordAttempt {
+    fn configured(value: String) -> Self {
+        Self {
+            bytes: value.as_bytes().to_vec(),
+            source: PasswordSource::Configured,
+            replacement: None,
+        }
+    }
+
+    fn supplied(bytes: Vec<u8>) -> Self {
+        Self {
+            replacement: String::from_utf8(bytes.clone()).ok(),
+            bytes,
+            source: PasswordSource::Supplied,
+        }
+    }
+
+    fn prompted(value: String) -> Self {
+        Self {
+            bytes: value.as_bytes().to_vec(),
+            source: PasswordSource::Prompted,
+            replacement: Some(value),
+        }
+    }
+}
+
 struct Runtime {
     dir: PathBuf,
     config: PathBuf,
     socket: PathBuf,
     alias: String,
     known_hosts: PathBuf,
+    entry: HostEntry,
+    configured_password: Option<String>,
 }
 
 impl Runtime {
@@ -75,6 +121,7 @@ impl Runtime {
             return Err("CONFIG_CHANGED: selected alias no longer exists".to_string());
         }
         let content = compile_config(entry, selected_alias)?;
+        let configured_password = selected_password(entry)?;
         let dir = temporary_directory()?;
         let config = dir.join("config");
         let socket = dir.join("master.sock");
@@ -87,6 +134,8 @@ impl Runtime {
             socket,
             alias: selected_alias.to_string(),
             known_hosts,
+            entry: entry.clone(),
+            configured_password,
         })
     }
 }
@@ -103,9 +152,19 @@ pub fn open(
     no_input: bool,
     selected_alias: &str,
 ) -> Result<(), String> {
+    open_with_password_fd(entry, home, no_input, selected_alias, None)
+}
+
+pub fn open_with_password_fd(
+    entry: &HostEntry,
+    home: &Path,
+    no_input: bool,
+    selected_alias: &str,
+    password_fd: Option<i32>,
+) -> Result<(), String> {
     SIGNAL.store(0, Ordering::Relaxed);
     install_signal_handlers();
-    let result = open_session(entry, home, no_input, selected_alias);
+    let result = open_session(entry, home, no_input, selected_alias, password_fd);
     reset_signal_handlers();
     result
 }
@@ -115,24 +174,51 @@ fn open_session(
     home: &Path,
     no_input: bool,
     selected_alias: &str,
+    password_fd: Option<i32>,
 ) -> Result<(), String> {
     let runtime = Runtime::create(entry, home, selected_alias)?;
-    let mut master = spawn_master(&runtime, no_input)?;
-    let ready = wait_for_master(&runtime, &mut master, no_input);
-    if let Err(error) = ready {
-        stop_master(&runtime, &mut master);
-        if !no_input && error.starts_with("HOST_KEY_TRUST_REQUIRED") {
-            enroll_host_key(&runtime)?;
-            master = spawn_master(&runtime, no_input)?;
-            if let Err(error) = wait_for_master(&runtime, &mut master, no_input) {
+    let mut attempt = match password_fd {
+        Some(fd) => Some(read_password_fd(fd)?),
+        None => runtime
+            .configured_password
+            .clone()
+            .map(PasswordAttempt::configured),
+    };
+    let mut enrolled = false;
+    let master = loop {
+        let mut master = spawn_master(&runtime, no_input, attempt.as_ref())?;
+        match wait_for_master(&runtime, &mut master, no_input) {
+            Ok(()) => break master,
+            Err(error) => {
                 stop_master(&runtime, &mut master);
+                if !enrolled && !no_input && error.starts_with("HOST_KEY_TRUST_REQUIRED") {
+                    enroll_host_key(&runtime)?;
+                    enrolled = true;
+                    continue;
+                }
+                let can_prompt = !no_input
+                    && io::stdin().is_terminal()
+                    && error.starts_with("SSH_AUTH_FAILED")
+                    && attempt
+                        .as_ref()
+                        .is_none_or(|value| value.source != PasswordSource::Prompted);
+                if can_prompt
+                    && let Some(next) = prompt_password(&runtime.alias, attempt.is_some())?
+                {
+                    attempt = Some(next);
+                    continue;
+                }
                 return Err(error);
             }
-        } else {
-            return Err(error);
         }
+    };
+    let mut master = master;
+    if let Some(attempt) = attempt.as_ref()
+        && let Err(error) = save_replacement(&runtime, attempt, no_input)
+    {
+        stop_master(&runtime, &mut master);
+        return Err(error);
     }
-
     let mut shell = match spawn_shell(&runtime, no_input) {
         Ok(shell) => shell,
         Err(error) => {
@@ -140,7 +226,13 @@ fn open_session(
             return Err(error);
         }
     };
-    let status = wait_for_shell(&mut shell)?;
+    let status = match wait_for_shell(&mut shell) {
+        Ok(status) => status,
+        Err(error) => {
+            stop_master(&runtime, &mut master);
+            return Err(error);
+        }
+    };
     stop_master(&runtime, &mut master);
     if let Some(signal) = received_signal() {
         return Err(format!("SESSION_INTERRUPTED: signal {signal}"));
@@ -152,8 +244,12 @@ fn open_session(
     }
 }
 
-fn spawn_master(runtime: &Runtime, no_input: bool) -> Result<Child, String> {
-    let mut command = ssh_command(runtime, no_input, true);
+fn spawn_master(
+    runtime: &Runtime,
+    no_input: bool,
+    attempt: Option<&PasswordAttempt>,
+) -> Result<Child, String> {
+    let (mut command, password_pipe) = auth_command(runtime, no_input, true, attempt)?;
     command.args(["-M", "-N", "-o", "ControlMaster=yes"]);
     command.arg(&runtime.alias);
     command
@@ -164,9 +260,17 @@ fn spawn_master(runtime: &Runtime, no_input: bool) -> Result<Child, String> {
         })
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
-    command
+    let mut child = command
         .spawn()
-        .map_err(|error| format!("SSH_AUTH_FAILED: cannot start OpenSSH: {error}"))
+        .map_err(|error| format!("SSH_AUTH_FAILED: cannot start OpenSSH: {error}"))?;
+    if let Some(password_pipe) = password_pipe
+        && let Err(error) = password_pipe.send()
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+    Ok(child)
 }
 
 fn spawn_shell(runtime: &Runtime, no_input: bool) -> Result<Child, String> {
@@ -219,9 +323,135 @@ fn enroll_host_key(runtime: &Runtime) -> Result<(), String> {
         Err("HOST_KEY_TRUST_REQUIRED: host key requires interactive confirmation".to_string())
     }
 }
+#[cfg(unix)]
+struct PasswordPipe {
+    read: RawFd,
+    writer: Option<File>,
+    password: Vec<u8>,
+}
+
+#[cfg(unix)]
+impl PasswordPipe {
+    fn new(password: &[u8]) -> Result<Self, String> {
+        let mut descriptors = [0; 2];
+        if unsafe { libc::pipe(descriptors.as_mut_ptr()) } != 0 {
+            return Err(format!(
+                "SSH_AUTH_FAILED: cannot create password pipe: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        let read = descriptors[0];
+        let write = descriptors[1];
+        if let Err(error) = set_cloexec(read).and_then(|_| set_cloexec(write)) {
+            unsafe {
+                libc::close(read);
+                libc::close(write);
+            }
+            return Err(format!(
+                "SSH_AUTH_FAILED: cannot protect password pipe: {error}"
+            ));
+        }
+        Ok(Self {
+            read,
+            writer: Some(unsafe { File::from_raw_fd(write) }),
+            password: password.to_vec(),
+        })
+    }
+
+    fn send(mut self) -> Result<(), String> {
+        let mut writer = self
+            .writer
+            .take()
+            .expect("password pipe writer should exist");
+        writer
+            .write_all(&self.password)
+            .and_then(|_| writer.write_all(b"\n"))
+            .map_err(|error| format!("SSH_AUTH_FAILED: cannot write password pipe: {error}"))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for PasswordPipe {
+    fn drop(&mut self) {
+        unsafe {
+            libc::close(self.read);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn set_cloexec(fd: RawFd) -> io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn clear_cloexec(fd: RawFd) -> io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn auth_command(
+    runtime: &Runtime,
+    no_input: bool,
+    strict: bool,
+    attempt: Option<&PasswordAttempt>,
+) -> Result<(Command, Option<PasswordPipe>), String> {
+    let Some(attempt) = attempt else {
+        return Ok((ssh_command(runtime, no_input, strict), None));
+    };
+    let pipe = PasswordPipe::new(&attempt.bytes)?;
+    let fd = pipe.read;
+    let mut command = Command::new("sshpass");
+    command.arg("-d").arg(fd.to_string()).arg("ssh");
+    append_ssh_args(&mut command, runtime, no_input, strict, true);
+    unsafe {
+        command.pre_exec(move || clear_cloexec(fd));
+    }
+    Ok((command, Some(pipe)))
+}
+
+#[cfg(not(unix))]
+fn auth_command(
+    runtime: &Runtime,
+    no_input: bool,
+    strict: bool,
+    attempt: Option<&PasswordAttempt>,
+) -> Result<(Command, Option<()>), String> {
+    if attempt.is_some() {
+        return Err(
+            "SSH_AUTH_FAILED: password authentication requires Unix file descriptors".to_string(),
+        );
+    }
+    Ok((ssh_command(runtime, no_input, strict), None))
+}
 
 fn ssh_command(runtime: &Runtime, no_input: bool, strict: bool) -> Command {
     let mut command = Command::new("ssh");
+    append_ssh_args(&mut command, runtime, no_input, strict, false);
+    command
+}
+
+fn append_ssh_args(
+    command: &mut Command,
+    runtime: &Runtime,
+    no_input: bool,
+    strict: bool,
+    password: bool,
+) {
     command.args(["-F", runtime.config.to_string_lossy().as_ref()]);
     command.args(["-S", runtime.socket.to_string_lossy().as_ref()]);
     let known_hosts = format!("UserKnownHostsFile={}", runtime.known_hosts.display());
@@ -229,10 +459,10 @@ fn ssh_command(runtime: &Runtime, no_input: bool, strict: bool) -> Command {
         "-o",
         "ControlPersist=no",
         "-o",
-        if no_input {
-            "BatchMode=yes"
-        } else {
+        if password || !no_input {
             "BatchMode=no"
+        } else {
+            "BatchMode=yes"
         },
         "-o",
         if strict {
@@ -255,13 +485,26 @@ fn ssh_command(runtime: &Runtime, no_input: bool, strict: bool) -> Command {
         "-o",
         known_hosts.as_str(),
         "-o",
-        "PreferredAuthentications=publickey",
+        if password {
+            "PreferredAuthentications=password"
+        } else {
+            "PreferredAuthentications=publickey"
+        },
         "-o",
-        "PasswordAuthentication=no",
+        if password {
+            "PasswordAuthentication=yes"
+        } else {
+            "PasswordAuthentication=no"
+        },
         "-o",
         "KbdInteractiveAuthentication=no",
+        "-o",
+        if password {
+            "NumberOfPasswordPrompts=1"
+        } else {
+            "NumberOfPasswordPrompts=0"
+        },
     ]);
-    command
 }
 
 fn wait_for_master(runtime: &Runtime, master: &mut Child, no_input: bool) -> Result<(), String> {
@@ -370,6 +613,175 @@ fn classify_master_failure(status: ExitStatus, stderr: &str, no_input: bool) -> 
     } else {
         format!("SSH_AUTH_FAILED: {detail}")
     }
+}
+fn selected_password(entry: &HostEntry) -> Result<Option<String>, String> {
+    let bytes = fs::read(&entry.source.path).map_err(|error| {
+        format!(
+            "CONFIG_READ_FAILED: cannot read {}: {error}",
+            entry.source.path
+        )
+    })?;
+    let end = entry.source.byte_end;
+    if entry.source.byte_start >= end || end > bytes.len() {
+        return Err("CONFIG_INVALID: selected Host span is outside source file".to_string());
+    }
+    let block = &bytes[entry.source.byte_start..end];
+    for raw in block.split(|byte| *byte == b'\n') {
+        let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
+        let start = raw
+            .iter()
+            .position(|byte| !byte.is_ascii_whitespace())
+            .unwrap_or(raw.len());
+        let line = &raw[start..];
+        if line.len() < 10
+            || !line[..10].eq_ignore_ascii_case(b"##PASSWORD")
+            || line.get(10).is_some_and(|byte| !byte.is_ascii_whitespace())
+        {
+            continue;
+        }
+        let value = line[10..]
+            .iter()
+            .position(|byte| !byte.is_ascii_whitespace())
+            .map_or(&[][..], |offset| &line[10 + offset..]);
+        if value.is_empty() {
+            return Ok(None);
+        }
+        let value = std::str::from_utf8(value)
+            .map_err(|_| "CONFIG_INVALID: password metadata is not valid UTF-8".to_string())?;
+        return Ok(Some(value.to_string()));
+    }
+    Ok(None)
+}
+
+#[cfg(unix)]
+fn read_password_fd(fd: i32) -> Result<PasswordAttempt, String> {
+    if fd < 0 {
+        return Err("PASSWORD_FD_INVALID: file descriptor must be non-negative".to_string());
+    }
+    let duplicate = unsafe { libc::dup(fd) };
+    if duplicate < 0 {
+        return Err(format!(
+            "PASSWORD_FD_INVALID: cannot read file descriptor {fd}: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    set_cloexec(fd).map_err(|error| {
+        unsafe {
+            libc::close(duplicate);
+        }
+        format!("PASSWORD_FD_INVALID: cannot protect file descriptor {fd}: {error}")
+    })?;
+    let mut file = unsafe { File::from_raw_fd(duplicate) };
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(|error| {
+        format!("PASSWORD_FD_INVALID: cannot read file descriptor {fd}: {error}")
+    })?;
+    while matches!(bytes.last(), Some(b'\n' | b'\r')) {
+        bytes.pop();
+    }
+    if bytes.is_empty() || bytes.iter().any(|byte| matches!(*byte, b'\r' | b'\n' | 0)) {
+        return Err("PASSWORD_FD_INVALID: password must contain one non-empty line".to_string());
+    }
+    Ok(PasswordAttempt::supplied(bytes))
+}
+
+#[cfg(not(unix))]
+fn read_password_fd(_fd: i32) -> Result<PasswordAttempt, String> {
+    Err("PASSWORD_FD_INVALID: explicit password descriptors require Unix".to_string())
+}
+
+fn prompt_password(alias: &str, replacement: bool) -> Result<Option<PasswordAttempt>, String> {
+    if !io::stdin().is_terminal() {
+        return Ok(None);
+    }
+    #[cfg(unix)]
+    {
+        use std::mem::MaybeUninit;
+        use std::os::fd::AsRawFd;
+
+        let label = if replacement {
+            format!("Password for direct host `{alias}` (replacement): ")
+        } else {
+            format!("Password for direct host `{alias}`: ")
+        };
+        eprint!("{label}");
+        io::stderr()
+            .flush()
+            .map_err(|error| format!("PASSWORD_PROMPT_FAILED: cannot flush prompt: {error}"))?;
+        let fd = io::stdin().as_raw_fd();
+        let mut original = MaybeUninit::uninit();
+        let original = unsafe {
+            if libc::tcgetattr(fd, original.as_mut_ptr()) != 0 {
+                return Err(
+                    "PASSWORD_PROMPT_FAILED: interactive input is not a terminal".to_string(),
+                );
+            }
+            original.assume_init()
+        };
+        let mut hidden = original;
+        hidden.c_lflag &= !libc::ECHO;
+        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &hidden) } != 0 {
+            return Err("PASSWORD_PROMPT_FAILED: cannot hide password input".to_string());
+        }
+        let mut value = String::new();
+        let read_result = io::stdin().read_line(&mut value);
+        let restore_result = unsafe { libc::tcsetattr(fd, libc::TCSANOW, &original) };
+        eprintln!();
+        if read_result.is_err() || restore_result != 0 {
+            return Err("PASSWORD_PROMPT_FAILED: cannot read hidden password".to_string());
+        }
+        let value = value.trim_end_matches(['\r', '\n']).to_string();
+        Ok((!value.is_empty()).then(|| PasswordAttempt::prompted(value)))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (alias, replacement);
+        Err("PASSWORD_PROMPT_FAILED: hidden password input is unsupported".to_string())
+    }
+}
+
+fn save_replacement(
+    runtime: &Runtime,
+    attempt: &PasswordAttempt,
+    no_input: bool,
+) -> Result<(), String> {
+    let Some(password) = attempt.replacement.as_deref() else {
+        return Ok(());
+    };
+    if no_input || !io::stdin().is_terminal() {
+        return Ok(());
+    }
+    eprint!(
+        "Save replacement password for direct host `{}`? [y/N]: ",
+        runtime.alias
+    );
+    io::stderr()
+        .flush()
+        .map_err(|error| format!("PASSWORD_PROMPT_FAILED: cannot flush prompt: {error}"))?;
+    let mut answer = String::new();
+    io::stdin()
+        .read_line(&mut answer)
+        .map_err(|error| format!("PASSWORD_PROMPT_FAILED: cannot read consent: {error}"))?;
+    if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        return Ok(());
+    }
+    mutation::validate_entry_paths(&runtime.entry)?;
+    let plan = mutation::plan_update(&UpdateRequest {
+        path: PathBuf::from(&runtime.entry.source.path),
+        expected_id: runtime.entry.id.clone(),
+        selected_alias: runtime.alias.clone(),
+        byte_start: runtime.entry.source.byte_start,
+        byte_end: runtime.entry.source.byte_end,
+        alias: None,
+        hostname: None,
+        user: None,
+        port: None,
+        password: Some(password.to_string()),
+        clear_user: false,
+        clear_port: false,
+        clear_password: false,
+    })?;
+    mutation::apply_edit(&plan)
 }
 
 fn compile_config(entry: &HostEntry, selected_alias: &str) -> Result<String, String> {

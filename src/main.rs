@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::process;
 const USAGE: &str = "Usage: sshx [--version]";
 const HOST_USAGE: &str = "Usage: sshx [--config PATH] host list [--format human|json|yaml]\n       sshx [--config PATH] host show SELECTOR [--format human|json|yaml]\n       sshx [--config PATH] host create --scope SCOPE --file PATH --alias ALIAS --hostname HOSTNAME [options]\n       sshx [--config PATH] host update SELECTOR [options]\n       sshx [--config PATH] host rename SELECTOR --alias ALIAS [options]\n       sshx [--config PATH] host delete SELECTOR [options]";
-const SETUP_USAGE: &str = "Usage: sshx setup [--personal PATH] [--work PATH] [--project NAME]\n       sshx connect [SELECTOR] [--id ID] [--source PATH --line NUMBER] [--no-input]";
+const SETUP_USAGE: &str = "Usage: sshx setup [--personal PATH] [--work PATH] [--project NAME]\n       sshx connect [SELECTOR] [--id ID] [--source PATH --line NUMBER] [--password-fd FD] [--no-input]";
 
 fn main() {
     match run(env::args_os().skip(1).collect()) {
@@ -83,7 +83,13 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
                     );
                 }
                 let alias = selected_connect_alias(entry, selector.as_deref(), &cli);
-                sshx::connect::open(entry, &home_dir()?, cli.no_input, alias)
+                sshx::connect::open_with_password_fd(
+                    entry,
+                    &home_dir()?,
+                    cli.no_input,
+                    alias,
+                    cli.password_fd,
+                )
             }
         }
         Command::Setup
@@ -962,6 +968,7 @@ struct Cli {
     user: Option<String>,
     port: Option<u16>,
     password_stdin: bool,
+    password_fd: Option<i32>,
     clear_user: bool,
     clear_port: bool,
     clear_password: bool,
@@ -990,6 +997,7 @@ impl Cli {
         let mut clear_port = false;
         let mut clear_password = false;
         let mut password_stdin = false;
+        let mut password_fd = None;
         let mut folder = None;
         let mut file = None;
         let mut yes = false;
@@ -1048,6 +1056,18 @@ impl Cli {
                 );
             } else if text == "--password-stdin" {
                 password_stdin = true;
+            } else if text == "--password-fd" {
+                password_fd = Some(
+                    next(text)?
+                        .parse()
+                        .map_err(|_| "--password-fd requires a number".to_string())?,
+                );
+            } else if let Some(value) = text.strip_prefix("--password-fd=") {
+                password_fd = Some(
+                    value
+                        .parse()
+                        .map_err(|_| "--password-fd requires a number".to_string())?,
+                );
             } else if text == "--clear-user" {
                 clear_user = true;
             } else if text == "--clear-port" {
@@ -1201,6 +1221,7 @@ impl Cli {
             user,
             port,
             password_stdin,
+            password_fd,
             clear_user,
             clear_port,
             clear_password,
