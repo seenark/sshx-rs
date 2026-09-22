@@ -344,17 +344,17 @@ fn interactive_select<'a>(entries: &[&'a HostEntry]) -> Result<&'a HostEntry, St
     if entries.is_empty() {
         return Err("HOST_NOT_FOUND: no hosts match current filters".to_string());
     }
-    println!("Search hosts:");
+    eprintln!("Search hosts:");
     for (index, entry) in entries.iter().enumerate() {
-        println!(
+        eprintln!(
             "  {}. {} ({})",
             index + 1,
             entry.aliases.join(" "),
             entry.source.path
         );
     }
-    print!("Search: ");
-    io::stdout()
+    eprint!("Search: ");
+    io::stderr()
         .flush()
         .map_err(|error| format!("cannot flush selector: {error}"))?;
     let mut query = String::new();
@@ -373,17 +373,17 @@ fn interactive_select<'a>(entries: &[&'a HostEntry]) -> Result<&'a HostEntry, St
             "HOST_NOT_FOUND: search `{query}` matched no entries"
         )),
         many => {
-            println!("Matches:");
+            eprintln!("Matches:");
             for (index, entry) in many.iter().enumerate() {
-                println!(
+                eprintln!(
                     "  {}. {} ({})",
                     index + 1,
                     entry.aliases.join(" "),
                     entry.id
                 );
             }
-            print!("Select number: ");
-            io::stdout()
+            eprint!("Select number: ");
+            io::stderr()
                 .flush()
                 .map_err(|error| format!("cannot flush selector: {error}"))?;
             let mut selection = String::new();
