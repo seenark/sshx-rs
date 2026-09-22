@@ -227,14 +227,14 @@ fn host_entries_with_same_values_remain_distinct_and_show_is_exact() {
 fn include_arguments_keep_written_order() {
     let (root, home) = fixture_root();
     let ssh = home.join(".ssh");
-    write(&ssh.join("config"), "Include z/*.conf a/*.conf\n");
+    write(&ssh.join("config"), "Include=z/*.conf a/*.conf\n");
     write(
         &ssh.join("z/10.conf"),
-        "Host z-entry\n  HostName z.example\n",
+        "Host=z-entry\n  HostName=z.example\n",
     );
     write(
         &ssh.join("a/10.conf"),
-        "Host a-entry\n  HostName a.example\n",
+        "Host=a-entry\n  HostName=a.example\n",
     );
 
     let output = run(
@@ -267,6 +267,37 @@ fn include_arguments_keep_written_order() {
 }
 
 #[test]
+fn match_stops_host_entry_span_and_destination() {
+    let (root, home) = fixture_root();
+    let ssh = home.join(".ssh");
+    write(
+        &ssh.join("config"),
+        "Host=first\nMatch all\n  HostName=wrong.example\n",
+    );
+
+    let output = run(
+        &home,
+        &[
+            "--config",
+            ssh.join("config").to_str().expect("UTF-8 fixture path"),
+            "host",
+            "list",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(output.status.success(), "{:?}", output);
+    let document: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("JSON output should parse");
+    let entry = &document["entries"][0];
+    assert_eq!(entry["aliases"], serde_json::json!(["first"]));
+    assert_eq!(entry["destination"], "first");
+    assert_eq!(entry["source"]["line_end"], 1);
+
+    fs::remove_dir_all(root).expect("fixture should be removed");
+}
+
+#[test]
 fn include_cycles_report_diagnostic_without_looping() {
     let (root, home) = fixture_root();
     let ssh = home.join(".ssh");
@@ -279,7 +310,6 @@ fn include_cycles_report_diagnostic_without_looping() {
         &ssh.join("b.conf"),
         "Host cycle-b\n  HostName cycle-b.example\nInclude a.conf\n",
     );
-
     let output = run(
         &home,
         &[

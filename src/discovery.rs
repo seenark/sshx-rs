@@ -233,29 +233,38 @@ fn parse_file(path: &Path) -> Result<ParsedFile, DiscoveryError> {
     let text = String::from_utf8_lossy(&bytes);
     let lines = split_lines(&text);
 
-    let host_line_indexes = lines
+    let boundaries = lines
         .iter()
         .enumerate()
         .filter_map(|(index, line)| {
-            let tokens = tokenize(&line.text);
-            (tokens
-                .first()
-                .is_some_and(|token| token.eq_ignore_ascii_case("host"))
-                && tokens.len() > 1)
+            let tokens = directive_tokens(&line.text);
+            let keyword = tokens.first()?;
+            (keyword.eq_ignore_ascii_case("match")
+                || (keyword.eq_ignore_ascii_case("host") && tokens.len() > 1))
                 .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let host_line_indexes = boundaries
+        .iter()
+        .copied()
+        .filter(|index| {
+            directive_tokens(&lines[*index].text)
+                .first()
+                .is_some_and(|keyword| keyword.eq_ignore_ascii_case("host"))
         })
         .collect::<Vec<_>>();
 
     let mut hosts = Vec::with_capacity(host_line_indexes.len());
     for (position, line_index) in host_line_indexes.iter().copied().enumerate() {
-        let end_line_index = host_line_indexes
-            .get(position + 1)
+        let end_line_index = boundaries
+            .iter()
             .copied()
+            .find(|index| *index > line_index)
             .unwrap_or(lines.len());
-        let host_tokens = tokenize(&lines[line_index].text);
+        let host_tokens = directive_tokens(&lines[line_index].text);
         let destination = (line_index + 1..end_line_index)
             .find_map(|index| {
-                let tokens = tokenize(&lines[index].text);
+                let tokens = directive_tokens(&lines[index].text);
                 tokens
                     .first()
                     .is_some_and(|token| token.eq_ignore_ascii_case("hostname"))
@@ -294,7 +303,7 @@ fn parse_file(path: &Path) -> Result<ParsedFile, DiscoveryError> {
     }
     let mut items = Vec::new();
     for (index, line) in lines.iter().enumerate() {
-        let tokens = tokenize(&line.text);
+        let tokens = directive_tokens(&line.text);
         if let Some(host_index) = host_by_line.get(&index) {
             items.push(Item::Host(*host_index));
         } else if tokens
@@ -381,6 +390,21 @@ fn tokenize(line: &str) -> Vec<String> {
     tokens
 }
 
+fn directive_tokens(line: &str) -> Vec<String> {
+    let mut tokens = tokenize(line);
+    if let Some(first) = tokens.first_mut()
+        && let Some(equal) = first.find('=')
+    {
+        let keyword = first[..equal].to_string();
+        let argument = first[equal + 1..].to_string();
+        *first = keyword;
+        if !argument.is_empty() {
+            tokens.insert(1, argument);
+        }
+    }
+    tokens
+}
+
 fn expand_include(pattern: &str, base: &Path) -> Vec<PathBuf> {
     let pattern = expand_tilde(pattern);
     let pattern = PathBuf::from(pattern);
@@ -422,24 +446,6 @@ fn expand_components(
     }
 
     let component = components[index].as_os_str().to_string_lossy();
-    if component == "**" {
-        expand_components(current, components, index + 1, matches);
-        let Some(entries) = read_directory(current) else {
-            return;
-        };
-        for entry in entries {
-            if entry
-                .file_type()
-                .map(|file_type| file_type.is_dir())
-                .unwrap_or(false)
-            {
-                current.push(entry.file_name());
-                expand_components(current, components, index, matches);
-                current.pop();
-            }
-        }
-        return;
-    }
 
     if has_magic(&component) {
         let Some(entries) = read_directory(current) else {
