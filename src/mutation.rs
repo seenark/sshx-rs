@@ -1,5 +1,5 @@
 use crate::discovery::{DiscoveryRoot, HostEntry, path_reachable};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -86,6 +86,50 @@ pub struct CreatePlan {
     pub files: Vec<FileChange>,
     lock_path: PathBuf,
     writes: Vec<WriteFile>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PairMutationRequest {
+    pub gateway_path: PathBuf,
+    pub gateway_expected_id: String,
+    pub gateway_id: String,
+    pub gateway_alias: String,
+    pub gateway_byte_start: usize,
+    pub gateway_byte_end: usize,
+    pub vm_path: PathBuf,
+    pub vm_expected_id: String,
+    pub vm_id: String,
+    pub vm_alias: String,
+    pub vm_byte_start: usize,
+    pub vm_byte_end: usize,
+    pub transit_host: String,
+    pub transit_port: u16,
+}
+
+#[derive(Debug)]
+pub struct PairPlan {
+    pub gateway_id: String,
+    pub vm_id: String,
+    pub transit_host: String,
+    pub transit_port: u16,
+    pub files: Vec<FileChange>,
+    lock_path: PathBuf,
+    writes: Vec<WriteFile>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PairJournal {
+    writes: Vec<PairJournalWrite>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PairJournalWrite {
+    path: String,
+    before: String,
+    after: String,
+    before_digest: u64,
+    after_digest: u64,
+    existed: bool,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -266,6 +310,385 @@ pub fn apply_edit(plan: &EditPlan) -> Result<(), String> {
     apply_writes(&plan.lock_path, &plan.writes)
 }
 
+pub fn plan_pair(request: &PairMutationRequest) -> Result<PairPlan, String> {
+    validate_value("gateway_id", &request.gateway_id)?;
+    validate_value("vm_id", &request.vm_id)?;
+    validate_value("transit_host", &request.transit_host)?;
+    if request.transit_port == 0 {
+        return Err("TRANSIT_PORT_INVALID: transit port must be non-zero".to_string());
+    }
+    let gateway_request = UpdateRequest {
+        path: request.gateway_path.clone(),
+        expected_id: request.gateway_expected_id.clone(),
+        selected_alias: request.gateway_alias.clone(),
+        byte_start: request.gateway_byte_start,
+        byte_end: request.gateway_byte_end,
+        alias: None,
+        hostname: None,
+        user: None,
+        port: None,
+        password: None,
+        clear_user: false,
+        clear_port: false,
+        clear_password: false,
+    };
+    let vm_request = UpdateRequest {
+        path: request.vm_path.clone(),
+        expected_id: request.vm_expected_id.clone(),
+        selected_alias: request.vm_alias.clone(),
+        byte_start: request.vm_byte_start,
+        byte_end: request.vm_byte_end,
+        alias: None,
+        hostname: None,
+        user: None,
+        port: None,
+        password: None,
+        clear_user: false,
+        clear_port: false,
+        clear_password: false,
+    };
+    let gateway = load_block_with_span(
+        &gateway_request,
+        request.gateway_byte_start,
+        request.gateway_byte_end,
+    )?;
+    let vm = load_block_with_span(&vm_request, request.vm_byte_start, request.vm_byte_end)?;
+    let mut gateway_changes = pair_identity_changes(&gateway, &request.gateway_id, false, "", 0)?;
+    gateway_changes.push(insert_metadata(
+        &gateway,
+        &format!("##SSHX VM={}", request.vm_id),
+    ));
+    let vm_changes = pair_identity_changes(
+        &vm,
+        &request.vm_id,
+        true,
+        &request.gateway_id,
+        request.transit_port,
+    )
+    .map(|mut changes| {
+        changes.push(insert_metadata(
+            &vm,
+            &format!(
+                "##SSHX TRANSIT={}:{}",
+                request.transit_host, request.transit_port
+            ),
+        ));
+        changes
+    })?;
+
+    let same_file = gateway.path == vm.path;
+    let mut files = Vec::new();
+    let mut writes = Vec::new();
+    if same_file {
+        if gateway.before != vm.before {
+            return Err("CONFIG_CHANGED: pair entries changed while reading".to_string());
+        }
+        let mut changes = gateway_changes;
+        changes.extend(vm_changes);
+        let after = apply_changes(&gateway.before, changes);
+        if gateway.before != after {
+            files.push(FileChange {
+                path: display_path(&gateway.path),
+                operation: FileOperation::Modify,
+                patch: edit_patch(&gateway.path, &gateway.before, &after),
+            });
+            writes.push(WriteFile {
+                path: gateway.path.clone(),
+                before: gateway.before.clone(),
+                after,
+                mode: gateway.mode,
+                existed: true,
+                snapshot: gateway.snapshot.clone(),
+            });
+        }
+    } else {
+        let gateway_after = apply_changes(&gateway.before, gateway_changes);
+        if gateway.before != gateway_after {
+            files.push(FileChange {
+                path: display_path(&gateway.path),
+                operation: FileOperation::Modify,
+                patch: edit_patch(&gateway.path, &gateway.before, &gateway_after),
+            });
+            writes.push(WriteFile {
+                path: gateway.path.clone(),
+                before: gateway.before.clone(),
+                after: gateway_after,
+                mode: gateway.mode,
+                existed: true,
+                snapshot: gateway.snapshot.clone(),
+            });
+        }
+        let vm_after = apply_changes(&vm.before, vm_changes);
+        if vm.before != vm_after {
+            files.push(FileChange {
+                path: display_path(&vm.path),
+                operation: FileOperation::Modify,
+                patch: edit_patch(&vm.path, &vm.before, &vm_after),
+            });
+            writes.push(WriteFile {
+                path: vm.path.clone(),
+                before: vm.before,
+                after: vm_after,
+                mode: vm.mode,
+                existed: true,
+                snapshot: vm.snapshot,
+            });
+        }
+    }
+    Ok(PairPlan {
+        gateway_id: request.gateway_id.clone(),
+        vm_id: request.vm_id.clone(),
+        transit_host: request.transit_host.clone(),
+        transit_port: request.transit_port,
+        files,
+        lock_path: mutation_lock_path(&gateway.path),
+        writes,
+    })
+}
+
+pub fn apply_pair(plan: &PairPlan) -> Result<(), String> {
+    recover_pair_journal(&plan.lock_path)?;
+    let _lock = WriterLock::acquire(&plan.lock_path)?;
+    for write in &plan.writes {
+        verify_snapshot(write)?;
+    }
+    if plan.writes.is_empty() {
+        return Ok(());
+    }
+    let journal_path = pair_journal_path(&plan.lock_path);
+    let mut journal = PairJournal { writes: Vec::new() };
+    for write in &plan.writes {
+        let before = pair_temp(&write.path, "before", &write.before, write.mode)?;
+        let after = pair_temp(&write.path, "after", &write.after, write.mode)?;
+        journal.writes.push(PairJournalWrite {
+            path: display_path(&write.path),
+            before: display_path(&before),
+            after: display_path(&after),
+            before_digest: digest(&write.before),
+            after_digest: digest(&write.after),
+            existed: write.existed,
+        });
+    }
+    write_pair_journal(&journal_path, &journal)?;
+    let result = (|| {
+        for write in &journal.writes {
+            let path = PathBuf::from(&write.path);
+            let current = fingerprint(&path)?;
+            if !current.exists || current.digest != write.before_digest {
+                return Err(format!(
+                    "CONCURRENT_EDIT: file changed during pair commit: {}",
+                    path.display()
+                ));
+            }
+            fs::rename(&write.after, &path).map_err(|error| {
+                format!(
+                    "MUTATION_WRITE_FAILED: cannot replace {}: {error}",
+                    path.display()
+                )
+            })?;
+            sync_parent(&path)?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let recovery = rollback_pair_journal(&journal_path, &journal);
+        return match recovery {
+            Ok(()) => Err(error),
+            Err(recovery_error) => Err(format!(
+                "MUTATION_PARTIAL: {error}; recovery failed: {recovery_error}"
+            )),
+        };
+    }
+    cleanup_pair_journal(&journal_path, &journal);
+    Ok(())
+}
+
+pub fn recover_pair_journals(paths: &[PathBuf]) -> Result<(), String> {
+    for path in paths {
+        recover_pair_journal(&mutation_lock_path(path))?;
+    }
+    Ok(())
+}
+
+fn pair_journal_path(lock_path: &Path) -> PathBuf {
+    lock_path.with_file_name(format!(
+        "{}.journal",
+        lock_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("sshx")
+    ))
+}
+
+fn pair_temp(path: &Path, kind: &str, bytes: &[u8], mode: u32) -> Result<PathBuf, String> {
+    let temporary = path.with_file_name(format!(
+        ".{}.sshx-pair-{kind}-{}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("config"),
+        ID_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(&temporary).map_err(|error| {
+        format!(
+            "MUTATION_WRITE_FAILED: cannot create {}: {error}",
+            temporary.display()
+        )
+    })?;
+    file.write_all(bytes).map_err(|error| error.to_string())?;
+    #[cfg(unix)]
+    fs::set_permissions(&temporary, fs::Permissions::from_mode(mode))
+        .map_err(|error| error.to_string())?;
+    file.sync_all().map_err(|error| error.to_string())?;
+    Ok(temporary)
+}
+
+fn write_pair_journal(path: &Path, journal: &PairJournal) -> Result<(), String> {
+    let temporary = pair_temp(
+        path,
+        "journal",
+        &serde_json::to_vec(journal).map_err(|error| error.to_string())?,
+        0o600,
+    )?;
+    fs::rename(&temporary, path).map_err(|error| {
+        format!(
+            "MUTATION_WRITE_FAILED: cannot publish {}: {error}",
+            path.display()
+        )
+    })?;
+    sync_parent(path)
+}
+
+fn recover_pair_journal(lock_path: &Path) -> Result<(), String> {
+    let journal_path = pair_journal_path(lock_path);
+    if !journal_path.is_file() {
+        return Ok(());
+    }
+    let bytes = fs::read(&journal_path)
+        .map_err(|error| format!("MUTATION_RECOVERY_FAILED: cannot read journal: {error}"))?;
+    let journal: PairJournal = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("MUTATION_RECOVERY_FAILED: invalid journal: {error}"))?;
+    let result = rollback_pair_journal(&journal_path, &journal);
+    let _ = fs::remove_file(lock_path);
+    result
+}
+
+fn rollback_pair_journal(path: &Path, journal: &PairJournal) -> Result<(), String> {
+    let mut failure = None;
+    for write in journal.writes.iter().rev() {
+        let target = PathBuf::from(&write.path);
+        let current = fingerprint(&target)?;
+        if current.exists && current.digest == write.after_digest {
+            let before = PathBuf::from(&write.before);
+            if write.existed {
+                fs::rename(&before, &target).map_err(|error| error.to_string())?;
+                sync_parent(&target)?;
+            } else {
+                fs::remove_file(&target).map_err(|error| error.to_string())?;
+            }
+        } else if current.exists && current.digest == write.before_digest {
+            let _ = fs::remove_file(&write.before);
+        } else {
+            failure = Some(format!(
+                "MUTATION_PARTIAL: refusing rollback after external change: {}",
+                target.display()
+            ));
+        }
+        let _ = fs::remove_file(&write.after);
+    }
+    let _ = fs::remove_file(path);
+    if let Some(error) = failure {
+        Err(error)
+    } else {
+        Ok(())
+    }
+}
+
+fn cleanup_pair_journal(path: &Path, journal: &PairJournal) {
+    for write in &journal.writes {
+        let _ = fs::remove_file(&write.before);
+        let _ = fs::remove_file(&write.after);
+    }
+    let _ = fs::remove_file(path);
+}
+
+fn sync_parent(path: &Path) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        let directory = File::open(parent)
+            .map_err(|error| format!("MUTATION_WRITE_FAILED: cannot open parent: {error}"))?;
+        directory
+            .sync_all()
+            .map_err(|error| format!("MUTATION_WRITE_FAILED: cannot sync parent: {error}"))?;
+    }
+    Ok(())
+}
+
+fn pair_identity_changes(
+    loaded: &LoadedBlock,
+    id: &str,
+    vm: bool,
+    gateway_id: &str,
+    transit_port: u16,
+) -> Result<Vec<Change>, String> {
+    let metadata = metadata_lines(loaded);
+    if vm
+        && (metadata.iter().any(|line| line.0 == "GATEWAY")
+            || metadata.iter().any(|line| line.0 == "TRANSIT"))
+    {
+        return Err("PAIR_EXISTS: VM entry already has pair metadata".to_string());
+    }
+    let mut changes = Vec::new();
+    if loaded.marker_range.is_none() {
+        changes.push(insert_metadata(loaded, &format!("##SSHX ID={id}")));
+    }
+    if vm {
+        changes.push(insert_metadata(
+            loaded,
+            &format!("##SSHX GATEWAY={gateway_id}"),
+        ));
+        if transit_port == 0 {
+            return Err("TRANSIT_PORT_INVALID: transit port must be non-zero".to_string());
+        }
+    }
+    Ok(changes)
+}
+
+fn metadata_lines(loaded: &LoadedBlock) -> Vec<(String, String)> {
+    (loaded.block_start_line..loaded.host_line)
+        .chain(loaded.host_line + 1..loaded.block_end_line)
+        .filter_map(|index| {
+            let line = loaded.lines[index];
+            let text = String::from_utf8_lossy(&loaded.before[line.start..line.content_end]);
+            let rest = text.trim().strip_prefix("##SSHX")?.trim();
+            let (name, value) = rest
+                .split_once('=')
+                .or_else(|| rest.split_once(char::is_whitespace))?;
+            Some((name.trim().to_ascii_uppercase(), value.trim().to_string()))
+        })
+        .collect()
+}
+
+fn insert_metadata(loaded: &LoadedBlock, metadata: &str) -> Change {
+    let line = loaded.lines[loaded.host_line];
+    let eol = if line.end > line.content_end {
+        loaded.before[line.content_end..line.end].to_vec()
+    } else {
+        detect_line_ending(&loaded.before)
+            .unwrap_or_else(|| "\n".to_string())
+            .into_bytes()
+    };
+    let mut replacement = metadata.as_bytes().to_vec();
+    replacement.extend_from_slice(&eol);
+    Change {
+        start: line.start,
+        end: line.start,
+        replacement,
+    }
+}
+
 pub fn validate_mutation_roots(roots: &[DiscoveryRoot]) -> Result<(), String> {
     for root in roots {
         validate_path_components(&root.path, "CONFIG_ROOT")?;
@@ -405,6 +828,7 @@ struct LoadedBlock {
     mode: u32,
     lines: Vec<ByteLine>,
     host_line: usize,
+    block_start_line: usize,
     block_end_line: usize,
     block_end: usize,
     marker_range: Option<(usize, usize)>,
@@ -530,6 +954,7 @@ fn load_block_with_span(
         mode,
         lines,
         host_line,
+        block_start_line,
         block_end_line,
         block_end,
         marker_range,
@@ -1082,15 +1507,7 @@ fn display_line(bytes: &[u8], line: ByteLine) -> String {
     String::from_utf8_lossy(&bytes[line.start..line.content_end]).into_owned()
 }
 
-fn new_id(target: &[u8], root: &[u8]) -> String {
-    let mut existing = HashSet::new();
-    for bytes in [target, root] {
-        for line in String::from_utf8_lossy(bytes).lines() {
-            if let Some(id) = existing_id(line) {
-                existing.insert(id);
-            }
-        }
-    }
+pub fn generate_id(existing: &HashSet<String>) -> String {
     loop {
         let sequence = ID_COUNTER.fetch_add(1, Ordering::Relaxed);
         let now = SystemTime::now()
@@ -1109,6 +1526,18 @@ fn new_id(target: &[u8], root: &[u8]) -> String {
             return candidate;
         }
     }
+}
+
+fn new_id(target: &[u8], root: &[u8]) -> String {
+    let mut existing = HashSet::new();
+    for bytes in [target, root] {
+        for line in String::from_utf8_lossy(bytes).lines() {
+            if let Some(id) = existing_id(line) {
+                existing.insert(id);
+            }
+        }
+    }
+    generate_id(&existing)
 }
 
 fn existing_id(line: &str) -> Option<String> {

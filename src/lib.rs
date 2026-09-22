@@ -2,6 +2,7 @@ pub mod connect;
 pub mod discovery;
 pub mod mutation;
 pub mod output;
+pub mod pair;
 pub mod settings;
 
 /// Version string exposed for clients embedding the reusable `sshx` library.

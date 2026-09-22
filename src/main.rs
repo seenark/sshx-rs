@@ -3,6 +3,7 @@ use sshx::discovery::{HostEntry, discover_roots, scope_for_path};
 use sshx::mutation::{self, CreateRequest, MutationKind, UpdateRequest};
 use sshx::output::{
     OutputFormat, render_create, render_diagnostic, render_edit, render_human, render_machine,
+    render_pair, render_pairs,
 };
 use sshx::settings::{self, RegisteredRoot};
 use std::env;
@@ -12,7 +13,7 @@ use std::path::PathBuf;
 use std::process;
 const USAGE: &str = "Usage: sshx [--version]";
 const HOST_USAGE: &str = "Usage: sshx [--config PATH] host list [--format human|json|yaml]\n       sshx [--config PATH] host show SELECTOR [--format human|json|yaml]\n       sshx [--config PATH] host create --scope SCOPE --file PATH --alias ALIAS --hostname HOSTNAME [options]\n       sshx [--config PATH] host update SELECTOR [options]\n       sshx [--config PATH] host rename SELECTOR --alias ALIAS [options]\n       sshx [--config PATH] host delete SELECTOR [options]";
-const SETUP_USAGE: &str = "Usage: sshx setup [--personal PATH] [--work PATH] [--project NAME]\n       sshx connect [SELECTOR] [--id ID] [--source PATH --line NUMBER] [--password-fd FD] [--no-input]";
+const SETUP_USAGE: &str = "Usage: sshx setup [--personal PATH] [--work PATH] [--project NAME]\n       sshx connect [SELECTOR] [--id ID] [--source PATH --line NUMBER] [--password-fd FD] [--no-input]\n       sshx pair setup [GATEWAY] [VM] [--gateway ID] [--vm ID] [--transit-host HOST --transit-port PORT]";
 
 fn main() {
     match run(env::args_os().skip(1).collect()) {
@@ -55,26 +56,33 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
     ) {
         return run_host_edit(&cli, &roots);
     }
+    if matches!(
+        &cli.command,
+        Command::PairSetup { .. } | Command::PairList | Command::PairValidate
+    ) {
+        return run_pair(&cli, &roots);
+    }
     let configured = settings::discovery_roots(&roots);
     let catalog = discover_roots(&configured).map_err(|error| error.to_string())?;
-    for diagnostic in &catalog.diagnostics {
+    let mut diagnostics = catalog.diagnostics.clone();
+    diagnostics.extend(sshx::pair::diagnostics(&catalog.entries));
+    for diagnostic in &diagnostics {
         eprintln!("{}", render_diagnostic(diagnostic));
     }
     let filtered = filter_entries(&catalog.entries, &cli);
 
     match &cli.command {
-        Command::List => render_entries(&filtered, &catalog.diagnostics, cli.format),
+        Command::List => render_entries(&filtered, &diagnostics, cli.format),
         Command::Show(selector) => {
             let entries = select_entries(&filtered, selector)?;
-            render_entries(&entries, &catalog.diagnostics, cli.format)
+            render_entries(&entries, &diagnostics, cli.format)
         }
         Command::Connect(selector) => {
             let entry = select_connect_entry(&filtered, selector.as_deref(), &cli)?;
             if cli.format.is_machine() {
-                render_entries(&[entry], &catalog.diagnostics, cli.format)
+                render_entries(&[entry], &diagnostics, cli.format)
             } else {
-                if catalog
-                    .diagnostics
+                if diagnostics
                     .iter()
                     .any(|diagnostic| diagnostic.code == "unsupported_match")
                 {
@@ -96,7 +104,10 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
         | Command::CreateHost
         | Command::UpdateHost(_)
         | Command::RenameHost(_)
-        | Command::DeleteHost(_) => unreachable!(),
+        | Command::DeleteHost(_)
+        | Command::PairSetup { .. }
+        | Command::PairList
+        | Command::PairValidate => unreachable!(),
     }
 }
 
@@ -133,6 +144,141 @@ fn render_entries(
         print!("{}", render_human(entries));
     }
     Ok(())
+}
+
+fn run_pair(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), String> {
+    let configured = settings::discovery_roots(roots);
+    mutation::validate_mutation_roots(&configured)?;
+    let initial = discover_roots(&configured).map_err(|error| error.to_string())?;
+    let mut journal_paths = configured
+        .iter()
+        .map(|root| root.path.clone())
+        .collect::<Vec<_>>();
+    journal_paths.extend(
+        initial
+            .entries
+            .iter()
+            .map(|entry| PathBuf::from(&entry.source.path)),
+    );
+    mutation::recover_pair_journals(&journal_paths)?;
+    let catalog = discover_roots(&configured).map_err(|error| error.to_string())?;
+    let diagnostics = sshx::pair::diagnostics(&catalog.entries);
+    for diagnostic in &catalog.diagnostics {
+        eprintln!("{}", render_diagnostic(diagnostic));
+    }
+    for diagnostic in &diagnostics {
+        eprintln!("{}", render_diagnostic(diagnostic));
+    }
+    match &cli.command {
+        Command::PairList | Command::PairValidate => {
+            let records = sshx::pair::records(&catalog.entries);
+            print!("{}", render_pairs(&records, &diagnostics, cli.format)?);
+            Ok(())
+        }
+        Command::PairSetup { gateway, vm } => {
+            let gateway_selector = gateway
+                .as_deref()
+                .ok_or_else(|| "GATEWAY_REQUIRED: provide a gateway selector".to_string())?;
+            let vm_selector = vm
+                .as_deref()
+                .ok_or_else(|| "VM_REQUIRED: provide a VM selector".to_string())?;
+            let gateway = select_pair_entry(
+                &catalog.entries,
+                gateway_selector,
+                cli.gateway_source.as_ref().or(cli.source.as_ref()),
+                cli.gateway_line.or(cli.line),
+                "gateway",
+            )?;
+            let vm = select_pair_entry(
+                &catalog.entries,
+                vm_selector,
+                cli.vm_source.as_ref(),
+                cli.vm_line,
+                "VM",
+            )?;
+            mutation::validate_entry_paths(gateway)?;
+            mutation::validate_entry_paths(vm)?;
+            let plan = sshx::pair::plan_setup(
+                &catalog.entries,
+                gateway,
+                vm,
+                cli.transit_host.as_deref(),
+                cli.transit_port,
+            )?;
+            if cli.preview {
+                print!("{}", render_pair(&plan, cli.format, false)?);
+                return Ok(());
+            }
+            let interactive = !cli.no_input && io::stdin().is_terminal();
+            if !cli.yes {
+                if !interactive {
+                    return Err(
+                        "CONSENT_REQUIRED: non-interactive pair setup requires --yes".to_string(),
+                    );
+                }
+                eprint!("{}", render_pair(&plan, OutputFormat::Human, false)?);
+                if !prompt_yes("Apply changes? [y/N]: ")? {
+                    return Err("MUTATION_DECLINED: pair setup was not applied".to_string());
+                }
+            }
+            mutation::apply_pair(&plan)?;
+            print!("{}", render_pair(&plan, cli.format, true)?);
+            Ok(())
+        }
+        _ => Err("PAIR_COMMAND: unsupported pair command".to_string()),
+    }
+}
+
+fn select_pair_entry<'a>(
+    entries: &'a [HostEntry],
+    selector: &str,
+    source: Option<&PathBuf>,
+    line: Option<usize>,
+    role: &str,
+) -> Result<&'a HostEntry, String> {
+    if source.is_some() != line.is_some() {
+        return Err(format!(
+            "SELECTOR_INCOMPLETE: {role} source and line must be provided together"
+        ));
+    }
+    let id_match = entries.iter().any(|entry| entry.id == selector);
+    let home = home_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let source = source.map(|path| {
+        let path = settings::normalize_path(path, &home);
+        std::fs::canonicalize(&path)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .into_owned()
+    });
+    let matches = entries
+        .iter()
+        .filter(|entry| {
+            if id_match {
+                entry.id == selector
+            } else {
+                entry.aliases.iter().any(|alias| alias == selector)
+            }
+        })
+        .filter(|entry| {
+            source
+                .as_deref()
+                .is_none_or(|path| entry.source.path == path)
+        })
+        .filter(|entry| line.is_none_or(|line| entry.source.line_start == line))
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [entry] => Ok(*entry),
+        [] if source.is_some() => Err(format!(
+            "HOST_MISMATCH: {role} selector `{selector}` does not match source and Host line"
+        )),
+        [] => Err(format!(
+            "HOST_NOT_FOUND: {role} selector `{selector}` matched no entries"
+        )),
+        many => Err(format!(
+            "HOST_AMBIGUOUS: {role} selector `{selector}` matched {} entries",
+            many.len()
+        )),
+    }
 }
 
 fn run_host_create(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), String> {
@@ -315,6 +461,9 @@ fn run_host_edit(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), String> {
     let home = home_dir()?;
     let plan = match operation {
         MutationKind::Delete => {
+            if let Some(error) = sshx::pair::deletion_reference(entry, &catalog.entries) {
+                return Err(error);
+            }
             ensure_delete_allowed(&home, entry)?;
             mutation::plan_delete(
                 PathBuf::from(&entry.source.path).as_path(),
@@ -943,6 +1092,12 @@ enum Command {
     UpdateHost(Option<String>),
     RenameHost(Option<String>),
     DeleteHost(Option<String>),
+    PairSetup {
+        gateway: Option<String>,
+        vm: Option<String>,
+    },
+    PairList,
+    PairValidate,
     Setup,
 }
 
@@ -977,6 +1132,12 @@ struct Cli {
     yes: bool,
     preview: bool,
     no_input: bool,
+    gateway_source: Option<PathBuf>,
+    gateway_line: Option<usize>,
+    vm_source: Option<PathBuf>,
+    vm_line: Option<usize>,
+    transit_host: Option<String>,
+    transit_port: Option<u16>,
     roots: Vec<RootRequest>,
 }
 
@@ -1002,8 +1163,16 @@ impl Cli {
         let mut file = None;
         let mut yes = false;
         let mut preview = false;
-        let mut host = None;
+        let host = None;
         let mut no_input = false;
+        let mut gateway_source = None;
+        let mut gateway_line = None;
+        let mut vm_source = None;
+        let mut vm_line = None;
+        let mut gateway_selector = None;
+        let mut vm_selector = None;
+        let mut transit_host = None;
+        let mut transit_port = None;
         let mut roots = Vec::new();
         let mut positional = Vec::new();
         let mut index = 0;
@@ -1040,8 +1209,35 @@ impl Cli {
                         .parse()
                         .map_err(|_| "--line requires a number".to_string())?,
                 );
-            } else if text == "--host" || text == "--selector" {
-                host = Some(next(text)?);
+            } else if text == "--gateway" || text == "--gateway-id" || text == "--gateway-selector"
+            {
+                gateway_selector = Some(next(text)?);
+            } else if text == "--vm" || text == "--vm-id" || text == "--vm-selector" {
+                vm_selector = Some(next(text)?);
+            } else if text == "--gateway-source" {
+                gateway_source = Some(PathBuf::from(next(text)?));
+            } else if text == "--gateway-line" {
+                gateway_line = Some(
+                    next(text)?
+                        .parse()
+                        .map_err(|_| "--gateway-line requires a number".to_string())?,
+                );
+            } else if text == "--vm-source" {
+                vm_source = Some(PathBuf::from(next(text)?));
+            } else if text == "--vm-line" {
+                vm_line = Some(
+                    next(text)?
+                        .parse()
+                        .map_err(|_| "--vm-line requires a number".to_string())?,
+                );
+            } else if text == "--transit-host" {
+                transit_host = Some(next(text)?);
+            } else if text == "--transit-port" {
+                transit_port = Some(
+                    next(text)?
+                        .parse()
+                        .map_err(|_| "--transit-port requires a number".to_string())?,
+                );
             } else if text == "--alias" {
                 alias = Some(next(text)?);
             } else if text == "--hostname" {
@@ -1154,6 +1350,22 @@ impl Cli {
                 Command::DeleteHost(Some(selector.clone()))
             }
             [host, delete] if host == "host" && delete == "delete" => Command::DeleteHost(None),
+            [pair, setup, gateway, vm]
+                if pair == "pair" && matches!(setup.as_str(), "setup" | "create") =>
+            {
+                Command::PairSetup {
+                    gateway: Some(gateway.clone()),
+                    vm: Some(vm.clone()),
+                }
+            }
+            [pair, setup] if pair == "pair" && matches!(setup.as_str(), "setup" | "create") => {
+                Command::PairSetup {
+                    gateway: None,
+                    vm: None,
+                }
+            }
+            [pair, list] if pair == "pair" && list == "list" => Command::PairList,
+            [pair, validate] if pair == "pair" && validate == "validate" => Command::PairValidate,
             [connect] if connect == "connect" => Command::Connect(None),
             [connect, selector] if connect == "connect" => Command::Connect(Some(selector.clone())),
             [setup] if setup == "setup" => Command::Setup,
@@ -1199,6 +1411,37 @@ impl Cli {
                 }
                 Command::DeleteHost(selector.or(host))
             }
+            Command::PairSetup {
+                mut gateway,
+                mut vm,
+            } => {
+                if let Some(host) = host {
+                    if gateway.is_some() {
+                        return Err("SELECTOR_CONFLICT: provide one gateway selector".to_string());
+                    }
+                    gateway = Some(host);
+                }
+                if let Some(value) = gateway_selector {
+                    if gateway.is_some() {
+                        return Err("SELECTOR_CONFLICT: provide one gateway selector".to_string());
+                    }
+                    gateway = Some(value);
+                }
+                if id.is_some() {
+                    if gateway.is_some() {
+                        return Err("SELECTOR_CONFLICT: provide one gateway selector".to_string());
+                    }
+                    gateway = id.take();
+                }
+                if let Some(value) = vm_selector {
+                    if vm.is_some() {
+                        return Err("SELECTOR_CONFLICT: provide one VM selector".to_string());
+                    }
+                    vm = Some(value);
+                }
+                Command::PairSetup { gateway, vm }
+            }
+            Command::PairList | Command::PairValidate => command,
             command => {
                 if host.is_some() {
                     return Err("--host is only valid with connect".to_string());
@@ -1230,6 +1473,12 @@ impl Cli {
             yes,
             preview,
             no_input,
+            gateway_source,
+            gateway_line,
+            vm_source,
+            vm_line,
+            transit_host,
+            transit_port,
             roots,
         })
     }

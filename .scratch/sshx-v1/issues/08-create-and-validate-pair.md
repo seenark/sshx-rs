@@ -4,7 +4,7 @@
 
 **Blocked by:** 06: Update, rename, and delete HostEntries losslessly.
 
-**Status:** ready-for-agent
+**Status:** in-progress
 
 - [ ] Pair setup selects exact gateway and VM HostEntries rather than resolving by alias alone.
 - [ ] Missing IDs are assigned transactionally and every paired ID is globally unique and immutable.

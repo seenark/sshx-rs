@@ -1,5 +1,6 @@
 use crate::discovery::{Diagnostic, HostEntry};
-use crate::mutation::{CreatePlan, EditPlan, FileOperation, MutationKind};
+use crate::mutation::{CreatePlan, EditPlan, FileOperation, MutationKind, PairPlan};
+use crate::pair::PairRecord;
 use serde::Serialize;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -195,6 +196,101 @@ pub fn render_edit(plan: &EditPlan, format: OutputFormat, applied: bool) -> Resu
             FileOperation::Delete => "delete",
         };
         rendered.push_str(&format!("{operation} {}\n{}", file.path, file.patch));
+    }
+    Ok(rendered)
+}
+pub fn render_pair(plan: &PairPlan, format: OutputFormat, applied: bool) -> Result<String, String> {
+    if format.is_machine() {
+        #[derive(Serialize)]
+        struct Document<'a> {
+            version: u8,
+            applied: bool,
+            gateway_id: &'a str,
+            vm_id: &'a str,
+            transit_host: &'a str,
+            transit_port: u16,
+            files: &'a [crate::mutation::FileChange],
+        }
+        let document = Document {
+            version: 1,
+            applied,
+            gateway_id: &plan.gateway_id,
+            vm_id: &plan.vm_id,
+            transit_host: &plan.transit_host,
+            transit_port: plan.transit_port,
+            files: &plan.files,
+        };
+        let mut rendered = match format {
+            OutputFormat::Json => serde_json::to_string_pretty(&document)
+                .map_err(|error| format!("cannot render JSON output: {error}"))?,
+            OutputFormat::Yaml => serde_yaml::to_string(&document)
+                .map_err(|error| format!("cannot render YAML output: {error}"))?,
+            OutputFormat::Human => unreachable!(),
+        };
+        if !rendered.ends_with('\n') {
+            rendered.push('\n');
+        }
+        return Ok(rendered);
+    }
+    let mut rendered = format!(
+        "{} pair gateway {} VM {} via {}:{}\n",
+        if applied { "Applied" } else { "Preview" },
+        plan.gateway_id,
+        plan.vm_id,
+        plan.transit_host,
+        plan.transit_port
+    );
+    for file in &plan.files {
+        rendered.push_str(&format!("modify {}\n{}", file.path, file.patch));
+    }
+    Ok(rendered)
+}
+
+pub fn render_pairs(
+    records: &[PairRecord],
+    diagnostics: &[Diagnostic],
+    format: OutputFormat,
+) -> Result<String, String> {
+    #[derive(Serialize)]
+    struct Document<'a> {
+        version: u8,
+        pairs: &'a [PairRecord],
+        diagnostics: &'a [Diagnostic],
+    }
+    if format.is_machine() {
+        let document = Document {
+            version: 1,
+            pairs: records,
+            diagnostics,
+        };
+        let mut rendered = match format {
+            OutputFormat::Json => serde_json::to_string_pretty(&document)
+                .map_err(|error| format!("cannot render JSON output: {error}"))?,
+            OutputFormat::Yaml => serde_yaml::to_string(&document)
+                .map_err(|error| format!("cannot render YAML output: {error}"))?,
+            OutputFormat::Human => unreachable!(),
+        };
+        if !rendered.ends_with('\n') {
+            rendered.push('\n');
+        }
+        return Ok(rendered);
+    }
+    let mut rendered = String::new();
+    for record in records {
+        rendered.push_str(&format!(
+            "{} -> {} via {}:{}\n",
+            record.gateway_alias, record.vm_alias, record.transit_host, record.transit_port
+        ));
+        rendered.push_str(&format!(
+            "  gateway: {}\n  VM: {}\n",
+            record.gateway_id, record.vm_id
+        ));
+    }
+    for diagnostic in diagnostics {
+        rendered.push_str(&format!(
+            "warning [{}]: {}\n",
+            diagnostic.code, diagnostic.message
+        ));
     }
     Ok(rendered)
 }

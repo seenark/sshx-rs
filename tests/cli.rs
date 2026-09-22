@@ -1610,3 +1610,421 @@ fn host_mutation_outputs_redact_secret_for_human_json_and_yaml() {
     );
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn pair_setup_assigns_ids_and_infers_unique_transit() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(
+        &config,
+        concat!(
+            "Host gateway\n",
+            "  HostName gateway.example\n",
+            "  LocalForward 2200 vm.internal:22\n",
+            "Host vm\n",
+            "  HostName vm.internal\n",
+            "  Port 22\n",
+        ),
+    );
+    let output = run(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "pair",
+            "setup",
+            "gateway",
+            "vm",
+            "--yes",
+            "--no-input",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(output.status.success(), "{output:?}");
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let gateway_id = document["gateway_id"].as_str().unwrap();
+    let vm_id = document["vm_id"].as_str().unwrap();
+    assert_ne!(gateway_id, vm_id);
+    assert_eq!(document["transit_host"], "vm.internal");
+    assert_eq!(document["transit_port"], 22);
+    let text = fs::read_to_string(&config).unwrap();
+    assert!(text.contains(&format!("##SSHX ID={gateway_id}")));
+    assert!(text.contains(&format!("##SSHX ID={vm_id}")));
+    assert!(text.contains(&format!("##SSHX GATEWAY={gateway_id}")));
+    assert!(text.contains("##SSHX TRANSIT=vm.internal:22"));
+    assert!(text.contains(&format!("##SSHX VM={vm_id}")));
+
+    let listed = run(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "pair",
+            "list",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(listed.status.success(), "{listed:?}");
+    let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(listed["pairs"].as_array().unwrap().len(), 1);
+    assert!(listed["diagnostics"].as_array().unwrap().is_empty());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn pair_setup_requires_explicit_transit_for_ambiguous_candidates() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(
+        &config,
+        concat!(
+            "Host gateway\n",
+            "  HostName gateway.example\n",
+            "  LocalForward 2200 first.internal:22\n",
+            "  LocalForward 2201 second.internal:22\n",
+            "Host vm\n",
+            "  HostName vm.internal\n",
+            "  Port 22\n",
+        ),
+    );
+    let missing = run(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "pair",
+            "setup",
+            "gateway",
+            "vm",
+            "--yes",
+            "--no-input",
+        ],
+    );
+    assert_eq!(missing.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("TRANSIT_REQUIRED"));
+    assert!(!fs::read_to_string(&config).unwrap().contains("##SSHX ID="));
+
+    let explicit = run(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "pair",
+            "setup",
+            "gateway",
+            "vm",
+            "--transit-host",
+            "chosen.internal",
+            "--transit-port",
+            "22",
+            "--yes",
+            "--no-input",
+        ],
+    );
+    assert!(explicit.status.success(), "{explicit:?}");
+    assert!(
+        fs::read_to_string(&config)
+            .unwrap()
+            .contains("##SSHX TRANSIT=chosen.internal:22")
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn pair_setup_rejects_proxy_routes_and_duplicate_ids() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(
+        &config,
+        concat!(
+            "##SSHX ID=11111111-1111-4111-8111-111111111111\n",
+            "Host gateway\n",
+            "  HostName gateway.example\n",
+            "  ProxyJump bastion\n",
+            "  LocalForward 2200 vm.internal:22\n",
+            "##SSHX ID=11111111-1111-4111-8111-111111111111\n",
+            "Host vm\n",
+            "  HostName vm.internal\n",
+            "  Port 22\n",
+        ),
+    );
+    let duplicate = run(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "pair",
+            "setup",
+            "gateway",
+            "vm",
+            "--yes",
+            "--no-input",
+        ],
+    );
+    assert_eq!(duplicate.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&duplicate.stderr).contains("duplicate_id"));
+    assert!(!fs::read_to_string(&config).unwrap().contains("GATEWAY="));
+
+    write(
+        &config,
+        concat!(
+            "ProxyJump bastion\n",
+            "##SSHX ID=11111111-1111-4111-8111-111111111111\n",
+            "Host gateway\n",
+            "  HostName gateway.example\n",
+            "  ProxyJump bastion\n",
+            "  LocalForward 2200 vm.internal:22\n",
+            "##SSHX ID=22222222-2222-4222-8222-222222222222\n",
+            "Host vm\n",
+            "  HostName vm.internal\n",
+            "  Port 22\n",
+        ),
+    );
+    let proxy = run(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "pair",
+            "setup",
+            "gateway",
+            "vm",
+            "--yes",
+            "--no-input",
+        ],
+    );
+    assert_eq!(proxy.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&proxy.stderr).contains("PAIR_ROUTE_UNSAFE"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn pair_references_block_delete_and_report_external_breakage() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(
+        &config,
+        concat!(
+            "Host gateway\n",
+            "  HostName gateway.example\n",
+            "  LocalForward 2200 vm.internal:22\n",
+            "Host vm\n",
+            "  HostName vm.internal\n",
+            "  Port 22\n",
+        ),
+    );
+    let setup = run(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "pair",
+            "setup",
+            "gateway",
+            "vm",
+            "--yes",
+            "--no-input",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(setup.status.success(), "{setup:?}");
+    let document: serde_json::Value = serde_json::from_slice(&setup.stdout).unwrap();
+    let gateway_id = document["gateway_id"].as_str().unwrap().to_string();
+    let vm_id = document["vm_id"].as_str().unwrap().to_string();
+    for id in [&gateway_id, &vm_id] {
+        let blocked = run(
+            &home,
+            &[
+                "--config",
+                config.to_str().unwrap(),
+                "host",
+                "delete",
+                "--id",
+                id,
+                "--yes",
+                "--no-input",
+            ],
+        );
+        assert_eq!(blocked.status.code(), Some(2), "{blocked:?}");
+        assert!(String::from_utf8_lossy(&blocked.stderr).contains("DELETE_REFERENCED"));
+    }
+    let broken = fs::read_to_string(&config)
+        .unwrap()
+        .replace(&format!("##SSHX GATEWAY={gateway_id}\n"), "");
+    fs::write(&config, broken).unwrap();
+    let validate = run(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "pair",
+            "validate",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(validate.status.success(), "{validate:?}");
+    let document: serde_json::Value = serde_json::from_slice(&validate.stdout).unwrap();
+    assert!(
+        document["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "broken_reference")
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn pair_setup_requires_exact_source_for_duplicate_aliases() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(
+        &config,
+        concat!(
+            "Host duplicate\n",
+            "  HostName first.example\n",
+            "  LocalForward 2200 vm.internal:22\n",
+            "Host duplicate\n",
+            "  HostName second.example\n",
+            "Host vm\n",
+            "  HostName vm.internal\n",
+            "  Port 22\n",
+        ),
+    );
+    let ambiguous = run(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "pair",
+            "setup",
+            "duplicate",
+            "vm",
+            "--yes",
+            "--no-input",
+        ],
+    );
+    assert_eq!(ambiguous.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&ambiguous.stderr).contains("HOST_AMBIGUOUS"));
+    let exact = run(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "pair",
+            "setup",
+            "duplicate",
+            "vm",
+            "--gateway-source",
+            config.to_str().unwrap(),
+            "--gateway-line",
+            "1",
+            "--yes",
+            "--no-input",
+        ],
+    );
+    assert!(exact.status.success(), "{exact:?}");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn pair_setup_rejects_malformed_ids_without_regeneration() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    let original = concat!(
+        "##SSHX ID=not-a-uuid\n",
+        "Host gateway\n",
+        "  HostName gateway.example\n",
+        "  LocalForward 2200 vm.internal:22\n",
+        "Host vm\n",
+        "  HostName vm.internal\n",
+        "  Port 22\n",
+    );
+    write(&config, original);
+    let output = run(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "pair",
+            "setup",
+            "gateway",
+            "vm",
+            "--yes",
+            "--no-input",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("malformed_id"));
+    assert_eq!(fs::read_to_string(&config).unwrap(), original);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn pair_setup_enforces_gateway_cardinality_by_entry_identity() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(
+        &config,
+        concat!(
+            "Host gateway-one\n",
+            "  HostName shared.gateway.example\n",
+            "  LocalForward 2200 vm-one.internal:22\n",
+            "Host vm-one\n",
+            "  HostName vm-one.internal\n",
+            "Host gateway-two\n",
+            "  HostName shared.gateway.example\n",
+            "  LocalForward 2201 vm-two.internal:22\n",
+            "Host vm-two\n",
+            "  HostName vm-two.internal\n",
+        ),
+    );
+    let setup_one = run(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "pair",
+            "setup",
+            "gateway-one",
+            "vm-one",
+            "--yes",
+            "--no-input",
+        ],
+    );
+    assert!(setup_one.status.success(), "{setup_one:?}");
+    let setup_two = run(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "pair",
+            "setup",
+            "gateway-two",
+            "vm-two",
+            "--yes",
+            "--no-input",
+        ],
+    );
+    assert!(setup_two.status.success(), "{setup_two:?}");
+    let reuse = run(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "pair",
+            "setup",
+            "gateway-one",
+            "vm-two",
+            "--yes",
+            "--no-input",
+        ],
+    );
+    assert_eq!(reuse.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&reuse.stderr).contains("PAIR_GATEWAY_IN_USE"));
+    fs::remove_dir_all(root).unwrap();
+}
