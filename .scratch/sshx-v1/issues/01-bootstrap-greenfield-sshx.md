@@ -4,10 +4,14 @@
 
 **Blocked by:** None (can start immediately).
 
-**Status:** claimed
+**Status:** resolved
 
-- [ ] The project pins Rust 1.95.0 through mise instead of floating on `latest`.
-- [ ] The package exposes a reusable library and a thin `sshx` CLI binary without introducing a multi-crate workspace.
-- [ ] Running `sshx --version` from a local build prints the binary name and package version successfully.
-- [ ] Formatting, linting, tests, and release compilation run on both macOS and Linux CI.
-- [ ] No source, test, workflow, annotation compatibility layer, or history is imported from `seenark/sshx-rust`.
+- [x] The project pins Rust 1.95.0 through mise instead of floating on `latest`.
+- [x] The package exposes a reusable library and a thin `sshx` CLI binary without introducing a multi-crate workspace.
+- [x] Running `sshx --version` from a local build prints the binary name and package version successfully.
+- [x] Formatting, linting, tests, and release compilation run on both macOS and Linux CI.
+- [x] No source, test, workflow, annotation compatibility layer, or history is imported from `seenark/sshx-rust`.
+
+## Answer
+
+6fcf61b1ad0b5987eee4b2b176f79689c5dd60a6
