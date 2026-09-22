@@ -197,7 +197,7 @@ fn open_session(
     };
     let mut enrolled = false;
     let master = loop {
-        let mut master = spawn_master(&runtime, no_input, attempt.as_ref())?;
+        let mut master = spawn_master(&runtime, no_input, attempt.as_ref(), false)?;
         match wait_for_master(&runtime, &mut master, no_input) {
             Ok(()) => break master,
             Err(error) => {
@@ -310,10 +310,15 @@ fn open_paired_session(
     let mut vm_attempt = password_attempt(&vm_runtime, vm_password_fd)
         .map_err(|error| paired_stage_error("VM", error))?;
 
-    let mut gateway_master =
-        authenticate_paired_master(&gateway_runtime, no_input, &mut gateway_attempt, "gateway")?;
+    let mut gateway_master = authenticate_paired_master(
+        &gateway_runtime,
+        no_input,
+        &mut gateway_attempt,
+        "gateway",
+        true,
+    )?;
     let mut vm_master =
-        match authenticate_paired_master(&vm_runtime, no_input, &mut vm_attempt, "VM") {
+        match authenticate_paired_master(&vm_runtime, no_input, &mut vm_attempt, "VM", false) {
             Ok(master) => master,
             Err(error) => {
                 stop_master(&gateway_runtime, &mut gateway_master);
@@ -382,10 +387,11 @@ fn authenticate_paired_master(
     no_input: bool,
     attempt: &mut Option<PasswordAttempt>,
     role: &str,
+    require_forward: bool,
 ) -> Result<Child, String> {
     let mut enrolled = false;
     loop {
-        let mut master = spawn_master(runtime, no_input, attempt.as_ref())
+        let mut master = spawn_master(runtime, no_input, attempt.as_ref(), require_forward)
             .map_err(|error| paired_stage_error(role, error))?;
         match wait_for_master(runtime, &mut master, no_input) {
             Ok(()) => return Ok(master),
@@ -432,15 +438,18 @@ fn paired_stage_error(role: &str, error: String) -> String {
     };
     format!("{}_{}: {error}", role.to_ascii_uppercase(), stage)
 }
-
 fn spawn_master(
     runtime: &Runtime,
     no_input: bool,
     attempt: Option<&PasswordAttempt>,
+    require_forward: bool,
 ) -> Result<Child, String> {
     let (mut command, password_pipe) = auth_command(runtime, no_input, true, attempt)?;
     command.args(["-M", "-N", "-o", "ControlMaster=yes"]);
-    command.args(["-o", "ExitOnForwardFailure=yes"]);
+    if require_forward {
+        command.args(["-o", "ExitOnForwardFailure=yes"]);
+    }
+    command.arg(&runtime.alias);
     command
         .stdin(if no_input {
             Stdio::null()

@@ -124,6 +124,16 @@ pub fn paired_route(
     {
         return Err("PAIR_BROKEN: gateway has no matching VM reference".to_string());
     }
+    if gateway_data.proxy_command
+        || gateway_data.proxy_jump
+        || vm_data.proxy_command
+        || vm_data.proxy_jump
+    {
+        return Err(
+            "PAIR_ROUTE_UNSAFE: ProxyCommand and ProxyJump are not allowed for paired routes"
+                .to_string(),
+        );
+    }
     let candidates = gateway_data
         .forwards
         .iter()
