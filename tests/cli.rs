@@ -550,3 +550,31 @@ fn no_input_missing_host_fails_before_config_discovery() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("HOST_REQUIRED"));
     fs::remove_dir_all(root).expect("fixture should be removed");
 }
+
+#[test]
+fn persistent_sshx_id_selects_exact_entry() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(
+        &config,
+        "##SSHX ID=entry-uuid\nHost stable\n  HostName stable.example\n",
+    );
+
+    let output = run(
+        &home,
+        &[
+            "connect",
+            "--id",
+            "entry-uuid",
+            "--no-input",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(output.status.success(), "{output:?}");
+    let document: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("connect JSON should parse");
+    assert_eq!(document["entries"][0]["id"], "entry-uuid");
+
+    fs::remove_dir_all(root).expect("fixture should be removed");
+}

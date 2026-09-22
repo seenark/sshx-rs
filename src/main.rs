@@ -1,11 +1,11 @@
 use serde::Serialize;
-use sshx::discovery::{HostEntry, discover_roots};
+use sshx::discovery::{HostEntry, discover_roots, scope_for_path};
 use sshx::output::{OutputFormat, render_diagnostic, render_human, render_machine};
 use sshx::settings::{self, RegisteredRoot};
 use std::env;
 use std::ffi::OsString;
 use std::io::{self, IsTerminal, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process;
 
 const USAGE: &str = "Usage: sshx [--version]";
@@ -425,19 +425,6 @@ fn format_ambiguous(selector: &str, entries: &[&HostEntry]) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!("HOST_AMBIGUOUS: selector `{selector}` matched candidates: {candidates}")
-}
-
-fn scope_for_path(path: &Path) -> String {
-    if path.components().any(|component| {
-        component
-            .as_os_str()
-            .to_string_lossy()
-            .eq_ignore_ascii_case(".private-key")
-    }) {
-        "work".to_string()
-    } else {
-        "personal".to_string()
-    }
 }
 
 fn home_dir() -> Result<PathBuf, String> {

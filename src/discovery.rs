@@ -99,6 +99,7 @@ struct HostBlock {
     line_index: usize,
     aliases: Vec<String>,
     destination: Option<String>,
+    persistent_id: Option<String>,
     byte_start: usize,
     byte_end: usize,
     line_start: usize,
@@ -127,18 +128,21 @@ struct State {
     diagnostics: Vec<Diagnostic>,
     diagnostic_keys: HashSet<String>,
 }
-
-pub fn discover(root: &Path) -> Result<Catalog, DiscoveryError> {
-    let scope = if root.components().any(|component| {
+pub fn scope_for_path(path: &Path) -> String {
+    if path.components().any(|component| {
         component
             .as_os_str()
             .to_string_lossy()
             .eq_ignore_ascii_case(".private-key")
     }) {
-        "work"
+        "work".to_string()
     } else {
-        "personal"
-    };
+        "personal".to_string()
+    }
+}
+
+pub fn discover(root: &Path) -> Result<Catalog, DiscoveryError> {
+    let scope = scope_for_path(root);
     discover_roots(&[DiscoveryRoot::new(root, scope, None)])
 }
 
@@ -158,11 +162,17 @@ pub fn discover_roots(roots: &[DiscoveryRoot]) -> Result<Catalog, DiscoveryError
                 root.display()
             ))
         })?;
-        let include_base = root.parent().unwrap_or_else(|| Path::new("/"));
+        let include_base = match std::env::var_os("HOME") {
+            Some(home) => absolute_path(&PathBuf::from(home).join(".ssh"))?,
+            None => root
+                .parent()
+                .unwrap_or_else(|| Path::new("/"))
+                .to_path_buf(),
+        };
         let chain = vec![display_path(&root)];
         visit_file(
             &root_identity,
-            include_base,
+            &include_base,
             &root_identity,
             &configured.scope,
             configured.project.as_deref(),
@@ -243,7 +253,9 @@ fn visit_file(
                         line_end: block.line_end,
                     };
                     let entry = HostEntry {
-                        id: format!("{}#{}-{}", source.path, source.byte_start, source.byte_end),
+                        id: block.persistent_id.clone().unwrap_or_else(|| {
+                            format!("{}#{}-{}", source.path, source.byte_start, source.byte_end)
+                        }),
                         aliases: block.aliases.clone(),
                         source,
                         destination: block.destination.clone(),
@@ -282,16 +294,36 @@ fn visit_file(
 fn derive_project(source: &Path, root: &Path) -> Option<String> {
     let parent = source.parent()?;
     let root_parent = root.parent()?;
-    let relative = parent.strip_prefix(root_parent).ok()?;
-    relative.components().find_map(|component| {
+    if let Ok(relative) = parent.strip_prefix(root_parent) {
+        return first_project_component(relative.components());
+    }
+
+    let mut components = parent.components();
+    while let Some(component) = components.next() {
         let Component::Normal(value) = component else {
-            return None;
+            continue;
         };
-        let value = value.to_string_lossy();
-        (!matches!(value.as_ref(), "project" | "projects" | "works")).then(|| value.into_owned())
-    })
+        if matches!(
+            value.to_string_lossy().as_ref(),
+            "project" | "projects" | "works"
+        ) {
+            return components.find_map(|component| match component {
+                Component::Normal(value) => Some(value.to_string_lossy().into_owned()),
+                _ => None,
+            });
+        }
+    }
+    None
 }
 
+fn first_project_component<'a>(components: impl Iterator<Item = Component<'a>>) -> Option<String> {
+    components
+        .filter_map(|component| match component {
+            Component::Normal(value) => Some(value.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .find(|value| !matches!(value.as_str(), "project" | "projects" | "works"))
+}
 fn add_cycle_diagnostic(identity: &Path, state: &mut State) {
     let start = state
         .active
@@ -347,6 +379,11 @@ fn parse_file(path: &Path) -> Result<ParsedFile, DiscoveryError> {
             .copied()
             .find(|index| *index > line_index)
             .unwrap_or(lines.len());
+        let block_start = boundaries
+            .iter()
+            .copied()
+            .rfind(|index| *index < line_index)
+            .map_or(0, |index| index + 1);
         let host_tokens = directive_tokens(&lines[line_index].text);
         let destination = (line_index + 1..end_line_index)
             .find_map(|index| {
@@ -364,6 +401,8 @@ fn parse_file(path: &Path) -> Result<ParsedFile, DiscoveryError> {
                     .find(|alias| !alias.starts_with('!') && !has_magic(alias))
                     .cloned()
             });
+        let persistent_id =
+            (block_start..end_line_index).find_map(|index| sshx_id(&lines[index].text));
         let byte_start = lines[line_index].start;
         let byte_end = end_line_index
             .checked_sub(1)
@@ -373,6 +412,7 @@ fn parse_file(path: &Path) -> Result<ParsedFile, DiscoveryError> {
             line_index,
             aliases: host_tokens.into_iter().skip(1).collect(),
             destination,
+            persistent_id,
             byte_start,
             byte_end,
             line_start: lines[line_index].number,
@@ -474,6 +514,23 @@ fn tokenize(line: &str) -> Vec<String> {
         tokens.push(token);
     }
     tokens
+}
+
+fn sshx_id(line: &str) -> Option<String> {
+    let marker = line.trim().strip_prefix("##SSHX")?.trim_start();
+    let mut tokens = tokenize(marker);
+    let key = tokens.first_mut()?;
+    let key = key.trim_end_matches(':');
+    if let Some((name, value)) = key.split_once('=')
+        && name.eq_ignore_ascii_case("ID")
+    {
+        return (!value.is_empty()).then(|| value.to_string());
+    }
+    if !key.eq_ignore_ascii_case("ID") {
+        return None;
+    }
+    let value = tokens.get(1)?.trim_end_matches(':');
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 fn directive_tokens(line: &str) -> Vec<String> {
