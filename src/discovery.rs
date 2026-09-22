@@ -282,12 +282,14 @@ fn visit_file(
 fn derive_project(source: &Path, root: &Path) -> Option<String> {
     let parent = source.parent()?;
     let root_parent = root.parent()?;
-    if parent == root_parent {
-        return None;
-    }
-    parent
-        .file_name()
-        .map(|value| value.to_string_lossy().into_owned())
+    let relative = parent.strip_prefix(root_parent).ok()?;
+    relative.components().find_map(|component| {
+        let Component::Normal(value) = component else {
+            return None;
+        };
+        let value = value.to_string_lossy();
+        (!matches!(value.as_ref(), "project" | "projects" | "works")).then(|| value.into_owned())
+    })
 }
 
 fn add_cycle_diagnostic(identity: &Path, state: &mut State) {
