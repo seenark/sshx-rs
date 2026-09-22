@@ -24,10 +24,36 @@ fn fixture() -> (PathBuf, PathBuf, PathBuf) {
         &ssh,
         r#"#!/bin/sh
 marker="$SSHX_TUNNEL_MARKER"
+pid_file="$marker.pid"
 case " $* " in
   *" -O check "*) test -f "$marker"; exit ;;
-  *" -O exit "*) rm -f "$marker"; exit 0 ;;
-  *" -N "*) ( : > "$marker"; trap 'rm -f "$marker"; exit 0' INT HUP TERM; while :; do sleep 1; done ) </dev/null >/dev/null 2>/dev/null & exit 0 ;;
+  *" -O exit "*)
+    if [ -f "$pid_file" ]; then
+      master_pid=$(cat "$pid_file")
+      kill "$master_pid" 2>/dev/null || :
+      i=0
+      while [ -e "$marker" ] && [ "$i" -lt 100 ]; do
+        sleep 0.01
+        i=$((i + 1))
+      done
+    fi
+    rm -f "$marker" "$pid_file"
+    exit 0
+    ;;
+  *" -N "*)
+    (
+      : > "$marker"
+      child=
+      trap 'kill "$child" 2>/dev/null; wait "$child" 2>/dev/null; rm -f "$marker" "$pid_file"; exit 0' INT HUP TERM
+      while :; do
+        sleep 1 &
+        child=$!
+        wait "$child"
+      done
+    ) </dev/null >/dev/null 2>/dev/null &
+    printf '%s' "$!" > "$pid_file"
+    exit 0
+    ;;
 esac
 exit 0
 "#,
