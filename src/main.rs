@@ -1,16 +1,17 @@
 use serde::Serialize;
 use sshx::discovery::{HostEntry, discover_roots, scope_for_path};
-use sshx::mutation::{self, CreateRequest};
-use sshx::output::{OutputFormat, render_create, render_diagnostic, render_human, render_machine};
+use sshx::mutation::{self, CreateRequest, MutationKind, UpdateRequest};
+use sshx::output::{
+    OutputFormat, render_create, render_diagnostic, render_edit, render_human, render_machine,
+};
 use sshx::settings::{self, RegisteredRoot};
 use std::env;
 use std::ffi::OsString;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::process;
-
 const USAGE: &str = "Usage: sshx [--version]";
-const HOST_USAGE: &str = "Usage: sshx [--config PATH] host list [--format human|json|yaml]\n       sshx [--config PATH] host show SELECTOR [--format human|json|yaml]\n       sshx host create --scope SCOPE --file PATH --alias ALIAS --hostname HOSTNAME [options]";
+const HOST_USAGE: &str = "Usage: sshx [--config PATH] host list [--format human|json|yaml]\n       sshx [--config PATH] host show SELECTOR [--format human|json|yaml]\n       sshx [--config PATH] host create --scope SCOPE --file PATH --alias ALIAS --hostname HOSTNAME [options]\n       sshx [--config PATH] host update SELECTOR [options]\n       sshx [--config PATH] host rename SELECTOR --alias ALIAS [options]\n       sshx [--config PATH] host delete SELECTOR [options]";
 const SETUP_USAGE: &str = "Usage: sshx setup [--personal PATH] [--work PATH] [--project NAME]\n       sshx connect [SELECTOR] [--id ID] [--source PATH --line NUMBER] [--no-input]";
 
 fn main() {
@@ -48,6 +49,12 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
     if matches!(&cli.command, Command::CreateHost) {
         return run_host_create(&cli, &roots);
     }
+    if matches!(
+        &cli.command,
+        Command::UpdateHost(_) | Command::RenameHost(_) | Command::DeleteHost(_)
+    ) {
+        return run_host_edit(&cli, &roots);
+    }
     let configured = settings::discovery_roots(&roots);
     let catalog = discover_roots(&configured).map_err(|error| error.to_string())?;
     for diagnostic in &catalog.diagnostics {
@@ -79,7 +86,11 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
                 sshx::connect::open(entry, &home_dir()?, cli.no_input, alias)
             }
         }
-        Command::Setup | Command::CreateHost => unreachable!(),
+        Command::Setup
+        | Command::CreateHost
+        | Command::UpdateHost(_)
+        | Command::RenameHost(_)
+        | Command::DeleteHost(_) => unreachable!(),
     }
 }
 
@@ -253,6 +264,193 @@ fn run_host_create(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), String> {
     mutation::apply(&plan)?;
     print!("{}", render_create(&plan, cli.format, true)?);
     Ok(())
+}
+
+fn run_host_edit(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), String> {
+    let configured = settings::discovery_roots(roots);
+    mutation::validate_mutation_roots(&configured)?;
+    let catalog = discover_roots(&configured).map_err(|error| error.to_string())?;
+    for diagnostic in &catalog.diagnostics {
+        eprintln!("{}", render_diagnostic(diagnostic));
+    }
+    let filtered = filter_entries(&catalog.entries, cli);
+    let (operation, positional) = match &cli.command {
+        Command::UpdateHost(selector) => (MutationKind::Update, selector.as_deref()),
+        Command::RenameHost(selector) => (MutationKind::Rename, selector.as_deref()),
+        Command::DeleteHost(selector) => (MutationKind::Delete, selector.as_deref()),
+        _ => return Err("MUTATION_COMMAND: unsupported host mutation".to_string()),
+    };
+    if operation == MutationKind::Delete
+        && (cli.alias.is_some()
+            || cli.hostname.is_some()
+            || cli.user.is_some()
+            || cli.port.is_some()
+            || cli.password_stdin
+            || cli.clear_user
+            || cli.clear_port
+            || cli.clear_password)
+    {
+        return Err("MUTATION_FIELDS: delete does not accept host fields".to_string());
+    }
+    if operation == MutationKind::Rename
+        && (cli.hostname.is_some()
+            || cli.user.is_some()
+            || cli.port.is_some()
+            || cli.password_stdin
+            || cli.clear_user
+            || cli.clear_port
+            || cli.clear_password)
+    {
+        return Err("MUTATION_FIELDS: rename accepts only --alias".to_string());
+    }
+    let entry = select_mutation_entry(&filtered, positional, cli)?;
+    mutation::validate_entry_paths(entry)?;
+    let selected_alias = selected_connect_alias(entry, positional, cli).to_string();
+    let home = home_dir()?;
+    let plan = match operation {
+        MutationKind::Delete => {
+            ensure_delete_allowed(&home, entry)?;
+            mutation::plan_delete(
+                PathBuf::from(&entry.source.path).as_path(),
+                &entry.id,
+                &selected_alias,
+                entry.source.byte_start,
+                entry.source.byte_end,
+            )?
+        }
+        MutationKind::Update | MutationKind::Rename => {
+            let password = if cli.password_stdin {
+                create_password(cli, false)?
+                    .ok_or_else(|| "PASSWORD_REQUIRED: password input is empty".to_string())?
+            } else {
+                String::new()
+            };
+            let mut plan = mutation::plan_update(&UpdateRequest {
+                path: PathBuf::from(&entry.source.path),
+                expected_id: entry.id.clone(),
+                selected_alias,
+                byte_start: entry.source.byte_start,
+                byte_end: entry.source.byte_end,
+                alias: cli.alias.clone(),
+                hostname: cli.hostname.clone(),
+                user: cli.user.clone(),
+                port: cli.port,
+                password: cli.password_stdin.then_some(password),
+                clear_user: cli.clear_user,
+                clear_port: cli.clear_port,
+                clear_password: cli.clear_password,
+            })?;
+            plan.operation = operation;
+            plan
+        }
+    };
+    if cli.preview {
+        print!("{}", render_edit(&plan, cli.format, false)?);
+        return Ok(());
+    }
+    let interactive = !cli.no_input && io::stdin().is_terminal();
+    if !cli.yes {
+        if !interactive {
+            return Err(
+                "CONSENT_REQUIRED: non-interactive host mutation requires --yes".to_string(),
+            );
+        }
+        eprint!("{}", render_edit(&plan, OutputFormat::Human, false)?);
+        if !prompt_yes("Apply changes? [y/N]: ")? {
+            return Err("MUTATION_DECLINED: host mutation was not applied".to_string());
+        }
+    }
+    mutation::apply_edit(&plan)?;
+    print!("{}", render_edit(&plan, cli.format, true)?);
+    Ok(())
+}
+
+fn select_mutation_entry<'a>(
+    entries: &[&'a HostEntry],
+    positional: Option<&str>,
+    cli: &Cli,
+) -> Result<&'a HostEntry, String> {
+    if positional.is_none() && cli.id.is_none() {
+        return Err("HOST_REQUIRED: host mutation requires a selector".to_string());
+    }
+    select_connect_entry(entries, positional, cli)
+}
+
+fn ensure_delete_allowed(home: &std::path::Path, entry: &HostEntry) -> Result<(), String> {
+    let id = &entry.id;
+    let mut paths = entry
+        .provenance
+        .iter()
+        .flat_map(|provenance| provenance.paths.iter().cloned())
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    let metadata_root = home.join(".config/sshx");
+    collect_regular_files(&metadata_root, &mut paths);
+    paths.sort();
+    paths.dedup();
+    for path in paths {
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        if has_pair_reference(&text, id) {
+            return Err(format!(
+                "DELETE_REFERENCED: entry {} is referenced by {}",
+                id,
+                path.display()
+            ));
+        }
+        if path.starts_with(&metadata_root) && has_active_reference(&text, id) {
+            return Err(format!(
+                "DELETE_ACTIVE: entry {} has active managed use in {}",
+                id,
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn collect_regular_files(path: &std::path::Path, files: &mut Vec<PathBuf>) {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return;
+    };
+    if metadata.file_type().is_symlink() {
+        return;
+    }
+    if metadata.is_file() {
+        files.push(path.to_path_buf());
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        collect_regular_files(&entry.path(), files);
+    }
+}
+
+fn has_pair_reference(text: &str, id: &str) -> bool {
+    let normalized = text
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+    let id = id.to_ascii_lowercase();
+    normalized.contains(&format!("gateway={id}"))
+        || normalized.contains(&format!("gateway_id={id}"))
+        || normalized.contains(&format!("gateway_id\":\"{id}\""))
+        || normalized.contains(&format!("vm={id}"))
+        || normalized.contains(&format!("vm_id={id}"))
+        || normalized.contains(&format!("vm_id\":\"{id}\""))
+}
+
+fn has_active_reference(text: &str, id: &str) -> bool {
+    let lower = text.to_ascii_lowercase().replace(char::is_whitespace, "");
+    lower.contains(&format!("\"entry_id\":\"{}\"", id.to_ascii_lowercase()))
+        && (lower.contains("\"state\":\"active\"")
+            || lower.contains("\"state\":\"starting\"")
+            || lower.contains("\"state\":\"stopping\""))
 }
 
 fn required_create_value(
@@ -736,6 +934,9 @@ enum Command {
     Show(String),
     Connect(Option<String>),
     CreateHost,
+    UpdateHost(Option<String>),
+    RenameHost(Option<String>),
+    DeleteHost(Option<String>),
     Setup,
 }
 
@@ -761,6 +962,9 @@ struct Cli {
     user: Option<String>,
     port: Option<u16>,
     password_stdin: bool,
+    clear_user: bool,
+    clear_port: bool,
+    clear_password: bool,
     folder: Option<PathBuf>,
     file: Option<PathBuf>,
     yes: bool,
@@ -782,6 +986,9 @@ impl Cli {
         let mut hostname = None;
         let mut user = None;
         let mut port = None;
+        let mut clear_user = false;
+        let mut clear_port = false;
+        let mut clear_password = false;
         let mut password_stdin = false;
         let mut folder = None;
         let mut file = None;
@@ -841,6 +1048,12 @@ impl Cli {
                 );
             } else if text == "--password-stdin" {
                 password_stdin = true;
+            } else if text == "--clear-user" {
+                clear_user = true;
+            } else if text == "--clear-port" {
+                clear_port = true;
+            } else if text == "--clear-password" {
+                clear_password = true;
             } else if text == "--folder" {
                 folder = Some(PathBuf::from(next(text)?));
             } else if text == "--file" || text == "--target-file" {
@@ -909,6 +1122,18 @@ impl Cli {
                 return Err("host show requires a selector".to_string());
             }
             [host, create] if host == "host" && create == "create" => Command::CreateHost,
+            [host, update, selector] if host == "host" && update == "update" => {
+                Command::UpdateHost(Some(selector.clone()))
+            }
+            [host, update] if host == "host" && update == "update" => Command::UpdateHost(None),
+            [host, rename, selector] if host == "host" && rename == "rename" => {
+                Command::RenameHost(Some(selector.clone()))
+            }
+            [host, rename] if host == "host" && rename == "rename" => Command::RenameHost(None),
+            [host, delete, selector] if host == "host" && delete == "delete" => {
+                Command::DeleteHost(Some(selector.clone()))
+            }
+            [host, delete] if host == "host" && delete == "delete" => Command::DeleteHost(None),
             [connect] if connect == "connect" => Command::Connect(None),
             [connect, selector] if connect == "connect" => Command::Connect(Some(selector.clone())),
             [setup] if setup == "setup" => Command::Setup,
@@ -936,6 +1161,24 @@ impl Cli {
                 }
                 Command::CreateHost
             }
+            Command::UpdateHost(selector) => {
+                if host.is_some() && selector.is_some() {
+                    return Err("SELECTOR_CONFLICT: provide one host selector".to_string());
+                }
+                Command::UpdateHost(selector.or(host))
+            }
+            Command::RenameHost(selector) => {
+                if host.is_some() && selector.is_some() {
+                    return Err("SELECTOR_CONFLICT: provide one host selector".to_string());
+                }
+                Command::RenameHost(selector.or(host))
+            }
+            Command::DeleteHost(selector) => {
+                if host.is_some() && selector.is_some() {
+                    return Err("SELECTOR_CONFLICT: provide one host selector".to_string());
+                }
+                Command::DeleteHost(selector.or(host))
+            }
             command => {
                 if host.is_some() {
                     return Err("--host is only valid with connect".to_string());
@@ -958,6 +1201,9 @@ impl Cli {
             user,
             port,
             password_stdin,
+            clear_user,
+            clear_port,
+            clear_password,
             folder,
             file,
             yes,

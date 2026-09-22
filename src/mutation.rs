@@ -1,4 +1,4 @@
-use crate::discovery::path_reachable;
+use crate::discovery::{DiscoveryRoot, HostEntry, path_reachable};
 use serde::Serialize;
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
@@ -45,6 +47,39 @@ impl CreateRequest {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct UpdateRequest {
+    pub path: PathBuf,
+    pub expected_id: String,
+    pub selected_alias: String,
+    pub byte_start: usize,
+    pub byte_end: usize,
+    pub alias: Option<String>,
+    pub hostname: Option<String>,
+    pub user: Option<String>,
+    pub port: Option<u16>,
+    pub password: Option<String>,
+    pub clear_user: bool,
+    pub clear_port: bool,
+    pub clear_password: bool,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MutationKind {
+    Update,
+    Rename,
+    Delete,
+}
+
+#[derive(Debug)]
+pub struct EditPlan {
+    pub id: String,
+    pub operation: MutationKind,
+    pub files: Vec<FileChange>,
+    lock_path: PathBuf,
+    writes: Vec<WriteFile>,
+}
+
 #[derive(Debug)]
 pub struct CreatePlan {
     pub id: String,
@@ -58,6 +93,7 @@ pub struct CreatePlan {
 pub enum FileOperation {
     Create,
     Modify,
+    Delete,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -87,6 +123,10 @@ struct Fingerprint {
     device: u64,
     #[cfg(unix)]
     inode: u64,
+    #[cfg(unix)]
+    uid: u32,
+    #[cfg(unix)]
+    gid: u32,
     modified: Option<(u64, u32)>,
 }
 
@@ -219,21 +259,651 @@ pub fn plan_create(request: &CreateRequest) -> Result<CreatePlan, String> {
 }
 
 pub fn apply(plan: &CreatePlan) -> Result<(), String> {
-    let _lock = WriterLock::acquire(&plan.lock_path)?;
-    for write in &plan.writes {
+    apply_writes(&plan.lock_path, &plan.writes)
+}
+
+pub fn apply_edit(plan: &EditPlan) -> Result<(), String> {
+    apply_writes(&plan.lock_path, &plan.writes)
+}
+
+pub fn validate_mutation_roots(roots: &[DiscoveryRoot]) -> Result<(), String> {
+    for root in roots {
+        validate_path_components(&root.path, "CONFIG_ROOT")?;
+    }
+    Ok(())
+}
+
+pub fn validate_entry_paths(entry: &HostEntry) -> Result<(), String> {
+    for provenance in &entry.provenance {
+        for path in &provenance.paths {
+            let path = Path::new(path);
+            let metadata = fs::symlink_metadata(path).map_err(|error| {
+                format!(
+                    "CONFIG_CHANGED: cannot inspect selected path {}: {error}",
+                    display_path(path)
+                )
+            })?;
+            if metadata.file_type().is_symlink() {
+                return Err(format!(
+                    "MUTATION_SYMLINK: refusing symlink in selected include path: {}",
+                    display_path(path)
+                ));
+            }
+        }
+    }
+    validate_path_components(Path::new(&entry.source.path), "SOURCE_FILE")
+}
+
+pub fn plan_update(request: &UpdateRequest) -> Result<EditPlan, String> {
+    validate_update_request(request)?;
+    let loaded = load_block(request)?;
+    let mut changes = Vec::new();
+    if let Some(alias) = &request.alias {
+        changes.push(replace_alias(&loaded, &request.selected_alias, alias)?);
+    }
+    let port_value = request.port.map(|port| port.to_string());
+    for (keyword, value, clear) in [
+        ("HostName", request.hostname.as_deref(), false),
+        ("User", request.user.as_deref(), request.clear_user),
+        ("Port", port_value.as_deref(), request.clear_port),
+    ] {
+        if (value.is_some() || clear)
+            && let Some(change) = replace_directive(&loaded, keyword, value, clear)?
+        {
+            changes.push(change);
+        }
+    }
+    if request.password.is_some() || request.clear_password {
+        changes.push(replace_password(
+            &loaded,
+            request.password.as_deref(),
+            request.clear_password,
+        )?);
+    }
+    let after = apply_changes(&loaded.before, changes);
+    Ok(make_edit_plan(
+        request.expected_id.clone(),
+        MutationKind::Update,
+        loaded,
+        after,
+    ))
+}
+
+pub fn plan_delete(
+    path: &Path,
+    expected_id: &str,
+    selected_alias: &str,
+    byte_start: usize,
+    byte_end: usize,
+) -> Result<EditPlan, String> {
+    let request = UpdateRequest {
+        path: path.to_path_buf(),
+        expected_id: expected_id.to_string(),
+        selected_alias: selected_alias.to_string(),
+        byte_start,
+        byte_end,
+        alias: None,
+        hostname: None,
+        user: None,
+        port: None,
+        password: None,
+        clear_user: false,
+        clear_port: false,
+        clear_password: false,
+    };
+    let loaded = load_block_with_span(&request, byte_start, byte_end)?;
+    let after = delete_block(&loaded);
+    Ok(make_edit_plan(
+        expected_id.to_string(),
+        MutationKind::Delete,
+        loaded,
+        after,
+    ))
+}
+
+fn apply_writes(lock_path: &Path, writes: &[WriteFile]) -> Result<(), String> {
+    let _lock = WriterLock::acquire(lock_path)?;
+    for write in writes {
         verify_snapshot(write)?;
     }
     let mut applied = Vec::new();
-    for write in &plan.writes {
+    for write in writes {
         if let Err(error) = write_atomic(write) {
+            let mut recovery_errors = Vec::new();
             for previous in applied.into_iter().rev() {
-                let _ = restore(previous);
+                if let Err(recovery_error) = restore(previous) {
+                    recovery_errors.push(recovery_error);
+                }
             }
-            return Err(error);
+            if recovery_errors.is_empty() {
+                return Err(error);
+            }
+            return Err(format!(
+                "MUTATION_PARTIAL: {error}; recovery failed: {}",
+                recovery_errors.join("; ")
+            ));
         }
         applied.push(write);
     }
+
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+
+struct ByteLine {
+    start: usize,
+    content_end: usize,
+    end: usize,
+}
+
+#[derive(Clone)]
+struct LoadedBlock {
+    path: PathBuf,
+    before: Vec<u8>,
+    snapshot: Fingerprint,
+    mode: u32,
+    lines: Vec<ByteLine>,
+    host_line: usize,
+    block_end_line: usize,
+    block_end: usize,
+    marker_range: Option<(usize, usize)>,
+}
+
+#[derive(Clone)]
+struct Change {
+    start: usize,
+    end: usize,
+    replacement: Vec<u8>,
+}
+
+fn validate_update_request(request: &UpdateRequest) -> Result<(), String> {
+    if request.alias.is_none()
+        && request.hostname.is_none()
+        && request.user.is_none()
+        && request.port.is_none()
+        && request.password.is_none()
+        && !request.clear_user
+        && !request.clear_port
+        && !request.clear_password
+    {
+        return Err("MUTATION_EMPTY: provide at least one host field".to_string());
+    }
+    if let Some(alias) = &request.alias {
+        validate_alias(alias)?;
+    }
+    for (name, value) in [
+        ("hostname", request.hostname.as_deref()),
+        ("user", request.user.as_deref()),
+        ("password", request.password.as_deref()),
+    ] {
+        if let Some(value) = value {
+            validate_value(name, value)?;
+        }
+    }
+    if request.user.is_some() && request.clear_user
+        || request.port.is_some() && request.clear_port
+        || request.password.is_some() && request.clear_password
+    {
+        return Err("MUTATION_CONFLICT: cannot set and clear one field together".to_string());
+    }
+    Ok(())
+}
+
+fn validate_alias(alias: &str) -> Result<(), String> {
+    validate_value("alias", alias)?;
+    if alias.chars().any(|character| {
+        character.is_whitespace() || matches!(character, '*' | '?' | '[' | ']' | '!')
+    }) {
+        return Err("ALIAS_INVALID: alias must be one exact Host token".to_string());
+    }
+    Ok(())
+}
+
+fn load_block(request: &UpdateRequest) -> Result<LoadedBlock, String> {
+    load_block_with_span(request, request.byte_start, request.byte_end)
+}
+
+fn load_block_with_span(
+    request: &UpdateRequest,
+    byte_start: usize,
+    byte_end: usize,
+) -> Result<LoadedBlock, String> {
+    let path = absolute_path(&request.path)?;
+    validate_path_components(&path, "SOURCE_FILE")?;
+    let before = read_regular_file(&path, "SOURCE_FILE")?;
+    let snapshot = fingerprint(&path)?;
+    ensure_snapshot_bytes(&snapshot, &before, &path)?;
+    let mode = snapshot.mode;
+    let lines = split_byte_lines(&before);
+    let host_line = lines
+        .iter()
+        .position(|line| line.start == byte_start)
+        .ok_or_else(|| "CONFIG_CHANGED: selected Host line no longer exists".to_string())?;
+    if !is_host_boundary(&before, lines[host_line]) {
+        return Err("CONFIG_CHANGED: selected span is no longer a Host block".to_string());
+    }
+    let block_end_line = lines
+        .iter()
+        .enumerate()
+        .skip(host_line + 1)
+        .find(|(_, line)| is_boundary(&before, **line))
+        .map_or(lines.len(), |(index, _)| index);
+    let block_end = lines
+        .get(block_end_line.saturating_sub(1))
+        .map_or(before.len(), |line| line.end);
+    if block_end != byte_end {
+        return Err("CONFIG_CHANGED: selected Host block span is stale".to_string());
+    }
+    let spans = token_spans(&before[lines[host_line].start..lines[host_line].content_end]);
+    let aliases = spans
+        .iter()
+        .skip(1)
+        .map(|(start, end)| {
+            decode_token(&before[lines[host_line].start + *start..lines[host_line].start + *end])
+        })
+        .collect::<Vec<_>>();
+    if !aliases.iter().any(|alias| alias == &request.selected_alias) {
+        return Err("CONFIG_CHANGED: selected alias no longer exists".to_string());
+    }
+
+    let block_start_line = (0..host_line)
+        .rev()
+        .find(|index| is_boundary(&before, lines[*index]))
+        .map_or(0, |index| index + 1);
+    let marker_range = (block_start_line..host_line).find_map(|index| {
+        let line = lines[index];
+        let text = String::from_utf8_lossy(&before[line.start..line.content_end]);
+        (existing_id(&text) == Some(request.expected_id.clone())).then_some((line.start, line.end))
+    });
+    let actual_id = marker_range
+        .as_ref()
+        .map(|_| request.expected_id.clone())
+        .unwrap_or_else(|| synthetic_entry_id(&path, byte_start, byte_end));
+    if actual_id != request.expected_id {
+        return Err("CONFIG_CHANGED: selected Host identity is stale".to_string());
+    }
+    Ok(LoadedBlock {
+        path,
+        before,
+        snapshot,
+        mode,
+        lines,
+        host_line,
+        block_end_line,
+        block_end,
+        marker_range,
+    })
+}
+
+fn make_edit_plan(
+    id: String,
+    operation: MutationKind,
+    loaded: LoadedBlock,
+    after: Vec<u8>,
+) -> EditPlan {
+    let LoadedBlock {
+        path,
+        before,
+        snapshot,
+        mode,
+        ..
+    } = loaded;
+    let files = if before == after {
+        Vec::new()
+    } else {
+        vec![FileChange {
+            path: display_path(&path),
+            operation: match operation {
+                MutationKind::Delete => FileOperation::Delete,
+                MutationKind::Update | MutationKind::Rename => FileOperation::Modify,
+            },
+            patch: edit_patch(&path, &before, &after),
+        }]
+    };
+    let writes = if before == after {
+        Vec::new()
+    } else {
+        vec![WriteFile {
+            path: path.clone(),
+            before,
+            after,
+            mode,
+            existed: true,
+            snapshot,
+        }]
+    };
+    EditPlan {
+        id,
+        operation,
+        files,
+        lock_path: mutation_lock_path(&path),
+        writes,
+    }
+}
+
+fn replace_alias(
+    loaded: &LoadedBlock,
+    selected_alias: &str,
+    alias: &str,
+) -> Result<Change, String> {
+    let line = loaded.lines[loaded.host_line];
+    let raw = &loaded.before[line.start..line.content_end];
+    let spans = token_spans(raw);
+    let (start, end) = spans
+        .iter()
+        .skip(1)
+        .find(|(start, end)| decode_token(&raw[*start..*end]) == selected_alias)
+        .copied()
+        .ok_or_else(|| "CONFIG_CHANGED: selected alias no longer exists".to_string())?;
+    Ok(Change {
+        start: line.start + start,
+        end: line.start + end,
+        replacement: alias.as_bytes().to_vec(),
+    })
+}
+
+fn replace_directive(
+    loaded: &LoadedBlock,
+    keyword: &str,
+    value: Option<&str>,
+    clear: bool,
+) -> Result<Option<Change>, String> {
+    for index in loaded.host_line + 1..loaded.block_end_line {
+        let line = loaded.lines[index];
+        let raw = &loaded.before[line.start..line.content_end];
+        if !directive_matches(raw, keyword) {
+            continue;
+        }
+        if clear {
+            return Ok(Some(Change {
+                start: line.start,
+                end: line.end,
+                replacement: Vec::new(),
+            }));
+        }
+        let Some((start, end)) = argument_span(raw, keyword) else {
+            return Err(format!("CONFIG_CHANGED: {keyword} directive has no value"));
+        };
+        return Ok(Some(Change {
+            start: line.start + start,
+            end: line.start + end,
+            replacement: value.unwrap_or_default().as_bytes().to_vec(),
+        }));
+    }
+    if clear {
+        return Ok(None);
+    }
+    Ok(Some(insert_directive(
+        loaded,
+        keyword,
+        value.unwrap_or_default(),
+    )))
+}
+
+fn replace_password(
+    loaded: &LoadedBlock,
+    value: Option<&str>,
+    clear: bool,
+) -> Result<Change, String> {
+    for index in loaded.host_line + 1..loaded.block_end_line {
+        let line = loaded.lines[index];
+        let raw = &loaded.before[line.start..line.content_end];
+        if !password_line(raw) {
+            continue;
+        }
+        if clear {
+            return Ok(Change {
+                start: line.start,
+                end: line.end,
+                replacement: Vec::new(),
+            });
+        }
+        let start = password_value_start(raw);
+        return Ok(Change {
+            start: line.start + start,
+            end: line.content_end,
+            replacement: value.unwrap_or_default().as_bytes().to_vec(),
+        });
+    }
+    if clear {
+        return Err("CONFIG_CHANGED: password metadata is already absent".to_string());
+    }
+    Ok(insert_directive(
+        loaded,
+        "##PASSWORD",
+        value.unwrap_or_default(),
+    ))
+}
+
+fn insert_directive(loaded: &LoadedBlock, keyword: &str, value: &str) -> Change {
+    let line = loaded.lines[loaded.host_line];
+    let eol = if line.end > line.content_end {
+        loaded.before[line.content_end..line.end].to_vec()
+    } else if let Some(eol) = detect_line_ending(&loaded.before) {
+        eol.into_bytes()
+    } else {
+        b"\n".to_vec()
+    };
+    let mut replacement = Vec::new();
+    if line.end == line.content_end {
+        replacement.extend_from_slice(&eol);
+    }
+    replacement.extend_from_slice(b"  ");
+    replacement.extend_from_slice(keyword.as_bytes());
+    replacement.push(b' ');
+    replacement.extend_from_slice(value.as_bytes());
+    replacement.extend_from_slice(&eol);
+    Change {
+        start: line.end,
+        end: line.end,
+        replacement,
+    }
+}
+
+fn apply_changes(before: &[u8], mut changes: Vec<Change>) -> Vec<u8> {
+    changes.sort_by_key(|change| std::cmp::Reverse(change.start));
+    let mut after = before.to_vec();
+    for change in changes {
+        after.splice(change.start..change.end, change.replacement);
+    }
+    after
+}
+
+fn delete_block(loaded: &LoadedBlock) -> Vec<u8> {
+    let host = loaded.lines[loaded.host_line];
+    let mut after = Vec::with_capacity(
+        loaded
+            .before
+            .len()
+            .saturating_sub(loaded.block_end.saturating_sub(host.start)),
+    );
+    if let Some((marker_start, marker_end)) = loaded.marker_range {
+        after.extend_from_slice(&loaded.before[..marker_start]);
+        after.extend_from_slice(&loaded.before[marker_end..host.start]);
+    } else {
+        after.extend_from_slice(&loaded.before[..host.start]);
+    }
+    after.extend_from_slice(&loaded.before[loaded.block_end..]);
+    after
+}
+
+fn split_byte_lines(bytes: &[u8]) -> Vec<ByteLine> {
+    let mut lines = Vec::new();
+    let mut start = 0;
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte != b'\n' {
+            continue;
+        }
+        let content_end = if index > start && bytes[index - 1] == b'\r' {
+            index - 1
+        } else {
+            index
+        };
+        lines.push(ByteLine {
+            start,
+            content_end,
+            end: index + 1,
+        });
+        start = index + 1;
+    }
+    if start < bytes.len() {
+        lines.push(ByteLine {
+            start,
+            content_end: bytes.len(),
+            end: bytes.len(),
+        });
+    }
+    lines
+}
+
+fn is_host_boundary(bytes: &[u8], line: ByteLine) -> bool {
+    let raw = &bytes[line.start..line.content_end];
+    directive_matches(raw, "Host") && token_spans(raw).len() > 1
+}
+
+fn is_boundary(bytes: &[u8], line: ByteLine) -> bool {
+    let raw = &bytes[line.start..line.content_end];
+    directive_matches(raw, "Match") || is_host_boundary(bytes, line)
+}
+
+fn directive_matches(raw: &[u8], keyword: &str) -> bool {
+    let spans = token_spans(raw);
+    let Some((start, end)) = spans.first().copied() else {
+        return false;
+    };
+    let token = &raw[start..end];
+    let name_end = token
+        .iter()
+        .position(|byte| *byte == b'=')
+        .unwrap_or(token.len());
+    token[..name_end].eq_ignore_ascii_case(keyword.as_bytes())
+}
+
+fn argument_span(raw: &[u8], keyword: &str) -> Option<(usize, usize)> {
+    let spans = token_spans(raw);
+    let (first_start, first_end) = spans.first().copied()?;
+    let first = &raw[first_start..first_end];
+    if let Some(equal) = first.iter().position(|byte| *byte == b'=')
+        && first[..equal].eq_ignore_ascii_case(keyword.as_bytes())
+    {
+        return Some((first_start + equal + 1, first_end));
+    }
+    if directive_matches(raw, keyword) {
+        spans.get(1).copied()
+    } else {
+        None
+    }
+}
+
+fn token_spans(raw: &[u8]) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut index = 0;
+    while index < raw.len() {
+        while index < raw.len() && raw[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        if index >= raw.len() || raw[index] == b'#' {
+            break;
+        }
+        let start = index;
+        let mut quote = None;
+        let mut escaped = false;
+        while index < raw.len() {
+            let byte = raw[index];
+            if escaped {
+                escaped = false;
+                index += 1;
+                continue;
+            }
+            if byte == b'\\' && quote != Some(b'\'') {
+                escaped = true;
+                index += 1;
+                continue;
+            }
+            if let Some(active) = quote {
+                if byte == active {
+                    quote = None;
+                }
+                index += 1;
+                continue;
+            }
+            if byte == b'\'' || byte == b'"' {
+                quote = Some(byte);
+                index += 1;
+                continue;
+            }
+            if byte.is_ascii_whitespace() || byte == b'#' {
+                break;
+            }
+            index += 1;
+        }
+        if start < index {
+            spans.push((start, index));
+        }
+        while index < raw.len() && raw[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        if index < raw.len() && raw[index] == b'#' {
+            break;
+        }
+    }
+    spans
+}
+
+fn decode_token(raw: &[u8]) -> String {
+    let raw = if raw.len() >= 2
+        && matches!(
+            (raw.first(), raw.last()),
+            (Some(b'\''), Some(b'\'')) | (Some(b'"'), Some(b'"'))
+        ) {
+        &raw[1..raw.len() - 1]
+    } else {
+        raw
+    };
+    let mut value = Vec::with_capacity(raw.len());
+    let mut escaped = false;
+    for byte in raw {
+        if escaped {
+            value.push(*byte);
+            escaped = false;
+        } else if *byte == b'\\' {
+            escaped = true;
+        } else {
+            value.push(*byte);
+        }
+    }
+    if escaped {
+        value.push(b'\\');
+    }
+    String::from_utf8_lossy(&value).into_owned()
+}
+
+fn password_line(raw: &[u8]) -> bool {
+    let trimmed = raw
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .map_or(&[][..], |start| &raw[start..]);
+    trimmed
+        .get(..10)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"##PASSWORD"))
+        && trimmed.get(10).is_some_and(u8::is_ascii_whitespace)
+}
+
+fn password_value_start(raw: &[u8]) -> usize {
+    let marker_start = raw
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(0);
+    let mut index = marker_start + 10;
+    while index < raw.len() && raw[index].is_ascii_whitespace() {
+        index += 1;
+    }
+    index
+}
+
+fn synthetic_entry_id(path: &Path, byte_start: usize, byte_end: usize) -> String {
+    format!("{}#{}-{}", display_path(path), byte_start, byte_end)
 }
 
 fn validate_request(request: &CreateRequest) -> Result<(), String> {
@@ -332,6 +1002,86 @@ fn append_patch(path: &Path, before: &[u8], after: &[u8], password: Option<&str>
     patch
 }
 
+fn validate_path_components(path: &Path, code: &str) -> Result<(), String> {
+    let path = absolute_path(path)?;
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
+            "{code}_SYMLINK: refusing symlink: {}",
+            display_path(&path)
+        )),
+        Ok(metadata) if !metadata.file_type().is_file() => Err(format!(
+            "{code}_INVALID: not a regular file: {}",
+            display_path(&path)
+        )),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "{code}_STAT_FAILED: cannot inspect {}: {error}",
+            display_path(&path)
+        )),
+    }
+}
+
+fn edit_patch(path: &Path, before: &[u8], after: &[u8]) -> String {
+    let old_lines = split_byte_lines(before);
+    let new_lines = split_byte_lines(after);
+    let mut prefix = 0;
+    while prefix < old_lines.len()
+        && prefix < new_lines.len()
+        && before[old_lines[prefix].start..old_lines[prefix].end]
+            == after[new_lines[prefix].start..new_lines[prefix].end]
+    {
+        prefix += 1;
+    }
+    let mut old_end = old_lines.len();
+    let mut new_end = new_lines.len();
+    while old_end > prefix
+        && new_end > prefix
+        && before[old_lines[old_end - 1].start..old_lines[old_end - 1].end]
+            == after[new_lines[new_end - 1].start..new_lines[new_end - 1].end]
+    {
+        old_end -= 1;
+        new_end -= 1;
+    }
+    let old_changed = &old_lines[prefix..old_end];
+    let new_changed = &new_lines[prefix..new_end];
+    let secret = old_changed
+        .iter()
+        .any(|line| password_line(&before[line.start..line.content_end]))
+        || new_changed
+            .iter()
+            .any(|line| password_line(&after[line.start..line.content_end]));
+    let mut patch = format!(
+        "--- {}\n+++ {}\n@@\n",
+        display_path(path),
+        display_path(path)
+    );
+    if secret {
+        if !old_changed.is_empty() {
+            patch.push_str("-<redacted secret-bearing block>\n");
+        }
+        if !new_changed.is_empty() {
+            patch.push_str("+<redacted secret-bearing block>\n");
+        }
+        return patch;
+    }
+    for line in old_changed {
+        patch.push('-');
+        patch.push_str(&display_line(before, *line));
+        patch.push('\n');
+    }
+    for line in new_changed {
+        patch.push('+');
+        patch.push_str(&display_line(after, *line));
+        patch.push('\n');
+    }
+    patch
+}
+
+fn display_line(bytes: &[u8], line: ByteLine) -> String {
+    String::from_utf8_lossy(&bytes[line.start..line.content_end]).into_owned()
+}
+
 fn new_id(target: &[u8], root: &[u8]) -> String {
     let mut existing = HashSet::new();
     for bytes in [target, root] {
@@ -364,8 +1114,8 @@ fn new_id(target: &[u8], root: &[u8]) -> String {
 fn existing_id(line: &str) -> Option<String> {
     let marker = line.trim().strip_prefix("##SSHX")?.trim_start();
     let token = marker.split_whitespace().next()?;
-    let (_, value) = token.split_once('=')?;
-    (!value.is_empty() && token.starts_with("ID=")).then(|| value.to_string())
+    let (name, value) = token.split_once('=')?;
+    (name.eq_ignore_ascii_case("ID") && !value.is_empty()).then(|| value.to_string())
 }
 
 fn include_path(target: &Path) -> String {
@@ -434,6 +1184,10 @@ fn fingerprint(path: &Path) -> Result<Fingerprint, String> {
                 device: 0,
                 #[cfg(unix)]
                 inode: 0,
+                #[cfg(unix)]
+                uid: 0,
+                #[cfg(unix)]
+                gid: 0,
                 modified: None,
             });
         }
@@ -467,6 +1221,10 @@ fn fingerprint(path: &Path) -> Result<Fingerprint, String> {
         digest: digest(&bytes),
         mode: file_mode(&metadata),
         #[cfg(unix)]
+        uid: metadata.uid(),
+        #[cfg(unix)]
+        gid: metadata.gid(),
+        #[cfg(unix)]
         device: metadata.dev(),
         #[cfg(unix)]
         inode: metadata.ino(),
@@ -487,6 +1245,7 @@ fn verify_snapshot(write: &WriteFile) -> Result<(), String> {
 
 fn write_atomic(write: &WriteFile) -> Result<(), String> {
     verify_snapshot(write)?;
+    validate_path_components(&write.path, "MUTATION")?;
     if let Some(parent) = write.path.parent() {
         fs::create_dir_all(parent).map_err(|error| {
             format!(
@@ -515,15 +1274,19 @@ fn write_atomic(write: &WriteFile) -> Result<(), String> {
                 temporary.display()
             )
         })?;
+        #[cfg(unix)]
+        if write.existed
+            && unsafe { libc::fchown(file.as_raw_fd(), write.snapshot.uid, write.snapshot.gid) }
+                != 0
+        {
+            return Err(format!(
+                "MUTATION_WRITE_FAILED: cannot preserve ownership {}",
+                write.path.display()
+            ));
+        }
         file.write_all(&write.after).map_err(|error| {
             format!(
                 "MUTATION_WRITE_FAILED: cannot write {}: {error}",
-                temporary.display()
-            )
-        })?;
-        file.sync_all().map_err(|error| {
-            format!(
-                "MUTATION_WRITE_FAILED: cannot sync {}: {error}",
                 temporary.display()
             )
         })?;
@@ -538,17 +1301,33 @@ fn write_atomic(write: &WriteFile) -> Result<(), String> {
                 },
             )?;
         }
+        file.sync_all().map_err(|error| {
+            format!(
+                "MUTATION_WRITE_FAILED: cannot sync {}: {error}",
+                temporary.display()
+            )
+        })?;
         verify_snapshot(write)?;
+        validate_path_components(&write.path, "MUTATION")?;
         fs::rename(&temporary, &write.path).map_err(|error| {
             format!(
                 "MUTATION_WRITE_FAILED: cannot replace {}: {error}",
                 write.path.display()
             )
         })?;
-        if let Some(parent) = write.path.parent()
-            && let Ok(directory) = File::open(parent)
-        {
-            let _ = directory.sync_all();
+        if let Some(parent) = write.path.parent() {
+            let directory = File::open(parent).map_err(|error| {
+                format!(
+                    "MUTATION_WRITE_FAILED: cannot open parent {}: {error}",
+                    parent.display()
+                )
+            })?;
+            directory.sync_all().map_err(|error| {
+                format!(
+                    "MUTATION_WRITE_FAILED: cannot sync parent {}: {error}",
+                    parent.display()
+                )
+            })?;
         }
         Ok(())
     })();

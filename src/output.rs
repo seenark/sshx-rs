@@ -1,5 +1,5 @@
 use crate::discovery::{Diagnostic, HostEntry};
-use crate::mutation::{CreatePlan, FileOperation};
+use crate::mutation::{CreatePlan, EditPlan, FileOperation, MutationKind};
 use serde::Serialize;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -138,6 +138,61 @@ pub fn render_create(
         let operation = match file.operation {
             FileOperation::Create => "create",
             FileOperation::Modify => "modify",
+            FileOperation::Delete => "delete",
+        };
+        rendered.push_str(&format!("{operation} {}\n{}", file.path, file.patch));
+    }
+    Ok(rendered)
+}
+pub fn render_edit(plan: &EditPlan, format: OutputFormat, applied: bool) -> Result<String, String> {
+    if format.is_machine() {
+        #[derive(Serialize)]
+        struct Document<'a> {
+            version: u8,
+            applied: bool,
+            operation: MutationKind,
+            id: &'a str,
+            files: &'a [crate::mutation::FileChange],
+        }
+        let mut rendered = match format {
+            OutputFormat::Json => serde_json::to_string_pretty(&Document {
+                version: 1,
+                applied,
+                operation: plan.operation,
+                id: &plan.id,
+                files: &plan.files,
+            })
+            .map_err(|error| format!("cannot render JSON output: {error}"))?,
+            OutputFormat::Yaml => serde_yaml::to_string(&Document {
+                version: 1,
+                applied,
+                operation: plan.operation,
+                id: &plan.id,
+                files: &plan.files,
+            })
+            .map_err(|error| format!("cannot render YAML output: {error}"))?,
+            OutputFormat::Human => unreachable!(),
+        };
+        if !rendered.ends_with('\n') {
+            rendered.push('\n');
+        }
+        return Ok(rendered);
+    }
+    let operation = match plan.operation {
+        MutationKind::Update => "update",
+        MutationKind::Rename => "rename",
+        MutationKind::Delete => "delete",
+    };
+    let mut rendered = format!(
+        "{} host entry {} ({operation})\n",
+        if applied { "Applied" } else { "Preview" },
+        plan.id
+    );
+    for file in &plan.files {
+        let operation = match file.operation {
+            FileOperation::Create => "create",
+            FileOperation::Modify => "modify",
+            FileOperation::Delete => "delete",
         };
         rendered.push_str(&format!("{operation} {}\n{}", file.path, file.patch));
     }

@@ -1099,3 +1099,331 @@ fn host_create_requires_consent_without_prompting() {
 
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn host_update_changes_selected_block_only_and_preserves_id_and_bytes() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    let original = concat!(
+        "# before\r\n",
+        "##SSHX ID=11111111-1111-4111-8111-111111111111\r\n",
+        "Host target\r\n",
+        "  HostName old.example # target comment\r\n",
+        "  User old\r\n",
+        "  Port 22\r\n",
+        "  ##PASSWORD old-secret\r\n",
+        "# between\r\n",
+        "Host unrelated\r\n",
+        "  HostName unrelated.example\r\n",
+        "# after\r\n",
+    )
+    .as_bytes();
+    fs::write(&config, original).unwrap();
+
+    let output = run_with_stdin(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "host",
+            "update",
+            "target",
+            "--hostname",
+            "new.example",
+            "--user",
+            "new-user",
+            "--port",
+            "2200",
+            "--password-stdin",
+            "--yes",
+            "--no-input",
+            "--format",
+            "json",
+        ],
+        b"new-secret\n",
+    );
+    assert!(output.status.success(), "{output:?}");
+    let rendered = String::from_utf8_lossy(&output.stdout);
+    assert!(!rendered.contains("old-secret"));
+    assert!(!rendered.contains("new-secret"));
+
+    let updated = fs::read(&config).unwrap();
+    assert!(updated.starts_with(b"# before\r\n"));
+    assert!(updated.ends_with(b"# after\r\n"));
+    assert!(updated.windows(2).any(|window| window == b"\r\n"));
+    assert!(String::from_utf8_lossy(&updated).contains("Host target\r\n"));
+    assert!(
+        String::from_utf8_lossy(&updated).contains("HostName new.example # target comment\r\n")
+    );
+    assert!(String::from_utf8_lossy(&updated).contains("User new-user\r\n"));
+    assert!(String::from_utf8_lossy(&updated).contains("Port 2200\r\n"));
+    assert!(String::from_utf8_lossy(&updated).contains("##PASSWORD new-secret\r\n"));
+    assert!(String::from_utf8_lossy(&updated).contains("Host unrelated\r\n"));
+    assert!(String::from_utf8_lossy(&updated).contains("  HostName unrelated.example\r\n"));
+    assert_eq!(updated[..20], original[..20]);
+
+    let list = run(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "host",
+            "list",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(list.status.success(), "{list:?}");
+    let document: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    let target = document["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| {
+            entry["aliases"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|alias| alias == "target")
+        })
+        .unwrap();
+    assert_eq!(
+        target["id"].as_str().unwrap(),
+        "11111111-1111-4111-8111-111111111111"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn host_rename_preserves_id_and_delete_removes_one_block() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(
+        &config,
+        concat!(
+            "##SSHX ID=22222222-2222-4222-8222-222222222222\n",
+            "Host old\n",
+            "  HostName old.example\n",
+            "Host same\n",
+            "  HostName same.example\n",
+        ),
+    );
+
+    let rename = run(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "host",
+            "rename",
+            "old",
+            "--alias",
+            "renamed",
+            "--yes",
+            "--no-input",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(rename.status.success(), "{rename:?}");
+    let renamed = String::from_utf8_lossy(&fs::read(&config).unwrap()).into_owned();
+    assert!(renamed.contains("Host renamed\n"));
+    assert!(renamed.contains("Host same\n"));
+    assert!(!renamed.contains("Host old\n"));
+
+    let list = run(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "host",
+            "list",
+            "--format",
+            "json",
+        ],
+    );
+    let document: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    let entry = document["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| {
+            entry["aliases"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|alias| alias == "renamed")
+        })
+        .unwrap();
+    assert_eq!(
+        entry["id"].as_str().unwrap(),
+        "22222222-2222-4222-8222-222222222222"
+    );
+
+    let delete = run(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "host",
+            "delete",
+            "renamed",
+            "--yes",
+            "--no-input",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(delete.status.success(), "{delete:?}");
+    let remaining = String::from_utf8_lossy(&fs::read(&config).unwrap()).into_owned();
+    assert!(!remaining.contains("Host renamed\n"));
+    assert!(!remaining.contains("22222222-2222-4222-8222-222222222222"));
+    assert!(remaining.contains("Host same\n"));
+    assert!(remaining.contains("  HostName same.example\n"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn host_mutation_rejects_stale_source_selection_and_pair_reference() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(
+        &config,
+        concat!(
+            "Host first\n",
+            "  HostName first.example\n",
+            "##SSHX ID=33333333-3333-4333-8333-333333333333\n",
+            "Host target\n",
+            "  HostName target.example\n",
+        ),
+    );
+    let stale = run(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "host",
+            "rename",
+            "target",
+            "--source",
+            config.to_str().unwrap(),
+            "--line",
+            "1",
+            "--alias",
+            "new-target",
+            "--yes",
+            "--no-input",
+        ],
+    );
+    assert_eq!(stale.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&stale.stderr).contains("HOST_MISMATCH"));
+
+    write(
+        &home.join(".config/sshx/pairs.json"),
+        "{\"gateway_id\":\"33333333-3333-4333-8333-333333333333\"}\n",
+    );
+    let blocked = run(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "host",
+            "delete",
+            "target",
+            "--yes",
+            "--no-input",
+        ],
+    );
+    assert_eq!(blocked.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&blocked.stderr).contains("DELETE_REFERENCED"));
+    assert!(fs::read_to_string(&config).unwrap().contains("Host target"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn host_mutation_rejects_symlinked_config_root() {
+    let (root, home) = fixture_root();
+    let real = home.join(".ssh/real-config");
+    let link = home.join(".ssh/config");
+    write(&real, "Host target\n  HostName target.example\n");
+    symlink(&real, &link).expect("fixture symlink should be created");
+
+    let output = run(
+        &home,
+        &[
+            "--config",
+            link.to_str().unwrap(),
+            "host",
+            "rename",
+            "target",
+            "--alias",
+            "renamed",
+            "--yes",
+            "--no-input",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("CONFIG_ROOT_SYMLINK"));
+    assert_eq!(
+        fs::read_to_string(real).unwrap(),
+        "Host target\n  HostName target.example\n"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn host_mutation_outputs_redact_secret_for_human_json_and_yaml() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(
+        &config,
+        concat!(
+            "##SSHX ID=44444444-4444-4444-8444-444444444444\n",
+            "Host secret-host\n",
+            "  HostName secret.example\n",
+            "  ##PASSWORD old-secret\n",
+        ),
+    );
+    for format in ["human", "json", "yaml"] {
+        let output = run_with_stdin(
+            &home,
+            &[
+                "--config",
+                config.to_str().unwrap(),
+                "host",
+                "update",
+                "secret-host",
+                "--hostname",
+                "new.example",
+                "--password-stdin",
+                "--preview",
+                "--no-input",
+                "--format",
+                format,
+            ],
+            b"new-secret\n",
+        );
+        assert!(output.status.success(), "{format}: {output:?}");
+        let rendered = String::from_utf8_lossy(&output.stdout);
+        assert!(!rendered.contains("old-secret"));
+        assert!(!rendered.contains("new-secret"));
+        assert!(!rendered.contains("Host secret-host"));
+        if format == "json" {
+            serde_json::from_slice::<serde_json::Value>(&output.stdout)
+                .expect("JSON mutation output should parse");
+        } else if format == "yaml" {
+            serde_yaml::from_slice::<serde_yaml::Value>(&output.stdout)
+                .expect("YAML mutation output should parse");
+        }
+    }
+    assert_eq!(
+        fs::read_to_string(&config).unwrap(),
+        concat!(
+            "##SSHX ID=44444444-4444-4444-8444-444444444444\n",
+            "Host secret-host\n",
+            "  HostName secret.example\n",
+            "  ##PASSWORD old-secret\n",
+        )
+    );
+    fs::remove_dir_all(root).unwrap();
+}

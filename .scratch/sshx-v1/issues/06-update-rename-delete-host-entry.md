@@ -4,7 +4,7 @@
 
 **Blocked by:** 05: Create a HostEntry without restructuring config.
 
-**Status:** ready-for-agent
+**Status:** claimed
 
 - [ ] Updates patch only the selected block and preserve comments, ordering, whitespace, CRLF/LF style, trailing newline, and unrelated HostEntries byte-for-byte.
 - [ ] Rename changes the requested alias while preserving the entry ID.
