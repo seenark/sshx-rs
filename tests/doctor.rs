@@ -1,0 +1,369 @@
+use std::fs;
+use std::net::TcpListener;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+static COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+fn fixture() -> (PathBuf, PathBuf) {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock should be after unix epoch")
+        .as_nanos();
+    let ordinal = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("sshx-ticket-13-{timestamp}-{ordinal}"));
+    let home = root.join("home");
+    fs::create_dir_all(home.join(".ssh")).expect("fixture home should be created");
+    (root, home)
+}
+
+fn write(path: &Path, contents: &str) {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("fixture parent should be created");
+    }
+    fs::write(path, contents).expect("fixture should be written");
+}
+
+fn run(home: &Path, args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_sshx"))
+        .env("HOME", home)
+        .args(args)
+        .output()
+        .expect("sshx binary should run")
+}
+
+#[test]
+fn doctor_reports_config_stages_without_secret_or_repair() {
+    let (root, home) = fixture();
+    let config = home.join(".ssh/config");
+    write(
+        &home.join(".ssh/conf.d/pw.conf"),
+        "Host included\n  HostName included.example\n",
+    );
+    let occupied = TcpListener::bind("127.0.0.1:0").expect("fixture listener should bind");
+    let occupied_port = occupied.local_addr().expect("listener address").port();
+    write(
+        &config,
+        &format!(
+            concat!(
+                "Include conf.d/[pw]*.conf\n",
+                "Include missing.conf\n",
+                "Match exec true\n",
+                "##SSHX ID=duplicate-id\n",
+                "Host gateway\n",
+                "  HostName gateway.example\n",
+                "  LocalForward 2200 vm.internal:22\n",
+                "  ##PASSWORD secret-value\n",
+                "##SSHX ID=duplicate-id\n",
+                "Host vm\n",
+                "  HostName vm.internal\n",
+                "  Port 22\n",
+                "  ##SSHX GATEWAY=missing-gateway\n",
+                "  ##SSHX TRANSIT=vm.internal:22\n",
+                "  ##PORT {occupied_port}\n",
+            ),
+            occupied_port = occupied_port
+        ),
+    );
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o644))
+        .expect("fixture permissions should be set");
+    let before = fs::read(&config).expect("config should be readable");
+
+    let json = run(
+        &home,
+        &[
+            "--config",
+            config.to_str().expect("UTF-8 fixture path"),
+            "doctor",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(json.status.success(), "{json:?}");
+    let json_value: serde_json::Value = serde_json::from_slice(&json.stdout).expect("JSON output");
+    let findings = json_value["findings"].as_array().expect("findings array");
+    for code in [
+        "include_missing",
+        "unsupported_semantics",
+        "duplicate_id",
+        "broken_reference",
+        "password_file_permissions",
+        "local_port_conflict",
+    ] {
+        assert!(
+            findings.iter().any(|finding| finding["code"] == code),
+            "missing finding {code}: {json_value}"
+        );
+    }
+    assert_eq!(json_value["validation"]["remote_servers"], "not_run");
+    assert_eq!(json_value["known_hosts"][0]["scope"], "personal");
+    assert!(String::from_utf8_lossy(&json.stdout).contains("stage"));
+    assert!(!String::from_utf8_lossy(&json.stdout).contains("secret-value"));
+    assert_eq!(
+        fs::read(&config).expect("config should remain readable"),
+        before
+    );
+
+    let yaml = run(
+        &home,
+        &[
+            "--config",
+            config.to_str().expect("UTF-8 fixture path"),
+            "doctor",
+            "--format",
+            "yaml",
+        ],
+    );
+    assert!(yaml.status.success(), "{yaml:?}");
+    let yaml_value: serde_yaml::Value = serde_yaml::from_slice(&yaml.stdout).expect("YAML output");
+    let yaml_findings = yaml_value["findings"].as_sequence().expect("YAML findings");
+    for code in [
+        "include_missing",
+        "unsupported_semantics",
+        "duplicate_id",
+        "broken_reference",
+        "password_file_permissions",
+        "local_port_conflict",
+    ] {
+        assert!(
+            yaml_findings.iter().any(|finding| finding["code"] == code),
+            "missing YAML finding {code}: {yaml_value:?}"
+        );
+    }
+    assert_eq!(yaml_value["validation"]["remote_servers"], "not_run");
+    assert!(!String::from_utf8_lossy(&yaml.stdout).contains("secret-value"));
+
+    let human = run(
+        &home,
+        &[
+            "--config",
+            config.to_str().expect("UTF-8 fixture path"),
+            "doctor",
+        ],
+    );
+    assert!(human.status.success(), "{human:?}");
+    let human_text = String::from_utf8_lossy(&human.stdout);
+    assert!(human_text.contains("Next:"));
+    assert!(human_text.contains("remote server validation: not run"));
+    assert!(!human_text.contains("secret-value"));
+
+    fs::remove_dir_all(root).expect("fixture should be removed");
+}
+
+#[test]
+fn doctor_checks_sshpass_only_when_password_auth_is_needed() {
+    let (root, home) = fixture();
+    let bin = root.join("bin");
+    fs::create_dir_all(&bin).expect("fake bin should be created");
+    let ssh = bin.join("ssh");
+    write(&ssh, "#!/bin/sh\nexit 0\n");
+    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755))
+        .expect("fake ssh should be executable");
+    let config = home.join(".ssh/config");
+    write(&config, "Host key-only\n  HostName key.example\n");
+
+    let key_only = Command::new(env!("CARGO_BIN_EXE_sshx"))
+        .env("HOME", &home)
+        .env("PATH", &bin)
+        .args([
+            "--config",
+            config.to_str().expect("UTF-8 fixture path"),
+            "doctor",
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("sshx binary should run");
+    assert!(key_only.status.success(), "{key_only:?}");
+    let key_value: serde_json::Value =
+        serde_json::from_slice(&key_only.stdout).expect("JSON output");
+    assert!(
+        !key_value["findings"]
+            .as_array()
+            .expect("findings array")
+            .iter()
+            .any(|finding| finding["code"] == "sshpass_missing")
+    );
+
+    write(
+        &config,
+        "Host password\n  HostName password.example\n  PreferredAuthentications publickey,password # comment\n",
+    );
+    let password = Command::new(env!("CARGO_BIN_EXE_sshx"))
+        .env("HOME", &home)
+        .env("PATH", &bin)
+        .args([
+            "--config",
+            config.to_str().expect("UTF-8 fixture path"),
+            "doctor",
+            "--format",
+            "json",
+        ])
+        .output()
+        .expect("sshx binary should run");
+    assert!(password.status.success(), "{password:?}");
+    let password_value: serde_json::Value =
+        serde_json::from_slice(&password.stdout).expect("JSON output");
+    assert!(
+        password_value["findings"]
+            .as_array()
+            .expect("findings array")
+            .iter()
+            .any(|finding| finding["code"] == "sshpass_missing")
+    );
+
+    fs::remove_dir_all(root).expect("fixture should be removed");
+}
+
+#[test]
+fn doctor_reports_stale_runtime_without_repairing_registry() {
+    let (root, home) = fixture();
+    let config = home.join(".ssh/config");
+    write(&config, "Host current\n  HostName current.example\n");
+    let tunnel_root = home.join(".config/sshx/tunnels");
+    fs::create_dir_all(&tunnel_root).expect("tunnel state should be created");
+    fs::set_permissions(&tunnel_root, fs::Permissions::from_mode(0o700))
+        .expect("tunnel state should be private");
+    let control_dir = tunnel_root.join("stale");
+    let control_socket = control_dir.join("master.sock");
+    let runtime_config = control_dir.join("config");
+    let registry = serde_json::json!({
+        "version": 1,
+        "tunnels": [{
+            "id": "tunnel-stale",
+            "state": "active",
+            "kind": "direct",
+            "entry_id": "missing-entry",
+            "aliases": ["stale"],
+            "selected_alias": "stale",
+            "source_path": config,
+            "source_byte_start": 0,
+            "source_byte_end": 10,
+            "source_line_start": 1,
+            "source_line_end": 1,
+            "block_fingerprint": "",
+            "request_signature": "",
+            "control_dir": control_dir,
+            "control_socket": control_socket,
+            "runtime_config": runtime_config,
+            "forwards": [],
+            "pair": null,
+            "error": null
+        }]
+    });
+    let registry_path = tunnel_root.join("registry.json");
+    write(
+        &registry_path,
+        &serde_json::to_string_pretty(&registry).expect("registry should serialize"),
+    );
+    fs::set_permissions(&registry_path, fs::Permissions::from_mode(0o600))
+        .expect("registry should be private");
+    let before = fs::read(&registry_path).expect("registry should be readable");
+
+    let output = run(
+        &home,
+        &[
+            "--config",
+            config.to_str().expect("UTF-8 fixture path"),
+            "doctor",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(output.status.success(), "{output:?}");
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON output");
+    assert_eq!(value["runtime"][0]["selection"], "stale");
+    for code in [
+        "stale_selection",
+        "managed_master_state",
+        "listener_state",
+        "application_health_unproven",
+        "stale_runtime_socket",
+    ] {
+        assert!(
+            value["findings"]
+                .as_array()
+                .expect("findings array")
+                .iter()
+                .any(|finding| finding["code"] == code),
+            "missing runtime finding {code}: {value:?}"
+        );
+    }
+    assert_eq!(
+        before,
+        fs::read(&registry_path).expect("registry should remain readable")
+    );
+    fs::remove_dir_all(root).expect("fixture should be removed");
+}
+
+#[test]
+fn doctor_accepts_private_ready_state_locations() {
+    let (root, home) = fixture();
+    let config = home.join(".ssh/config");
+    write(&config, "Host ready\n  HostName ready.example\n");
+    let app_dir = home.join(".config/sshx");
+    let tunnel_dir = app_dir.join("tunnels");
+    fs::create_dir_all(&tunnel_dir).expect("app state should be created");
+    for path in [&app_dir, &tunnel_dir] {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .expect("app directory should be private");
+    }
+    let settings = app_dir.join("config.json");
+    write(&settings, "{}");
+    let registry = tunnel_dir.join("registry.json");
+    write(&registry, r#"{"version":1,"tunnels":[]}"#);
+    for path in [&settings, &registry] {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .expect("app file should be private");
+    }
+    let personal_known_hosts = home.join(".ssh/known_hosts");
+    let work_known_hosts = app_dir.join("known_hosts/work");
+    write(&personal_known_hosts, "");
+    write(&work_known_hosts, "");
+    for path in [&personal_known_hosts, &work_known_hosts] {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .expect("known-host file should be private");
+    }
+
+    let output = run(
+        &home,
+        &[
+            "--config",
+            config.to_str().expect("UTF-8 fixture path"),
+            "doctor",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(output.status.success(), "{output:?}");
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON output");
+    assert!(
+        value["state"]
+            .as_array()
+            .expect("state array")
+            .iter()
+            .all(|state| state["status"] == "ready"),
+        "state locations not ready: {value:?}"
+    );
+    assert!(
+        value["known_hosts"]
+            .as_array()
+            .expect("known-host array")
+            .iter()
+            .all(|state| state["status"] == "ready")
+    );
+    assert!(
+        !value["findings"]
+            .as_array()
+            .expect("findings array")
+            .iter()
+            .any(|finding| {
+                finding["code"] == "app_state_insecure" || finding["code"] == "known_hosts_insecure"
+            }),
+        "private state should not be insecure: {value:?}"
+    );
+    fs::remove_dir_all(root).expect("fixture should be removed");
+}

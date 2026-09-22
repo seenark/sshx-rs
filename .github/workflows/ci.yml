@@ -4,16 +4,31 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   verify:
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: jdx/mise-action@v2
+      - name: Install Linux prerequisites
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y openssh-client sshpass
+      - name: Install macOS prerequisites
+        if: runner.os == 'macOS'
+        run: |
+          brew install sshpass
+          command -v ssh
+          command -v sshpass
       - run: mise exec -- cargo fmt --all -- --check
       - run: mise exec -- cargo clippy --all-targets --all-features -- -D warnings
       - run: mise exec -- cargo test --all-targets --all-features
-      - run: mise exec -- cargo build --release
+      - run: mise exec -- ./scripts/test-release-package.sh
