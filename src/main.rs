@@ -50,7 +50,7 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
     for diagnostic in &catalog.diagnostics {
         eprintln!("{}", render_diagnostic(diagnostic));
     }
-    let filtered = filter_entries(&catalog.entries, &cli, &roots);
+    let filtered = filter_entries(&catalog.entries, &cli);
 
     match &cli.command {
         Command::List => render_entries(&filtered, &catalog.diagnostics, cli.format),
@@ -217,11 +217,7 @@ fn registered_roots(cli: &Cli) -> Result<Vec<RegisteredRoot>, String> {
     }])
 }
 
-fn filter_entries<'a>(
-    entries: &'a [HostEntry],
-    cli: &Cli,
-    roots: &[RegisteredRoot],
-) -> Vec<&'a HostEntry> {
+fn filter_entries<'a>(entries: &'a [HostEntry], cli: &Cli) -> Vec<&'a HostEntry> {
     let source = cli.source.as_ref().map(|path| {
         settings::normalize_path(path, &home_dir().unwrap_or_else(|_| PathBuf::from(".")))
             .to_string_lossy()
@@ -230,27 +226,20 @@ fn filter_entries<'a>(
     entries
         .iter()
         .filter(|entry| {
-            (cli.scopes.is_empty()
-                || cli
-                    .scopes
-                    .iter()
-                    .any(|scope| entry.scopes.iter().any(|value| value == scope)))
-                && (cli.projects.is_empty()
-                    || cli
-                        .projects
-                        .iter()
-                        .any(|project| entry.projects.iter().any(|value| value == project)))
+            let provenance_matches = entry.provenance.iter().any(|provenance| {
+                (cli.scopes.is_empty() || cli.scopes.iter().any(|scope| scope == &provenance.scope))
+                    && (cli.projects.is_empty()
+                        || cli
+                            .projects
+                            .iter()
+                            .any(|project| provenance.project.as_deref() == Some(project.as_str())))
+            });
+            provenance_matches
                 && source
                     .as_deref()
                     .is_none_or(|path| entry.source.path == path)
                 && cli.line.is_none_or(|line| entry.source.line_start == line)
                 && cli.id.as_deref().is_none_or(|id| entry.id == id)
-                && roots.iter().any(|root| {
-                    entry
-                        .provenance
-                        .iter()
-                        .any(|provenance| provenance.scope == root.scope)
-                })
         })
         .collect()
 }
