@@ -3,7 +3,7 @@ use sshx::discovery::{HostEntry, discover_roots, scope_for_path};
 use sshx::mutation::{self, CreateRequest, MutationKind, UpdateRequest};
 use sshx::output::{
     OutputFormat, render_create, render_diagnostic, render_edit, render_human, render_machine,
-    render_pair, render_pairs,
+    render_pair, render_pairs, render_tunnels,
 };
 use sshx::settings::{self, RegisteredRoot};
 use std::env;
@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::process;
 const USAGE: &str = "Usage: sshx [--version]";
 const HOST_USAGE: &str = "Usage: sshx [--config PATH] host list [--format human|json|yaml]\n       sshx [--config PATH] host show SELECTOR [--format human|json|yaml]\n       sshx [--config PATH] host create --scope SCOPE --file PATH --alias ALIAS --hostname HOSTNAME [options]\n       sshx [--config PATH] host update SELECTOR [options]\n       sshx [--config PATH] host rename SELECTOR --alias ALIAS [options]\n       sshx [--config PATH] host delete SELECTOR [options]";
-const SETUP_USAGE: &str = "Usage: sshx setup [--personal PATH] [--work PATH] [--project NAME]\n       sshx connect [SELECTOR] [--id ID] [--source PATH --line NUMBER] [--password-fd FD] [--gateway-password-fd FD --vm-password-fd FD] [--bind] [--forward REMOTE[=LOCAL]] [--no-input]\n       sshx pair setup [GATEWAY] [VM] [--gateway ID] [--vm ID] [--transit-host HOST --transit-port PORT]";
+const SETUP_USAGE: &str = "Usage: sshx setup [--personal PATH] [--work PATH] [--project NAME]\n       sshx connect [SELECTOR] [--id ID] [--source PATH --line NUMBER] [--password-fd FD] [--gateway-password-fd FD --vm-password-fd FD] [--bind] [--forward REMOTE[=LOCAL]] [--no-input]\n       sshx tunnel direct start [SELECTOR] [-L SPEC] [-R SPEC] [-D SPEC] [--allow-bind]\n       sshx tunnel direct list|status ID|stop ID|restart ID\n       sshx pair setup [GATEWAY] [VM] [--gateway ID] [--vm ID] [--transit-host HOST --transit-port PORT]";
 
 fn main() {
     match run(env::args_os().skip(1).collect()) {
@@ -45,6 +45,25 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
     validate_connect_without_catalog(&cli)?;
     if matches!(cli.command, Command::Setup) {
         return run_setup(&cli);
+    }
+    let home = home_dir()?;
+    match &cli.command {
+        Command::TunnelList => {
+            let response = sshx::tunnel::list(&home)?;
+            print!("{}", render_tunnels(&response, cli.format)?);
+            return Ok(());
+        }
+        Command::TunnelStatus(id) => {
+            let response = sshx::tunnel::status(&home, id)?;
+            print!("{}", render_tunnels(&response, cli.format)?);
+            return Ok(());
+        }
+        Command::TunnelStop(id) => {
+            let response = sshx::tunnel::stop(&home, id)?;
+            print!("{}", render_tunnels(&response, cli.format)?);
+            return Ok(());
+        }
+        _ => {}
     }
     let roots = registered_roots(&cli)?;
     if matches!(&cli.command, Command::CreateHost) {
@@ -133,6 +152,41 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
                 }
             }
         }
+        Command::TunnelStart(selector) => {
+            if !cli.forwards.is_empty() || cli.bind {
+                return Err(
+                    "TUNNEL_FORWARD_MODE: standalone tunnels require explicit -L, -R, or -D"
+                        .to_string(),
+                );
+            }
+            let entry = select_connect_entry(&filtered, selector.as_deref(), &cli)?;
+            if sshx::pair::paired_route(&catalog.entries, entry)?.is_some() {
+                return Err(
+                    "TUNNEL_DIRECT_PAIR: paired entries require a paired standalone tunnel"
+                        .to_string(),
+                );
+            }
+            let alias = selected_connect_alias(entry, selector.as_deref(), &cli);
+            let response = sshx::tunnel::start(
+                entry,
+                &home,
+                alias,
+                cli.no_input,
+                cli.password_fd,
+                &cli.local_forwards,
+                &cli.remote_forwards,
+                &cli.dynamic_forwards,
+                cli.allow_bind,
+            )?;
+            print!("{}", render_tunnels(&response, cli.format)?);
+            Ok(())
+        }
+        Command::TunnelRestart(id) => {
+            let response =
+                sshx::tunnel::restart(&catalog.entries, &home, id, cli.no_input, cli.password_fd)?;
+            print!("{}", render_tunnels(&response, cli.format)?);
+            Ok(())
+        }
         Command::Setup
         | Command::CreateHost
         | Command::UpdateHost(_)
@@ -140,7 +194,10 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
         | Command::DeleteHost(_)
         | Command::PairSetup { .. }
         | Command::PairList
-        | Command::PairValidate => unreachable!(),
+        | Command::PairValidate
+        | Command::TunnelList
+        | Command::TunnelStatus(_)
+        | Command::TunnelStop(_) => unreachable!(),
     }
 }
 
@@ -1153,6 +1210,11 @@ enum Command {
     PairList,
     PairValidate,
     Setup,
+    TunnelStart(Option<String>),
+    TunnelList,
+    TunnelStatus(String),
+    TunnelStop(String),
+    TunnelRestart(String),
 }
 
 #[derive(Debug)]
@@ -1185,6 +1247,10 @@ struct Cli {
     clear_password: bool,
     folder: Option<PathBuf>,
     file: Option<PathBuf>,
+    local_forwards: Vec<String>,
+    remote_forwards: Vec<String>,
+    dynamic_forwards: Vec<String>,
+    allow_bind: bool,
     yes: bool,
     preview: bool,
     no_input: bool,
@@ -1222,6 +1288,10 @@ impl Cli {
         let mut folder = None;
         let mut file = None;
         let mut yes = false;
+        let mut local_forwards = Vec::new();
+        let mut remote_forwards = Vec::new();
+        let mut dynamic_forwards = Vec::new();
+        let mut allow_bind = false;
         let mut preview = false;
         let host = None;
         let mut no_input = false;
@@ -1368,6 +1438,32 @@ impl Cli {
                 id = Some(next(text)?);
             } else if text == "--no-input" || text == "--non-interactive" {
                 no_input = true;
+            } else if text == "-L" || text == "--local-forward" {
+                local_forwards.push(next(text)?);
+            } else if let Some(value) = text.strip_prefix("-L=") {
+                local_forwards.push(value.to_string());
+            } else if let Some(value) = text.strip_prefix("-L")
+                && !value.is_empty()
+            {
+                local_forwards.push(value.to_string());
+            } else if text == "-R" || text == "--remote-forward" {
+                remote_forwards.push(next(text)?);
+            } else if let Some(value) = text.strip_prefix("-R=") {
+                remote_forwards.push(value.to_string());
+            } else if let Some(value) = text.strip_prefix("-R")
+                && !value.is_empty()
+            {
+                remote_forwards.push(value.to_string());
+            } else if text == "-D" || text == "--dynamic-forward" {
+                dynamic_forwards.push(next(text)?);
+            } else if let Some(value) = text.strip_prefix("-D=") {
+                dynamic_forwards.push(value.to_string());
+            } else if let Some(value) = text.strip_prefix("-D")
+                && !value.is_empty()
+            {
+                dynamic_forwards.push(value.to_string());
+            } else if text == "--allow-bind" || text == "--allow-non-loopback" {
+                allow_bind = true;
             } else if text == "--bind" {
                 bind = true;
             } else if text.starts_with("--bind=") {
@@ -1446,6 +1542,50 @@ impl Cli {
                 Command::DeleteHost(Some(selector.clone()))
             }
             [host, delete] if host == "host" && delete == "delete" => Command::DeleteHost(None),
+            [tunnel, direct, start]
+                if tunnel == "tunnel" && direct == "direct" && start == "start" =>
+            {
+                Command::TunnelStart(None)
+            }
+            [tunnel, direct, start, selector]
+                if tunnel == "tunnel" && direct == "direct" && start == "start" =>
+            {
+                Command::TunnelStart(Some(selector.clone()))
+            }
+            [tunnel, start] if tunnel == "tunnel" && start == "start" => Command::TunnelStart(None),
+            [tunnel, start, selector] if tunnel == "tunnel" && start == "start" => {
+                Command::TunnelStart(Some(selector.clone()))
+            }
+            [tunnel, direct, list]
+                if tunnel == "tunnel" && direct == "direct" && list == "list" =>
+            {
+                Command::TunnelList
+            }
+            [tunnel, list] if tunnel == "tunnel" && list == "list" => Command::TunnelList,
+            [tunnel, direct, status, id]
+                if tunnel == "tunnel" && direct == "direct" && status == "status" =>
+            {
+                Command::TunnelStatus(id.clone())
+            }
+            [tunnel, status, id] if tunnel == "tunnel" && status == "status" => {
+                Command::TunnelStatus(id.clone())
+            }
+            [tunnel, direct, stop, id]
+                if tunnel == "tunnel" && direct == "direct" && stop == "stop" =>
+            {
+                Command::TunnelStop(id.clone())
+            }
+            [tunnel, stop, id] if tunnel == "tunnel" && stop == "stop" => {
+                Command::TunnelStop(id.clone())
+            }
+            [tunnel, direct, restart, id]
+                if tunnel == "tunnel" && direct == "direct" && restart == "restart" =>
+            {
+                Command::TunnelRestart(id.clone())
+            }
+            [tunnel, restart, id] if tunnel == "tunnel" && restart == "restart" => {
+                Command::TunnelRestart(id.clone())
+            }
             [pair, setup, gateway, vm]
                 if pair == "pair" && matches!(setup.as_str(), "setup" | "create") =>
             {
@@ -1538,6 +1678,11 @@ impl Cli {
                 Command::PairSetup { gateway, vm }
             }
             Command::PairList | Command::PairValidate => command,
+            Command::TunnelStart(selector) => Command::TunnelStart(selector),
+            Command::TunnelList
+            | Command::TunnelStatus(_)
+            | Command::TunnelStop(_)
+            | Command::TunnelRestart(_) => command,
             command => {
                 if host.is_some() {
                     return Err("--host is only valid with connect".to_string());
@@ -1568,6 +1713,10 @@ impl Cli {
             clear_password,
             folder,
             file,
+            local_forwards,
+            remote_forwards,
+            dynamic_forwards,
+            allow_bind: allow_bind || bind,
             yes,
             preview,
             no_input,

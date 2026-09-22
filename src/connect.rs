@@ -128,6 +128,28 @@ struct Runtime {
     entry: HostEntry,
     configured_password: Option<String>,
     forwards: Vec<ServiceForward>,
+    preserve_dir: bool,
+}
+pub(crate) struct StandaloneRuntime {
+    runtime: Runtime,
+}
+
+impl StandaloneRuntime {
+    pub(crate) fn control_dir(&self) -> &Path {
+        &self.runtime.dir
+    }
+
+    pub(crate) fn control_socket(&self) -> &Path {
+        &self.runtime.socket
+    }
+
+    pub(crate) fn runtime_config(&self) -> &Path {
+        &self.runtime.config
+    }
+
+    pub(crate) fn alias(&self) -> &str {
+        &self.runtime.alias
+    }
 }
 
 struct OwnedMaster {
@@ -190,11 +212,23 @@ impl Runtime {
         content: String,
         forwards: &[ServiceForward],
     ) -> Result<Self, String> {
+        let dir = temporary_directory()?;
+        Self::create_with_directory(entry, home, selected_alias, content, forwards, dir, false)
+    }
+
+    fn create_with_directory(
+        entry: &HostEntry,
+        home: &Path,
+        selected_alias: &str,
+        content: String,
+        forwards: &[ServiceForward],
+        dir: PathBuf,
+        preserve_dir: bool,
+    ) -> Result<Self, String> {
         if !entry.aliases.iter().any(|alias| alias == selected_alias) {
             return Err("CONFIG_CHANGED: selected alias no longer exists".to_string());
         }
         let configured_password = selected_password(entry)?;
-        let dir = temporary_directory()?;
         let config = dir.join("config");
         let socket = dir.join("master.sock");
         let known_hosts = known_hosts_path(home, entry);
@@ -209,13 +243,35 @@ impl Runtime {
             entry: entry.clone(),
             configured_password,
             forwards: forwards.to_vec(),
+            preserve_dir,
         })
     }
 }
 
+pub(crate) fn prepare_standalone_runtime(
+    entry: &HostEntry,
+    home: &Path,
+    selected_alias: &str,
+    control_dir: PathBuf,
+) -> Result<StandaloneRuntime, String> {
+    let content = compile_standalone_config(entry, selected_alias)?;
+    Ok(StandaloneRuntime {
+        runtime: Runtime::create_with_directory(
+            entry,
+            home,
+            selected_alias,
+            content,
+            &[],
+            control_dir,
+            true,
+        )?,
+    })
+}
 impl Drop for Runtime {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.dir);
+        if !self.preserve_dir {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
     }
 }
 
@@ -561,6 +617,221 @@ fn spawn_master(
         return Err(error);
     }
     Ok(child)
+}
+
+pub(crate) fn launch_standalone(
+    runtime: &StandaloneRuntime,
+    no_input: bool,
+    password_fd: Option<i32>,
+    forwards: &[(char, String)],
+    local_listeners: &[(String, u16)],
+) -> Result<(), String> {
+    SIGNAL.store(0, Ordering::Relaxed);
+    install_signal_handlers();
+    let result =
+        launch_standalone_session(runtime, no_input, password_fd, forwards, local_listeners);
+    reset_signal_handlers();
+    result
+}
+
+fn launch_standalone_session(
+    runtime: &StandaloneRuntime,
+    no_input: bool,
+    password_fd: Option<i32>,
+    forwards: &[(char, String)],
+    local_listeners: &[(String, u16)],
+) -> Result<(), String> {
+    let mut attempt = match password_fd {
+        Some(fd) => Some(read_password_fd(fd)?),
+        None => runtime
+            .runtime
+            .configured_password
+            .clone()
+            .map(PasswordAttempt::configured),
+    };
+    let mut enrolled = false;
+    loop {
+        match launch_standalone_once(
+            runtime,
+            no_input,
+            attempt.as_ref(),
+            forwards,
+            local_listeners,
+        ) {
+            Ok(()) => break,
+            Err(error) => {
+                stop_standalone(runtime);
+                if !enrolled && !no_input && error.starts_with("HOST_KEY_TRUST_REQUIRED") {
+                    enroll_host_key(&runtime.runtime)?;
+                    enrolled = true;
+                    continue;
+                }
+                let can_prompt = !no_input
+                    && io::stdin().is_terminal()
+                    && error.starts_with("SSH_AUTH_FAILED")
+                    && attempt
+                        .as_ref()
+                        .is_none_or(|value| value.source != PasswordSource::Prompted);
+                if can_prompt
+                    && let Some(next) = prompt_password(&runtime.runtime.alias, attempt.is_some())?
+                {
+                    attempt = Some(next);
+                    continue;
+                }
+                return Err(error);
+            }
+        }
+    }
+    if let Some(attempt) = attempt.as_ref()
+        && attempt.source == PasswordSource::Prompted
+    {
+        save_replacement(&runtime.runtime, attempt, no_input)?;
+    }
+    Ok(())
+}
+
+fn launch_standalone_once(
+    runtime: &StandaloneRuntime,
+    no_input: bool,
+    attempt: Option<&PasswordAttempt>,
+    forwards: &[(char, String)],
+    local_listeners: &[(String, u16)],
+) -> Result<(), String> {
+    let (mut command, password_pipe) = auth_command(&runtime.runtime, no_input, true, attempt)?;
+    command.args([
+        "-M",
+        "-N",
+        "-f",
+        "-o",
+        "ControlMaster=yes",
+        "-o",
+        "ExitOnForwardFailure=yes",
+    ]);
+    for (kind, specification) in forwards {
+        command.arg(format!("-{kind}"));
+        command.arg(specification);
+    }
+    command.arg(&runtime.runtime.alias);
+    command
+        .stdin(if no_input {
+            Stdio::null()
+        } else {
+            Stdio::inherit()
+        })
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("SSH_AUTH_FAILED: cannot start OpenSSH: {error}"))?;
+    if let Some(password_pipe) = password_pipe
+        && let Err(error) = password_pipe.send()
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("SSH_AUTH_FAILED: cannot inspect OpenSSH: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(classify_master_failure(
+            output.status,
+            &stderr,
+            no_input,
+            ForwardStage::Service,
+        ));
+    }
+    wait_for_standalone_ready(runtime, local_listeners)
+}
+
+fn wait_for_standalone_ready(
+    runtime: &StandaloneRuntime,
+    local_listeners: &[(String, u16)],
+) -> Result<(), String> {
+    let started = SystemTime::now();
+    loop {
+        if let Some(signal) = received_signal() {
+            return Err(format!("SESSION_INTERRUPTED: signal {signal}"));
+        }
+        if standalone_master_ready(runtime) {
+            if local_listeners_ready(local_listeners) {
+                return Ok(());
+            }
+            if started
+                .elapsed()
+                .unwrap_or_default()
+                .ge(&FORWARD_READY_TIMEOUT)
+            {
+                return Err(
+                    "SERVICE_BIND_FAILED: timed out waiting for requested tunnel listener"
+                        .to_string(),
+                );
+            }
+        }
+        if started.elapsed().unwrap_or_default().ge(&MASTER_TIMEOUT) {
+            return Err("SSH_AUTH_TIMEOUT: OpenSSH master did not become ready".to_string());
+        }
+        thread::sleep(POLL_INTERVAL);
+    }
+}
+
+fn local_listeners_ready(listeners: &[(String, u16)]) -> bool {
+    listeners.iter().all(|(host, port)| {
+        let address = host
+            .parse::<std::net::IpAddr>()
+            .map(|address| std::net::SocketAddr::new(address, *port))
+            .or_else(|_| format!("{host}:{port}").parse())
+            .ok();
+        address
+            .and_then(|address| {
+                TcpStream::connect_timeout(&address, Duration::from_millis(100)).ok()
+            })
+            .is_some()
+    })
+}
+
+pub(crate) fn standalone_master_ready(runtime: &StandaloneRuntime) -> bool {
+    standalone_master_ready_at(runtime.control_socket(), runtime.alias())
+}
+
+pub(crate) fn standalone_master_ready_at(socket: &Path, alias: &str) -> bool {
+    Command::new("ssh")
+        .args([
+            "-F",
+            "none",
+            "-S",
+            socket.to_string_lossy().as_ref(),
+            "-O",
+            "check",
+            alias,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+pub(crate) fn stop_standalone(runtime: &StandaloneRuntime) {
+    stop_standalone_at(runtime.control_socket(), runtime.alias());
+}
+
+pub(crate) fn stop_standalone_at(socket: &Path, alias: &str) {
+    let _ = Command::new("ssh")
+        .args([
+            "-F",
+            "none",
+            "-S",
+            socket.to_string_lossy().as_ref(),
+            "-O",
+            "exit",
+            alias,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 fn spawn_shell(runtime: &Runtime, no_input: bool) -> Result<Child, String> {
@@ -1152,6 +1423,7 @@ fn save_replacement_for(
 #[derive(Clone, Copy)]
 enum RuntimeTransform<'a> {
     None,
+    Standalone,
     Service {
         forwards: &'a [ServiceForward],
     },
@@ -1166,9 +1438,12 @@ enum RuntimeTransform<'a> {
         forwards: &'a [ServiceForward],
     },
 }
-
 fn compile_config(entry: &HostEntry, selected_alias: &str) -> Result<String, String> {
     compile_config_with_transform(entry, selected_alias, RuntimeTransform::None)
+}
+
+fn compile_standalone_config(entry: &HostEntry, selected_alias: &str) -> Result<String, String> {
+    compile_config_with_transform(entry, selected_alias, RuntimeTransform::Standalone)
 }
 
 fn compile_config_with_forwards(
@@ -1308,6 +1583,20 @@ fn compile_config_with_transform(
                 "UNSUPPORTED_DIRECTIVE: {keyword} cannot be preserved in direct runtime config"
             ));
         }
+        if matches!(transform, RuntimeTransform::Standalone)
+            && (keyword.eq_ignore_ascii_case("proxycommand")
+                || keyword.eq_ignore_ascii_case("proxyjump"))
+        {
+            return Err(
+                "UNSUPPORTED_PROXY: standalone direct tunnel rejects proxy routing".to_string(),
+            );
+        }
+        if matches!(transform, RuntimeTransform::Standalone)
+            && (keyword.eq_ignore_ascii_case("localforward")
+                || keyword.eq_ignore_ascii_case("remoteforward"))
+        {
+            continue;
+        }
         if keyword.eq_ignore_ascii_case("localforward")
             && let RuntimeTransform::Gateway {
                 transit_host,
@@ -1389,7 +1678,9 @@ fn compile_config_with_transform(
             }
             append_service_forwards(&mut output, forwards);
         }
-        RuntimeTransform::None | RuntimeTransform::Gateway { .. } => {}
+        RuntimeTransform::None
+        | RuntimeTransform::Standalone
+        | RuntimeTransform::Gateway { .. } => {}
     }
     output.push_str("Include ");
     output.push_str(SYSTEM_CONFIG);
@@ -1825,6 +2116,7 @@ mod tests {
                 destination_host: "127.0.0.1".to_string(),
                 local_port: port,
             }],
+            preserve_dir: false,
         };
         assert!(service_forwards_ready(&runtime));
         drop(listener);

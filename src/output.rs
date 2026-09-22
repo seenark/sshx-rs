@@ -295,6 +295,65 @@ pub fn render_pairs(
     Ok(rendered)
 }
 
+pub fn render_tunnels(
+    response: &crate::tunnel::TunnelResponse,
+    format: OutputFormat,
+) -> Result<String, String> {
+    #[derive(Serialize)]
+    struct Document<'a> {
+        version: u8,
+        operation: &'a str,
+        tunnels: &'a [crate::tunnel::TunnelView],
+    }
+    if format.is_machine() {
+        let document = Document {
+            version: 1,
+            operation: &response.operation,
+            tunnels: &response.tunnels,
+        };
+        let mut rendered = match format {
+            OutputFormat::Json => serde_json::to_string_pretty(&document)
+                .map_err(|error| format!("cannot render JSON output: {error}"))?,
+            OutputFormat::Yaml => serde_yaml::to_string(&document)
+                .map_err(|error| format!("cannot render YAML output: {error}"))?,
+            OutputFormat::Human => unreachable!(),
+        };
+        if !rendered.ends_with('\n') {
+            rendered.push('\n');
+        }
+        return Ok(rendered);
+    }
+    let mut rendered = String::new();
+    for tunnel in &response.tunnels {
+        rendered.push_str(&format!(
+            "{} {} master={} listener={} application={}\n",
+            tunnel.id,
+            tunnel.state,
+            tunnel.master_status,
+            tunnel.listener_status,
+            tunnel.application_health
+        ));
+        rendered.push_str(&format!(
+            "  host: {} ({})\n  source: {}:{}\n",
+            tunnel.selected_alias, tunnel.entry_id, tunnel.source_path, tunnel.source_line
+        ));
+        for forward in &tunnel.forwards {
+            rendered.push_str(&format!(
+                "  -{} {} local={}\n",
+                forward.kind,
+                forward.effective,
+                forward
+                    .local_port
+                    .map_or_else(|| "unknown".to_string(), |port| port.to_string())
+            ));
+        }
+        if let Some(error) = &tunnel.error {
+            rendered.push_str(&format!("  error: {error}\n"));
+        }
+    }
+    Ok(rendered)
+}
+
 #[cfg(test)]
 mod tests {
     use super::OutputFormat;
