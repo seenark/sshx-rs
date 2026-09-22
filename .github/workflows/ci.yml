@@ -1,0 +1,19 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  verify:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - run: mise exec -- cargo fmt --all -- --check
+      - run: mise exec -- cargo clippy --all-targets --all-features -- -D warnings
+      - run: mise exec -- cargo test --all-targets --all-features
+      - run: mise exec -- cargo build --release

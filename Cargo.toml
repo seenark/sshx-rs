@@ -1,0 +1,13 @@
+[package]
+name = "sshx"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95.0"
+
+[lib]
+name = "sshx"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sshx"
+path = "src/main.rs"
