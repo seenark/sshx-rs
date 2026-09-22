@@ -153,7 +153,10 @@ fn requested_forwards(
             "FORWARD_INTERACTIVE_REQUIRED: --bind cannot be used with --no-input".to_string(),
         );
     }
-    if cli.bind && cli.forwards.is_empty() {
+    if cli.bind && !cli.forwards.is_empty() {
+        return Err("FORWARD_MODE_CONFLICT: --bind cannot be combined with --forward".to_string());
+    }
+    if cli.bind {
         sshx::session::interactive_forwards(entry)
     } else if cli.forwards.is_empty() {
         Ok(Vec::new())
@@ -1367,9 +1370,10 @@ impl Cli {
                 no_input = true;
             } else if text == "--bind" {
                 bind = true;
-            } else if let Some(value) = text.strip_prefix("--bind=") {
-                bind = true;
-                forwards.push(value.to_string());
+            } else if text.starts_with("--bind=") {
+                return Err(
+                    "--bind does not take a value; use --forward REMOTE[=LOCAL]".to_string()
+                );
             } else if text == "--forward" {
                 forwards.push(next(text)?);
             } else if let Some(value) = text.strip_prefix("--forward=") {

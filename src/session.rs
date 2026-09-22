@@ -124,7 +124,6 @@ pub fn resolve_forwards(
             local_port,
         });
     }
-    preflight(&forwards)?;
     Ok(forwards)
 }
 
@@ -264,7 +263,11 @@ fn service_metadata(line: &str) -> Result<Option<ServiceMetadata>, String> {
                 "local" | "local_port" | "bind" | "bind_port" => {
                     default_local_port = Some(parse_metadata_port(value)?)
                 }
-                _ => {}
+                _ => {
+                    return Err(format!(
+                        "FORWARD_METADATA_INVALID: unknown SERVICE field `{key}`"
+                    ));
+                }
             }
             continue;
         }
@@ -283,7 +286,11 @@ fn service_metadata(line: &str) -> Result<Option<ServiceMetadata>, String> {
             && let Ok(port) = token.parse()
         {
             default_local_port = Some(port);
+            continue;
         }
+        return Err(format!(
+            "FORWARD_METADATA_INVALID: unexpected SERVICE value `{token}`"
+        ));
     }
     let remote_port = remote_port.ok_or_else(|| {
         "FORWARD_METADATA_INVALID: ##SSHX SERVICE requires a remote port".to_string()
@@ -303,7 +310,8 @@ fn service_metadata(line: &str) -> Result<Option<ServiceMetadata>, String> {
 }
 
 fn marker_value<'a>(line: &'a str, marker: &str) -> Option<&'a str> {
-    if line.len() < marker.len() || !line[..marker.len()].eq_ignore_ascii_case(marker) {
+    let prefix = line.get(..marker.len())?;
+    if !prefix.eq_ignore_ascii_case(marker) {
         return None;
     }
     let rest = &line[marker.len()..];
@@ -334,7 +342,7 @@ fn validate_destination_host(host: &str) -> Result<(), String> {
     if host.is_empty()
         || host.starts_with('-')
         || host.contains(|character: char| {
-            character.is_whitespace() || matches!(character, '\0' | '\r' | '\n')
+            character.is_whitespace() || matches!(character, '\0' | '\r' | '\n') || character == '%'
         })
         || matches!(host, "0.0.0.0" | "::" | "*")
     {
@@ -392,16 +400,18 @@ fn parse_selection(value: &str, count: usize) -> Result<Vec<usize>, String> {
     }
     Ok(selected)
 }
-
 fn prompt_line(prompt: &str) -> Result<String, String> {
     eprint!("{prompt}");
     io::stderr()
         .flush()
         .map_err(|error| format!("FORWARD_PROMPT_FAILED: cannot flush prompt: {error}"))?;
     let mut value = String::new();
-    io::stdin()
+    let read = io::stdin()
         .read_line(&mut value)
         .map_err(|error| format!("FORWARD_PROMPT_FAILED: cannot read selection: {error}"))?;
+    if read == 0 {
+        return Err("FORWARD_INPUT_CLOSED: interactive input ended".to_string());
+    }
     Ok(value.trim_end_matches(['\r', '\n']).to_string())
 }
 
@@ -505,5 +515,17 @@ mod tests {
         .expect_err("busy local port should fail");
         assert!(error.starts_with("SERVICE_BIND_FAILED"), "{error}");
         assert!(listener.local_addr().is_ok());
+    }
+    #[test]
+    fn metadata_scan_handles_unicode_and_rejects_ssh_tokens() {
+        let (path, entry) = entry(concat!(
+            "Host selected\n",
+            "  # 日本語\n",
+            "  ##PORT 5432\n",
+            "  ##SSHX SERVICE 5432 HOST=%h\n",
+        ));
+        let error = declared_services(&entry).expect_err("SSH tokens must be rejected");
+        assert!(error.starts_with("FORWARD_UNSAFE"), "{error}");
+        fs::remove_file(path).expect("fixture should remove");
     }
 }
