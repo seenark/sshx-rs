@@ -1,5 +1,7 @@
 use crate::connect;
 use crate::discovery::HostEntry;
+use crate::pair::{self, PairedRoute};
+use crate::session::{self, ServiceForward};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -36,11 +38,43 @@ impl ForwardSpec {
             .map(|port| (self.bind_address.clone(), port))
     }
 }
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PairedRegistry {
+    gateway_entry_id: String,
+    vm_entry_id: String,
+    gateway_alias: String,
+    vm_alias: String,
+    gateway_source_path: String,
+    gateway_source_byte_start: usize,
+    gateway_source_byte_end: usize,
+    gateway_source_line_start: usize,
+    gateway_source_line_end: usize,
+    vm_source_path: String,
+    vm_source_byte_start: usize,
+    vm_source_byte_end: usize,
+    vm_source_line_start: usize,
+    vm_source_line_end: usize,
+    gateway_block_fingerprint: String,
+    vm_block_fingerprint: String,
+    gateway_id: String,
+    vm_id: String,
+    transit_host: String,
+    transit_port: u16,
+    transit_local_port: u16,
+    gateway_control_dir: String,
+    gateway_control_socket: String,
+    gateway_runtime_config: String,
+    vm_control_dir: String,
+    vm_control_socket: String,
+    vm_runtime_config: String,
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct RegistryEntry {
     id: String,
     state: String,
+    #[serde(default = "default_tunnel_kind")]
+    kind: String,
     entry_id: String,
     aliases: Vec<String>,
     selected_alias: String,
@@ -55,6 +89,8 @@ struct RegistryEntry {
     control_socket: String,
     runtime_config: String,
     forwards: Vec<ForwardSpec>,
+    #[serde(default)]
+    pair: Option<PairedRegistry>,
     error: Option<String>,
 }
 
@@ -68,6 +104,7 @@ struct RegistryFile {
 pub struct TunnelView {
     pub id: String,
     pub state: String,
+    pub kind: String,
     pub entry_id: String,
     pub aliases: Vec<String>,
     pub selected_alias: String,
@@ -77,6 +114,14 @@ pub struct TunnelView {
     pub master_status: String,
     pub listener_status: String,
     pub application_health: String,
+    pub gateway_entry_id: Option<String>,
+    pub vm_entry_id: Option<String>,
+    pub gateway_alias: Option<String>,
+    pub vm_alias: Option<String>,
+    pub transit_host: Option<String>,
+    pub transit_port: Option<u16>,
+    pub gateway_master_status: Option<String>,
+    pub vm_master_status: Option<String>,
     pub error: Option<String>,
 }
 
@@ -146,6 +191,7 @@ pub fn start(
     let record = RegistryEntry {
         id,
         state: "starting".to_string(),
+        kind: "direct".to_string(),
         entry_id: entry.id.clone(),
         aliases: entry.aliases.clone(),
         selected_alias: selected_alias.to_string(),
@@ -160,6 +206,7 @@ pub fn start(
         control_socket: runtime.control_socket().to_string_lossy().into_owned(),
         runtime_config: runtime.runtime_config().to_string_lossy().into_owned(),
         forwards,
+        pair: None,
         error: None,
     };
     registry.tunnels.push(record);
@@ -209,6 +256,165 @@ pub fn start(
     drop(runtime);
     Ok(response)
 }
+pub fn start_paired(
+    route: &PairedRoute,
+    home: &Path,
+    gateway_alias: &str,
+    vm_alias: &str,
+    no_input: bool,
+    credentials: connect::PairedCredentials,
+    forwards: &[ServiceForward],
+) -> Result<TunnelResponse, String> {
+    if forwards.is_empty() {
+        return Err(
+            "TUNNEL_FORWARD_REQUIRED: provide at least one --forward or use --bind".to_string(),
+        );
+    }
+    session::preflight(forwards)?;
+    let gateway_fingerprint = entry_fingerprint(&route.gateway)?;
+    let vm_fingerprint = entry_fingerprint(&route.vm)?;
+    let specs = forwards
+        .iter()
+        .map(service_forward_spec)
+        .collect::<Vec<_>>();
+    let signature = paired_request_signature(
+        route,
+        gateway_alias,
+        vm_alias,
+        &gateway_fingerprint,
+        &vm_fingerprint,
+        &specs,
+    );
+    let root = registry_root(home);
+    ensure_private_tree(&root)?;
+    let _lock = RegistryLock::acquire(&root)?;
+    let mut registry = read_registry(&root)?;
+    for record in &registry.tunnels {
+        if record.kind != "paired" || record.request_signature != signature {
+            continue;
+        }
+        if record.state == "active"
+            && validate_pair_control_reference(&root, record).is_ok()
+            && pair_masters_ready(record)
+        {
+            return Ok(TunnelResponse {
+                operation: "start".to_string(),
+                tunnels: vec![view(record)],
+            });
+        }
+        if matches!(record.state.as_str(), "active" | "starting" | "stopping") {
+            return Err(format!(
+                "TUNNEL_DOWN: paired tunnel `{}` already exists but is not fully responsive; use restart",
+                record.id
+            ));
+        }
+    }
+    let id = next_id(&registry).replace("dt-", "pt-");
+    let control_dir = root.join(&id);
+    fs::create_dir(&control_dir)
+        .map_err(|error| format!("REGISTRY_FAILED: cannot create control directory: {error}"))?;
+    set_mode(&control_dir, 0o700)?;
+    let runtime = match connect::prepare_paired_standalone_runtime(
+        route,
+        home,
+        gateway_alias,
+        vm_alias,
+        forwards,
+        control_dir.clone(),
+    ) {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&control_dir);
+            return Err(error);
+        }
+    };
+    let pair = PairedRegistry {
+        gateway_entry_id: route.gateway.id.clone(),
+        vm_entry_id: route.vm.id.clone(),
+        gateway_alias: gateway_alias.to_string(),
+        vm_alias: vm_alias.to_string(),
+        gateway_source_path: route.gateway.source.path.clone(),
+        gateway_source_byte_start: route.gateway.source.byte_start,
+        gateway_source_byte_end: route.gateway.source.byte_end,
+        gateway_source_line_start: route.gateway.source.line_start,
+        gateway_source_line_end: route.gateway.source.line_end,
+        vm_source_path: route.vm.source.path.clone(),
+        vm_source_byte_start: route.vm.source.byte_start,
+        vm_source_byte_end: route.vm.source.byte_end,
+        vm_source_line_start: route.vm.source.line_start,
+        vm_source_line_end: route.vm.source.line_end,
+        gateway_block_fingerprint: gateway_fingerprint,
+        vm_block_fingerprint: vm_fingerprint,
+        gateway_id: route.gateway_id.clone(),
+        vm_id: route.vm_id.clone(),
+        transit_host: route.transit_host.clone(),
+        transit_port: route.transit_port,
+        transit_local_port: runtime.transit_port(),
+        gateway_control_dir: runtime.gateway_control_dir().to_string_lossy().into_owned(),
+        gateway_control_socket: runtime
+            .gateway_control_socket()
+            .to_string_lossy()
+            .into_owned(),
+        gateway_runtime_config: runtime
+            .gateway_runtime_config()
+            .to_string_lossy()
+            .into_owned(),
+        vm_control_dir: runtime.vm_control_dir().to_string_lossy().into_owned(),
+        vm_control_socket: runtime.vm_control_socket().to_string_lossy().into_owned(),
+        vm_runtime_config: runtime.vm_runtime_config().to_string_lossy().into_owned(),
+    };
+    registry.tunnels.push(RegistryEntry {
+        id,
+        state: "starting".to_string(),
+        kind: "paired".to_string(),
+        entry_id: route.vm.id.clone(),
+        aliases: route.vm.aliases.clone(),
+        selected_alias: vm_alias.to_string(),
+        source_path: route.vm.source.path.clone(),
+        source_byte_start: route.vm.source.byte_start,
+        source_byte_end: route.vm.source.byte_end,
+        source_line_start: route.vm.source.line_start,
+        source_line_end: route.vm.source.line_end,
+        block_fingerprint: pair.vm_block_fingerprint.clone(),
+        request_signature: signature,
+        control_dir: control_dir.to_string_lossy().into_owned(),
+        control_socket: pair.vm_control_socket.clone(),
+        runtime_config: pair.vm_runtime_config.clone(),
+        forwards: specs,
+        pair: Some(pair),
+        error: None,
+    });
+    write_registry(&root, &registry)?;
+    let index = registry.tunnels.len() - 1;
+    if let Err(error) = connect::launch_paired_standalone(&runtime, no_input, credentials) {
+        registry.tunnels[index].state = "failed".to_string();
+        registry.tunnels[index].error = Some(redact_error(&error));
+        write_registry(&root, &registry)?;
+        drop(runtime);
+        return Err(error);
+    }
+    registry.tunnels[index].state = "active".to_string();
+    if let Err(error) = write_registry(&root, &registry) {
+        let cleanup = paired_stop(&registry.tunnels[index]);
+        registry.tunnels[index].state = "failed".to_string();
+        registry.tunnels[index].error = Some(redact_error(&format!(
+            "{error}{}",
+            cleanup
+                .as_deref()
+                .map_or(String::new(), |error| format!("; {error}"))
+        )));
+        let _ = write_registry(&root, &registry);
+        drop(runtime);
+        return Err(error);
+    }
+    let response_record = registry.tunnels[index].clone();
+    let response = TunnelResponse {
+        operation: "start".to_string(),
+        tunnels: vec![view(&response_record)],
+    };
+    drop(runtime);
+    Ok(response)
+}
 
 pub fn list(home: &Path) -> Result<TunnelResponse, String> {
     let root = registry_root(home);
@@ -245,20 +451,22 @@ pub fn stop(home: &Path, id: &str) -> Result<TunnelResponse, String> {
         .iter()
         .position(|record| record.id == id)
         .ok_or_else(|| format!("TUNNEL_NOT_FOUND: tunnel `{id}` does not exist"))?;
-    let record = &registry.tunnels[index];
-    validate_control_reference(&root, record)?;
-    connect::stop_standalone_at(Path::new(&record.control_socket), &record.selected_alias);
-    if connect::standalone_master_ready_at(
-        Path::new(&record.control_socket),
-        &record.selected_alias,
-    ) {
-        return Err(format!(
-            "TUNNEL_STOP_FAILED: tunnel `{id}` master remains responsive"
-        ));
+    if registry.tunnels[index].kind == "paired" {
+        validate_pair_control_reference(&root, &registry.tunnels[index])?;
+    } else {
+        validate_control_reference(&root, &registry.tunnels[index])?;
     }
-    let record = &mut registry.tunnels[index];
-    record.state = "stopped".to_string();
-    record.error = None;
+    registry.tunnels[index].state = "stopping".to_string();
+    registry.tunnels[index].error = None;
+    write_registry(&root, &registry)?;
+    let cleanup = paired_stop(&registry.tunnels[index]);
+    if let Some(error) = cleanup {
+        registry.tunnels[index].error = Some(redact_error(&error));
+        write_registry(&root, &registry)?;
+        return Err(error);
+    }
+    registry.tunnels[index].state = "stopped".to_string();
+    registry.tunnels[index].error = None;
     write_registry(&root, &registry)?;
     let response_record = registry.tunnels[index].clone();
     let _ = fs::remove_dir_all(&response_record.control_dir);
@@ -274,6 +482,8 @@ pub fn restart(
     id: &str,
     no_input: bool,
     password_fd: Option<i32>,
+    gateway_password_fd: Option<i32>,
+    vm_password_fd: Option<i32>,
 ) -> Result<TunnelResponse, String> {
     let root = registry_root(home);
     ensure_private_tree(&root)?;
@@ -284,6 +494,50 @@ pub fn restart(
         .find(|record| record.id == id)
         .ok_or_else(|| format!("TUNNEL_NOT_FOUND: tunnel `{id}` does not exist"))?
         .clone();
+    if record.kind == "paired" {
+        let pair = record
+            .pair
+            .as_ref()
+            .ok_or_else(|| "REGISTRY_INVALID: paired tunnel has no pair metadata".to_string())?;
+        let vm = entries
+            .iter()
+            .find(|entry| {
+                entry.id == pair.vm_entry_id
+                    && entry.source.path == pair.vm_source_path
+                    && entry.source.byte_start == pair.vm_source_byte_start
+                    && entry.source.byte_end == pair.vm_source_byte_end
+            })
+            .ok_or_else(|| {
+                format!("CONFIG_CHANGED: tunnel `{id}` selected VM HostEntry is unavailable")
+            })?;
+        let route = pair::paired_route(entries, vm)?;
+        let route = route.ok_or_else(|| {
+            "PAIR_BROKEN: selected VM no longer has an approved paired route".to_string()
+        })?;
+        validate_paired_record(&route, pair)?;
+        let _ = stop(home, id)?;
+        let forwards = record
+            .forwards
+            .iter()
+            .map(service_forward_from_spec)
+            .collect::<Result<Vec<_>, _>>()?;
+        return start_paired(
+            &route,
+            home,
+            &pair.gateway_alias,
+            &pair.vm_alias,
+            no_input,
+            connect::PairedCredentials {
+                gateway_password_fd: gateway_password_fd.or(password_fd),
+                vm_password_fd: vm_password_fd.or(password_fd),
+            },
+            &forwards,
+        )
+        .map(|mut response| {
+            response.operation = "restart".to_string();
+            response
+        });
+    }
     let entry = entries
         .iter()
         .find(|entry| same_entry(entry, &record))
@@ -310,7 +564,7 @@ pub fn restart(
         home,
         &record.selected_alias,
         no_input,
-        password_fd,
+        password_fd.or(vm_password_fd),
         &local,
         &remote,
         &dynamic,
@@ -320,6 +574,186 @@ pub fn restart(
         response.operation = "restart".to_string();
         response
     })
+}
+fn default_tunnel_kind() -> String {
+    "direct".to_string()
+}
+
+fn service_forward_spec(forward: &ServiceForward) -> ForwardSpec {
+    ForwardSpec {
+        kind: "L".to_string(),
+        requested: forward.id.clone(),
+        effective: format!(
+            "127.0.0.1:{}:{}:{}",
+            forward.local_port, forward.destination_host, forward.remote_port
+        ),
+        bind_address: "127.0.0.1".to_string(),
+        local_port: Some(forward.local_port),
+        remote_host: Some(forward.destination_host.clone()),
+        remote_port: Some(forward.remote_port),
+    }
+}
+
+fn service_forward_from_spec(forward: &ForwardSpec) -> Result<ServiceForward, String> {
+    if forward.kind != "L" || forward.bind_address != "127.0.0.1" {
+        return Err(
+            "TUNNEL_INVALID: paired registry contains non-loopback service forward".to_string(),
+        );
+    }
+    Ok(ServiceForward {
+        id: forward.requested.clone(),
+        remote_port: forward
+            .remote_port
+            .ok_or_else(|| "TUNNEL_INVALID: paired forward has no remote port".to_string())?,
+        destination_host: forward
+            .remote_host
+            .clone()
+            .ok_or_else(|| "TUNNEL_INVALID: paired forward has no destination host".to_string())?,
+        local_port: forward
+            .local_port
+            .ok_or_else(|| "TUNNEL_INVALID: paired forward has no local port".to_string())?,
+    })
+}
+
+fn paired_request_signature(
+    route: &PairedRoute,
+    gateway_alias: &str,
+    vm_alias: &str,
+    gateway_fingerprint: &str,
+    vm_fingerprint: &str,
+    forwards: &[ForwardSpec],
+) -> String {
+    let mut material = format!(
+        "paired\0{}:{}:{}:{}\0{}:{}:{}:{}\0{}\0{}\0{}\0{}\0{}:{}",
+        route.gateway.source.path,
+        route.gateway.source.byte_start,
+        route.gateway.source.byte_end,
+        gateway_fingerprint,
+        route.vm.source.path,
+        route.vm.source.byte_start,
+        route.vm.source.byte_end,
+        vm_fingerprint,
+        route.gateway_id,
+        route.vm_id,
+        gateway_alias,
+        vm_alias,
+        route.transit_host,
+        route.transit_port
+    );
+    for forward in forwards {
+        material.push('\0');
+        material.push_str(&forward.kind);
+        material.push('=');
+        material.push_str(&forward.bind_address);
+        material.push('=');
+        material.push_str(&forward.effective);
+    }
+    hash_hex(material.as_bytes())
+}
+
+fn pair_masters_ready(record: &RegistryEntry) -> bool {
+    let Some(pair) = record.pair.as_ref() else {
+        return false;
+    };
+    let masters_ready = connect::standalone_master_ready_at(
+        Path::new(&pair.gateway_control_socket),
+        &pair.gateway_alias,
+    ) && connect::standalone_master_ready_at(
+        Path::new(&pair.vm_control_socket),
+        &pair.vm_alias,
+    );
+    masters_ready
+        && listener_bound("127.0.0.1", pair.transit_local_port)
+        && record
+            .forwards
+            .iter()
+            .filter_map(ForwardSpec::listener)
+            .all(|(bind, port)| listener_bound(&bind, port))
+}
+
+fn validate_pair_control_reference(root: &Path, record: &RegistryEntry) -> Result<(), String> {
+    let pair = record
+        .pair
+        .as_ref()
+        .ok_or_else(|| "REGISTRY_INVALID: paired tunnel has no pair metadata".to_string())?;
+    let root_dir = Path::new(&record.control_dir);
+    if root_dir.parent() != Some(root) {
+        return Err("REGISTRY_UNSAFE: paired control path escaped registry directory".to_string());
+    }
+    ensure_private_dir(root_dir, false)?;
+    for (directory, socket, runtime) in [
+        (
+            &pair.gateway_control_dir,
+            &pair.gateway_control_socket,
+            &pair.gateway_runtime_config,
+        ),
+        (
+            &pair.vm_control_dir,
+            &pair.vm_control_socket,
+            &pair.vm_runtime_config,
+        ),
+    ] {
+        let directory = Path::new(directory);
+        if directory.parent() != Some(root_dir) {
+            return Err(
+                "REGISTRY_UNSAFE: paired control path escaped registry directory".to_string(),
+            );
+        }
+        ensure_private_dir(directory, false)?;
+        for path in [Path::new(socket), Path::new(runtime)] {
+            if let Ok(metadata) = fs::symlink_metadata(path)
+                && metadata.file_type().is_symlink()
+            {
+                return Err(format!("REGISTRY_UNSAFE: {} is a symlink", path.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn paired_stop(record: &RegistryEntry) -> Option<String> {
+    if record.kind != "paired" {
+        return connect::stop_standalone_checked_at(
+            Path::new(&record.control_socket),
+            &record.selected_alias,
+        )
+        .err()
+        .map(|error| format!("TUNNEL_STOP_FAILED: {error}"));
+    }
+    let Some(pair) = record.pair.as_ref() else {
+        return Some("REGISTRY_INVALID: paired tunnel has no pair metadata".to_string());
+    };
+    let mut errors = Vec::new();
+    if let Err(error) =
+        connect::stop_standalone_checked_at(Path::new(&pair.vm_control_socket), &pair.vm_alias)
+    {
+        errors.push(format!("VM: {error}"));
+    }
+    if let Err(error) = connect::stop_standalone_checked_at(
+        Path::new(&pair.gateway_control_socket),
+        &pair.gateway_alias,
+    ) {
+        errors.push(format!("gateway: {error}"));
+    }
+    (!errors.is_empty()).then(|| format!("TUNNEL_STOP_FAILED: {}", errors.join("; ")))
+}
+
+fn validate_paired_record(route: &PairedRoute, pair: &PairedRegistry) -> Result<(), String> {
+    if route.gateway.id != pair.gateway_entry_id
+        || route.vm.id != pair.vm_entry_id
+        || route.gateway_id != pair.gateway_id
+        || route.vm_id != pair.vm_id
+        || route.transit_host != pair.transit_host
+        || route.transit_port != pair.transit_port
+    {
+        return Err("CONFIG_CHANGED: paired route identity or transit changed on disk".to_string());
+    }
+    if entry_fingerprint(&route.gateway)? != pair.gateway_block_fingerprint
+        || entry_fingerprint(&route.vm)? != pair.vm_block_fingerprint
+    {
+        return Err("CONFIG_CHANGED: paired HostEntry changed on disk".to_string());
+    }
+    Ok(())
 }
 
 pub fn find_entry<'a>(entries: &'a [HostEntry], record: &TunnelView) -> Option<&'a HostEntry> {
@@ -556,18 +990,62 @@ fn view(record: &RegistryEntry) -> TunnelView {
     let root = Path::new(&record.control_dir)
         .parent()
         .unwrap_or_else(|| Path::new("/"));
-    let control_safe = validate_control_reference(root, record).is_ok();
-    let master_status = if control_safe
-        && connect::standalone_master_ready_at(
-            Path::new(&record.control_socket),
-            &record.selected_alias,
-        ) {
-        "responsive"
-    } else if control_safe {
-        "down"
-    } else {
-        "unknown"
-    };
+    let (master_status, gateway_master_status, vm_master_status, _control_safe, config_safe) =
+        if record.kind == "paired" {
+            let control_safe = validate_pair_control_reference(root, record).is_ok();
+            let config_safe = record.pair.as_ref().is_some_and(pair_config_current);
+            let (gateway, vm) = record.pair.as_ref().map_or(("down", "down"), |pair| {
+                if !control_safe || !config_safe {
+                    ("down", "down")
+                } else {
+                    (
+                        if connect::standalone_master_ready_at(
+                            Path::new(&pair.gateway_control_socket),
+                            &pair.gateway_alias,
+                        ) {
+                            "responsive"
+                        } else {
+                            "down"
+                        },
+                        if connect::standalone_master_ready_at(
+                            Path::new(&pair.vm_control_socket),
+                            &pair.vm_alias,
+                        ) {
+                            "responsive"
+                        } else {
+                            "down"
+                        },
+                    )
+                }
+            });
+            (
+                if gateway == "responsive" && vm == "responsive" {
+                    "responsive"
+                } else if control_safe {
+                    "down"
+                } else {
+                    "unknown"
+                },
+                Some(gateway.to_string()),
+                Some(vm.to_string()),
+                control_safe,
+                config_safe,
+            )
+        } else {
+            let control_safe = validate_control_reference(root, record).is_ok();
+            let master = if control_safe
+                && connect::standalone_master_ready_at(
+                    Path::new(&record.control_socket),
+                    &record.selected_alias,
+                ) {
+                "responsive"
+            } else if control_safe {
+                "down"
+            } else {
+                "unknown"
+            };
+            (master, None, None, control_safe, true)
+        };
     let listener_status = if master_status != "responsive" {
         "down"
     } else if record.forwards.iter().any(|forward| forward.kind == "R") {
@@ -582,14 +1060,34 @@ fn view(record: &RegistryEntry) -> TunnelView {
     } else {
         "down"
     };
-    let state = if record.state == "active" && master_status == "down" {
+    let state = if record.state == "active" && (master_status == "down" || !config_safe) {
         "down".to_string()
     } else {
         record.state.clone()
     };
+    let error = if !config_safe {
+        Some("CONFIG_CHANGED: paired HostEntry changed on disk".to_string())
+    } else {
+        record.error.clone()
+    };
+    let (gateway_entry_id, vm_entry_id, gateway_alias, vm_alias, transit_host, transit_port) =
+        record
+            .pair
+            .as_ref()
+            .map_or((None, None, None, None, None, None), |pair| {
+                (
+                    Some(pair.gateway_entry_id.clone()),
+                    Some(pair.vm_entry_id.clone()),
+                    Some(pair.gateway_alias.clone()),
+                    Some(pair.vm_alias.clone()),
+                    Some(pair.transit_host.clone()),
+                    Some(pair.transit_local_port),
+                )
+            });
     TunnelView {
         id: record.id.clone(),
         state,
+        kind: record.kind.clone(),
         entry_id: record.entry_id.clone(),
         aliases: record.aliases.clone(),
         selected_alias: record.selected_alias.clone(),
@@ -599,8 +1097,31 @@ fn view(record: &RegistryEntry) -> TunnelView {
         master_status: master_status.to_string(),
         listener_status: listener_status.to_string(),
         application_health: "unknown".to_string(),
-        error: record.error.clone(),
+        gateway_entry_id,
+        vm_entry_id,
+        gateway_alias,
+        vm_alias,
+        transit_host,
+        transit_port,
+        gateway_master_status,
+        vm_master_status,
+        error,
     }
+}
+
+fn pair_config_current(pair: &PairedRegistry) -> bool {
+    entry_span_fingerprint(
+        Path::new(&pair.gateway_source_path),
+        pair.gateway_source_byte_start,
+        pair.gateway_source_byte_end,
+    )
+    .is_ok_and(|fingerprint| fingerprint == pair.gateway_block_fingerprint)
+        && entry_span_fingerprint(
+            Path::new(&pair.vm_source_path),
+            pair.vm_source_byte_start,
+            pair.vm_source_byte_end,
+        )
+        .is_ok_and(|fingerprint| fingerprint == pair.vm_block_fingerprint)
 }
 
 fn listener_bound(bind: &str, port: u16) -> bool {
@@ -840,6 +1361,17 @@ fn entry_fingerprint(entry: &HostEntry) -> Result<String, String> {
     Ok(hash_hex(
         &bytes[entry.source.byte_start..entry.source.byte_end],
     ))
+}
+fn entry_span_fingerprint(
+    path: &Path,
+    byte_start: usize,
+    byte_end: usize,
+) -> Result<String, String> {
+    let bytes = fs::read(path).map_err(|error| error.to_string())?;
+    if byte_start >= byte_end || byte_end > bytes.len() {
+        return Err("source span is outside file".to_string());
+    }
+    Ok(hash_hex(&bytes[byte_start..byte_end]))
 }
 
 fn request_signature(

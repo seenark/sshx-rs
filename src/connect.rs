@@ -152,6 +152,42 @@ impl StandaloneRuntime {
     }
 }
 
+pub(crate) struct PairedStandaloneRuntime {
+    gateway: StandaloneRuntime,
+    vm: StandaloneRuntime,
+    transit_port: u16,
+}
+
+impl PairedStandaloneRuntime {
+    pub(crate) fn gateway_control_dir(&self) -> &Path {
+        self.gateway.control_dir()
+    }
+
+    pub(crate) fn gateway_control_socket(&self) -> &Path {
+        self.gateway.control_socket()
+    }
+
+    pub(crate) fn gateway_runtime_config(&self) -> &Path {
+        self.gateway.runtime_config()
+    }
+
+    pub(crate) fn vm_control_dir(&self) -> &Path {
+        self.vm.control_dir()
+    }
+
+    pub(crate) fn vm_control_socket(&self) -> &Path {
+        self.vm.control_socket()
+    }
+
+    pub(crate) fn vm_runtime_config(&self) -> &Path {
+        self.vm.runtime_config()
+    }
+
+    pub(crate) fn transit_port(&self) -> u16 {
+        self.transit_port
+    }
+}
+
 struct OwnedMaster {
     runtime: Runtime,
     child: Child,
@@ -233,6 +269,7 @@ impl Runtime {
         let socket = dir.join("master.sock");
         let known_hosts = known_hosts_path(home, entry);
         ensure_known_hosts_parent(&known_hosts)?;
+
         write_private_file(&config, content.as_bytes())?;
         Ok(Self {
             dir,
@@ -265,6 +302,70 @@ pub(crate) fn prepare_standalone_runtime(
             control_dir,
             true,
         )?,
+    })
+}
+pub(crate) fn prepare_paired_standalone_runtime(
+    route: &PairedRoute,
+    home: &Path,
+    gateway_alias: &str,
+    vm_alias: &str,
+    forwards: &[ServiceForward],
+    control_dir: PathBuf,
+) -> Result<PairedStandaloneRuntime, String> {
+    let transit_port = allocate_transit_port()?;
+    let gateway_config = compile_gateway_config(
+        &route.gateway,
+        gateway_alias,
+        &route.transit_host,
+        route.transit_port,
+        transit_port,
+    )?;
+    let vm_config = compile_vm_config(
+        &route.vm,
+        vm_alias,
+        transit_port,
+        &stable_vm_host_key_alias(&route.vm_id),
+        forwards,
+    )?;
+    let gateway_dir = control_dir.join("gateway");
+    let vm_dir = control_dir.join("vm");
+    for directory in [&gateway_dir, &vm_dir] {
+        fs::create_dir(directory).map_err(|error| {
+            format!(
+                "REGISTRY_FAILED: cannot create paired control directory {}: {error}",
+                directory.display()
+            )
+        })?;
+        set_mode(directory, 0o700)?;
+    }
+    let gateway = match Runtime::create_with_directory(
+        &route.gateway,
+        home,
+        gateway_alias,
+        gateway_config,
+        &[],
+        gateway_dir,
+        true,
+    ) {
+        Ok(runtime) => StandaloneRuntime { runtime },
+        Err(error) => {
+            let _ = fs::remove_dir_all(&control_dir);
+            return Err(error);
+        }
+    };
+    let vm = match Runtime::create_with_directory(
+        &route.vm, home, vm_alias, vm_config, forwards, vm_dir, true,
+    ) {
+        Ok(runtime) => StandaloneRuntime { runtime },
+        Err(error) => {
+            let _ = fs::remove_dir_all(&control_dir);
+            return Err(error);
+        }
+    };
+    Ok(PairedStandaloneRuntime {
+        gateway,
+        vm,
+        transit_port,
     })
 }
 impl Drop for Runtime {
@@ -567,15 +668,16 @@ fn paired_stage_error(role: &str, error: String) -> String {
     if error.starts_with("SESSION_INTERRUPTED") {
         return error;
     }
-    if error.starts_with("SERVICE_BIND_FAILED") {
-        return format!("{}_SERVICE_BIND_FAILED: {error}", role.to_ascii_uppercase());
-    }
     if role.eq_ignore_ascii_case("gateway")
         && (error.starts_with("TRANSIT_BIND_FAILED")
+            || error.starts_with("SERVICE_BIND_FAILED")
             || error.contains("forward")
             || error.contains("bind"))
     {
         return format!("TRANSIT_BIND_FAILED: gateway transit forward failed: {error}");
+    }
+    if error.starts_with("SERVICE_BIND_FAILED") {
+        return format!("{}_SERVICE_BIND_FAILED: {error}", role.to_ascii_uppercase());
     }
     let stage = if error.starts_with("HOST_KEY_TRUST_REQUIRED") {
         "TRUST_REQUIRED"
@@ -688,6 +790,170 @@ fn launch_standalone_session(
         save_replacement(&runtime.runtime, attempt, no_input)?;
     }
     Ok(())
+}
+
+pub(crate) fn launch_paired_standalone(
+    runtime: &PairedStandaloneRuntime,
+    no_input: bool,
+    credentials: PairedCredentials,
+) -> Result<(), String> {
+    SIGNAL.store(0, Ordering::Relaxed);
+    install_signal_handlers();
+    let result = launch_paired_standalone_session(runtime, no_input, credentials);
+    reset_signal_handlers();
+    result
+}
+
+fn launch_paired_standalone_session(
+    runtime: &PairedStandaloneRuntime,
+    no_input: bool,
+    credentials: PairedCredentials,
+) -> Result<(), String> {
+    let gateway_listeners = vec![("127.0.0.1".to_string(), runtime.transit_port)];
+    let vm_listeners = runtime
+        .vm
+        .runtime
+        .forwards
+        .iter()
+        .map(|forward| ("127.0.0.1".to_string(), forward.local_port))
+        .collect::<Vec<_>>();
+    let gateway_attempt = match launch_detached_master(
+        &runtime.gateway,
+        no_input,
+        credentials.gateway_password_fd,
+        &[],
+        &gateway_listeners,
+        "gateway",
+    ) {
+        Ok(attempt) => attempt,
+        Err(error) => {
+            return Err(with_pair_cleanup(
+                error,
+                cleanup_paired_masters(runtime, false, true),
+            ));
+        }
+    };
+    let vm_result = launch_detached_master(
+        &runtime.vm,
+        no_input,
+        credentials.vm_password_fd,
+        &[],
+        &vm_listeners,
+        "VM",
+    );
+    let vm_attempt = match vm_result {
+        Ok(attempt) => attempt,
+        Err(error) => {
+            return Err(with_pair_cleanup(
+                error,
+                cleanup_paired_masters(runtime, true, true),
+            ));
+        }
+    };
+    if let Some(attempt) = gateway_attempt.as_ref()
+        && attempt.source == PasswordSource::Prompted
+        && let Err(error) =
+            save_replacement_for(&runtime.gateway.runtime, attempt, no_input, "gateway")
+    {
+        return Err(with_pair_cleanup(
+            error,
+            cleanup_paired_masters(runtime, true, true),
+        ));
+    }
+    if let Some(attempt) = vm_attempt.as_ref()
+        && attempt.source == PasswordSource::Prompted
+        && let Err(error) = save_replacement_for(&runtime.vm.runtime, attempt, no_input, "VM")
+    {
+        return Err(with_pair_cleanup(
+            error,
+            cleanup_paired_masters(runtime, true, true),
+        ));
+    }
+    Ok(())
+}
+
+fn launch_detached_master(
+    runtime: &StandaloneRuntime,
+    no_input: bool,
+    password_fd: Option<i32>,
+    forwards: &[(char, String)],
+    local_listeners: &[(String, u16)],
+    role: &str,
+) -> Result<Option<PasswordAttempt>, String> {
+    let mut attempt = match password_fd {
+        Some(fd) => Some(read_password_fd(fd).map_err(|error| paired_stage_error(role, error))?),
+        None => runtime
+            .runtime
+            .configured_password
+            .clone()
+            .map(PasswordAttempt::configured),
+    };
+    let mut enrolled = false;
+    loop {
+        match launch_standalone_once(
+            runtime,
+            no_input,
+            attempt.as_ref(),
+            forwards,
+            local_listeners,
+        ) {
+            Ok(()) => return Ok(attempt),
+            Err(error) => {
+                if !enrolled && !no_input && error.starts_with("HOST_KEY_TRUST_REQUIRED") {
+                    stop_standalone(runtime);
+                    enroll_host_key(&runtime.runtime)
+                        .map_err(|error| paired_stage_error(role, error))?;
+                    enrolled = true;
+                    continue;
+                }
+                let can_prompt = !no_input
+                    && io::stdin().is_terminal()
+                    && error.starts_with("SSH_AUTH_FAILED")
+                    && attempt
+                        .as_ref()
+                        .is_none_or(|value| value.source != PasswordSource::Prompted);
+                if can_prompt
+                    && let Some(next) =
+                        prompt_password_for(role, &runtime.runtime.alias, attempt.is_some())
+                            .map_err(|error| paired_stage_error(role, error))?
+                {
+                    stop_standalone(runtime);
+                    attempt = Some(next);
+                    continue;
+                }
+                return Err(paired_stage_error(role, error));
+            }
+        }
+    }
+}
+
+fn with_pair_cleanup(error: String, cleanup_errors: Vec<String>) -> String {
+    if cleanup_errors.is_empty() {
+        error
+    } else {
+        format!("{error}; CLEANUP_FAILED: {}", cleanup_errors.join("; "))
+    }
+}
+
+fn cleanup_paired_masters(
+    runtime: &PairedStandaloneRuntime,
+    stop_vm: bool,
+    stop_gateway: bool,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    if stop_vm
+        && let Err(error) =
+            stop_standalone_checked_at(runtime.vm.control_socket(), runtime.vm.alias())
+    {
+        errors.push(format!("VM: {error}"));
+    }
+    if stop_gateway
+        && let Err(error) =
+            stop_standalone_checked_at(runtime.gateway.control_socket(), runtime.gateway.alias())
+    {
+        errors.push(format!("gateway: {error}"));
+    }
+    errors
 }
 
 fn launch_standalone_once(
@@ -832,6 +1098,30 @@ pub(crate) fn stop_standalone_at(socket: &Path, alias: &str) {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
+}
+pub(crate) fn stop_standalone_checked_at(socket: &Path, alias: &str) -> Result<(), String> {
+    let status = Command::new("ssh")
+        .args([
+            "-F",
+            "none",
+            "-S",
+            socket.to_string_lossy().as_ref(),
+            "-O",
+            "exit",
+            alias,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| format!("cannot stop master: {error}"))?;
+    if !status.success() {
+        return Err(format!("control exit returned {status}"));
+    }
+    if standalone_master_ready_at(socket, alias) {
+        return Err("master remains responsive after control exit".to_string());
+    }
+    Ok(())
 }
 
 fn spawn_shell(runtime: &Runtime, no_input: bool) -> Result<Child, String> {

@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::process;
 const USAGE: &str = "Usage: sshx [--version]";
 const HOST_USAGE: &str = "Usage: sshx [--config PATH] host list [--format human|json|yaml]\n       sshx [--config PATH] host show SELECTOR [--format human|json|yaml]\n       sshx [--config PATH] host create --scope SCOPE --file PATH --alias ALIAS --hostname HOSTNAME [options]\n       sshx [--config PATH] host update SELECTOR [options]\n       sshx [--config PATH] host rename SELECTOR --alias ALIAS [options]\n       sshx [--config PATH] host delete SELECTOR [options]";
-const SETUP_USAGE: &str = "Usage: sshx setup [--personal PATH] [--work PATH] [--project NAME]\n       sshx connect [SELECTOR] [--id ID] [--source PATH --line NUMBER] [--password-fd FD] [--gateway-password-fd FD --vm-password-fd FD] [--bind] [--forward REMOTE[=LOCAL]] [--no-input]\n       sshx tunnel direct start [SELECTOR] [-L SPEC] [-R SPEC] [-D SPEC] [--allow-bind]\n       sshx tunnel direct list|status ID|stop ID|restart ID\n       sshx pair setup [GATEWAY] [VM] [--gateway ID] [--vm ID] [--transit-host HOST --transit-port PORT]";
+const SETUP_USAGE: &str = "Usage: sshx setup [--personal PATH] [--work PATH] [--project NAME]\n       sshx connect [SELECTOR] [--id ID] [--source PATH --line NUMBER] [--password-fd FD] [--gateway-password-fd FD --vm-password-fd FD] [--bind] [--forward REMOTE[=LOCAL]] [--no-input]\n       sshx tunnel direct start [SELECTOR] [-L SPEC] [-R SPEC] [-D SPEC] [--allow-bind]\n       sshx tunnel paired start [SELECTOR] [--bind] [--forward REMOTE[=LOCAL]] [--no-input]\n       sshx tunnel direct list|status ID|stop ID|restart ID\n       sshx tunnel paired list|status ID|stop ID|restart ID\n       sshx pair setup [GATEWAY] [VM] [--gateway ID] [--vm ID] [--transit-host HOST --transit-port PORT]";
 
 fn main() {
     match run(env::args_os().skip(1).collect()) {
@@ -152,7 +152,42 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
                 }
             }
         }
-        Command::TunnelStart(selector) => {
+        Command::TunnelStart(selector) | Command::TunnelPairedStart(selector) => {
+            if !cli.local_forwards.is_empty()
+                || !cli.remote_forwards.is_empty()
+                || !cli.dynamic_forwards.is_empty()
+            {
+                return Err(
+                    "TUNNEL_FORWARD_MODE: paired standalone tunnels use --forward or --bind"
+                        .to_string(),
+                );
+            }
+            let entry = select_connect_entry(&filtered, selector.as_deref(), &cli)?;
+            let route = sshx::pair::paired_route(&catalog.entries, entry)?.ok_or_else(|| {
+                "TUNNEL_PAIRED_REQUIRED: selected HostEntry has no valid Pair".to_string()
+            })?;
+            let gateway_alias = route
+                .gateway
+                .aliases
+                .first()
+                .ok_or_else(|| "PAIR_INVALID: gateway has no alias".to_string())?;
+            let forwards = requested_forwards(&route.vm, &cli)?;
+            let response = sshx::tunnel::start_paired(
+                &route,
+                &home,
+                gateway_alias,
+                selected_connect_alias(entry, selector.as_deref(), &cli),
+                cli.no_input,
+                sshx::connect::PairedCredentials {
+                    gateway_password_fd: cli.gateway_password_fd,
+                    vm_password_fd: cli.vm_password_fd.or(cli.password_fd),
+                },
+                &forwards,
+            )?;
+            print!("{}", render_tunnels(&response, cli.format)?);
+            Ok(())
+        }
+        Command::TunnelDirectStart(selector) => {
             if !cli.forwards.is_empty() || cli.bind {
                 return Err(
                     "TUNNEL_FORWARD_MODE: standalone tunnels require explicit -L, -R, or -D"
@@ -182,8 +217,15 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
             Ok(())
         }
         Command::TunnelRestart(id) => {
-            let response =
-                sshx::tunnel::restart(&catalog.entries, &home, id, cli.no_input, cli.password_fd)?;
+            let response = sshx::tunnel::restart(
+                &catalog.entries,
+                &home,
+                id,
+                cli.no_input,
+                cli.password_fd,
+                cli.gateway_password_fd,
+                cli.vm_password_fd,
+            )?;
             print!("{}", render_tunnels(&response, cli.format)?);
             Ok(())
         }
@@ -713,12 +755,14 @@ fn has_pair_reference(text: &str, id: &str) -> bool {
 
 fn has_active_reference(text: &str, id: &str) -> bool {
     let lower = text.to_ascii_lowercase().replace(char::is_whitespace, "");
-    lower.contains(&format!("\"entry_id\":\"{}\"", id.to_ascii_lowercase()))
+    let id = id.to_ascii_lowercase();
+    (lower.contains(&format!("\"entry_id\":\"{id}\""))
+        || lower.contains(&format!("\"gateway_entry_id\":\"{id}\""))
+        || lower.contains(&format!("\"vm_entry_id\":\"{id}\"")))
         && (lower.contains("\"state\":\"active\"")
             || lower.contains("\"state\":\"starting\"")
             || lower.contains("\"state\":\"stopping\""))
 }
-
 fn required_create_value(
     value: Option<&str>,
     label: &str,
@@ -1211,6 +1255,8 @@ enum Command {
     PairValidate,
     Setup,
     TunnelStart(Option<String>),
+    TunnelDirectStart(Option<String>),
+    TunnelPairedStart(Option<String>),
     TunnelList,
     TunnelStatus(String),
     TunnelStop(String),
@@ -1545,16 +1591,46 @@ impl Cli {
             [tunnel, direct, start]
                 if tunnel == "tunnel" && direct == "direct" && start == "start" =>
             {
-                Command::TunnelStart(None)
+                Command::TunnelDirectStart(None)
             }
             [tunnel, direct, start, selector]
                 if tunnel == "tunnel" && direct == "direct" && start == "start" =>
             {
-                Command::TunnelStart(Some(selector.clone()))
+                Command::TunnelDirectStart(Some(selector.clone()))
+            }
+            [tunnel, paired, start]
+                if tunnel == "tunnel" && paired == "paired" && start == "start" =>
+            {
+                Command::TunnelPairedStart(None)
+            }
+            [tunnel, paired, start, selector]
+                if tunnel == "tunnel" && paired == "paired" && start == "start" =>
+            {
+                Command::TunnelPairedStart(Some(selector.clone()))
             }
             [tunnel, start] if tunnel == "tunnel" && start == "start" => Command::TunnelStart(None),
             [tunnel, start, selector] if tunnel == "tunnel" && start == "start" => {
                 Command::TunnelStart(Some(selector.clone()))
+            }
+            [tunnel, paired, list]
+                if tunnel == "tunnel" && paired == "paired" && list == "list" =>
+            {
+                Command::TunnelList
+            }
+            [tunnel, paired, status, id]
+                if tunnel == "tunnel" && paired == "paired" && status == "status" =>
+            {
+                Command::TunnelStatus(id.clone())
+            }
+            [tunnel, paired, stop, id]
+                if tunnel == "tunnel" && paired == "paired" && stop == "stop" =>
+            {
+                Command::TunnelStop(id.clone())
+            }
+            [tunnel, paired, restart, id]
+                if tunnel == "tunnel" && paired == "paired" && restart == "restart" =>
+            {
+                Command::TunnelRestart(id.clone())
             }
             [tunnel, direct, list]
                 if tunnel == "tunnel" && direct == "direct" && list == "list" =>
@@ -1679,6 +1755,8 @@ impl Cli {
             }
             Command::PairList | Command::PairValidate => command,
             Command::TunnelStart(selector) => Command::TunnelStart(selector),
+            Command::TunnelDirectStart(selector) => Command::TunnelDirectStart(selector),
+            Command::TunnelPairedStart(selector) => Command::TunnelPairedStart(selector),
             Command::TunnelList
             | Command::TunnelStatus(_)
             | Command::TunnelStop(_)
