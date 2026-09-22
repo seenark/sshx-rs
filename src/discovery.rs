@@ -255,7 +255,7 @@ fn parse_file(path: &Path) -> Result<ParsedFile, DiscoveryError> {
         .collect::<Vec<_>>();
 
     let mut hosts = Vec::with_capacity(host_line_indexes.len());
-    for (position, line_index) in host_line_indexes.iter().copied().enumerate() {
+    for line_index in host_line_indexes.iter().copied() {
         let end_line_index = boundaries
             .iter()
             .copied()
