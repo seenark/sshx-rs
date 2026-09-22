@@ -4,7 +4,7 @@
 
 **Blocked by:** 01: Bootstrap greenfield `sshx` executable.
 
-**Status:** ready-for-agent
+**Status:** claimed
 
 - [ ] Include directives are processed at their source position, with relative user paths and wildcard ordering matching OpenSSH semantics.
 - [ ] Include cycles terminate with a clear diagnostic instead of looping.
