@@ -1,5 +1,6 @@
 use std::fs;
 use std::io::Write;
+use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
@@ -702,6 +703,28 @@ fn run_fake_ssh(home: &Path, args: &[&str], bin: &Path, root: &Path) -> std::pro
         .expect("sshx binary should run")
 }
 
+fn run_fake_ssh_owned(
+    home: &Path,
+    args: &[String],
+    bin: &Path,
+    root: &Path,
+) -> std::process::Output {
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    Command::new(env!("CARGO_BIN_EXE_sshx"))
+        .env("HOME", home)
+        .env("PATH", path)
+        .env("SSHX_CAPTURE", root.join("runtime-config").as_os_str())
+        .env("SSHX_STARTED", root.join("master-started").as_os_str())
+        .env("SSHX_CLOSED", root.join("master-closed").as_os_str())
+        .args(args)
+        .output()
+        .expect("sshx binary should run")
+}
+
 fn paired_fake_ssh(root: &Path) -> PathBuf {
     let bin = root.join("paired-bin");
     fs::create_dir_all(&bin).expect("paired fake SSH directory should be created");
@@ -1210,6 +1233,38 @@ fn direct_connect_compiles_exact_block_and_uses_owned_master() {
     assert!(!runtime.contains("remove this"));
     assert!(root.join("master-started").exists());
     assert!(root.join("master-closed").exists());
+    fs::remove_dir_all(root).expect("fixture should be removed");
+}
+
+#[test]
+fn direct_service_forward_preflight_preserves_busy_external_listener() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(
+        &config,
+        "Host direct\n  HostName direct.example\n  ##PORT 5432\n",
+    );
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("external listener should bind");
+    let local_port = listener
+        .local_addr()
+        .expect("external listener address")
+        .port();
+    let bin = fake_ssh(&root);
+    let args = vec![
+        "--config".to_string(),
+        config.to_string_lossy().into_owned(),
+        "connect".to_string(),
+        "direct".to_string(),
+        "--no-input".to_string(),
+        "--forward".to_string(),
+        format!("5432={local_port}"),
+    ];
+    let output = run_fake_ssh_owned(&home, &args, &bin, &root);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let text = String::from_utf8_lossy(&output.stderr);
+    assert!(text.contains("SERVICE_BIND_FAILED"), "{text}");
+    assert!(!root.join("master-started").exists());
+    assert!(listener.local_addr().is_ok());
     fs::remove_dir_all(root).expect("fixture should be removed");
 }
 

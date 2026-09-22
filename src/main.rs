@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::process;
 const USAGE: &str = "Usage: sshx [--version]";
 const HOST_USAGE: &str = "Usage: sshx [--config PATH] host list [--format human|json|yaml]\n       sshx [--config PATH] host show SELECTOR [--format human|json|yaml]\n       sshx [--config PATH] host create --scope SCOPE --file PATH --alias ALIAS --hostname HOSTNAME [options]\n       sshx [--config PATH] host update SELECTOR [options]\n       sshx [--config PATH] host rename SELECTOR --alias ALIAS [options]\n       sshx [--config PATH] host delete SELECTOR [options]";
-const SETUP_USAGE: &str = "Usage: sshx setup [--personal PATH] [--work PATH] [--project NAME]\n       sshx connect [SELECTOR] [--id ID] [--source PATH --line NUMBER] [--password-fd FD] [--gateway-password-fd FD --vm-password-fd FD] [--no-input]\n       sshx pair setup [GATEWAY] [VM] [--gateway ID] [--vm ID] [--transit-host HOST --transit-port PORT]";
+const SETUP_USAGE: &str = "Usage: sshx setup [--personal PATH] [--work PATH] [--project NAME]\n       sshx connect [SELECTOR] [--id ID] [--source PATH --line NUMBER] [--password-fd FD] [--gateway-password-fd FD --vm-password-fd FD] [--bind] [--forward REMOTE[=LOCAL]] [--no-input]\n       sshx pair setup [GATEWAY] [VM] [--gateway ID] [--vm ID] [--transit-host HOST --transit-port PORT]";
 
 fn main() {
     match run(env::args_os().skip(1).collect()) {
@@ -107,22 +107,28 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
                         (Some(fd), None) | (None, Some(fd)) => Some(fd),
                         (None, None) => None,
                     };
-                    sshx::connect::open_paired(
+                    let forwards = requested_forwards(&route.vm, &cli)?;
+                    sshx::connect::open_paired_with_forwards(
                         &route,
                         &home_dir()?,
                         cli.no_input,
                         gateway_alias,
                         alias,
-                        cli.gateway_password_fd,
-                        vm_password_fd,
+                        sshx::connect::PairedCredentials {
+                            gateway_password_fd: cli.gateway_password_fd,
+                            vm_password_fd,
+                        },
+                        &forwards,
                     )
                 } else {
-                    sshx::connect::open_with_password_fd(
+                    let forwards = requested_forwards(entry, &cli)?;
+                    sshx::connect::open_with_password_fd_and_forwards(
                         entry,
                         &home_dir()?,
                         cli.no_input,
                         alias,
                         cli.password_fd,
+                        &forwards,
                     )
                 }
             }
@@ -135,6 +141,24 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
         | Command::PairSetup { .. }
         | Command::PairList
         | Command::PairValidate => unreachable!(),
+    }
+}
+
+fn requested_forwards(
+    entry: &HostEntry,
+    cli: &Cli,
+) -> Result<Vec<sshx::session::ServiceForward>, String> {
+    if cli.bind && cli.no_input {
+        return Err(
+            "FORWARD_INTERACTIVE_REQUIRED: --bind cannot be used with --no-input".to_string(),
+        );
+    }
+    if cli.bind && cli.forwards.is_empty() {
+        sshx::session::interactive_forwards(entry)
+    } else if cli.forwards.is_empty() {
+        Ok(Vec::new())
+    } else {
+        sshx::session::resolve_forwards(entry, &cli.forwards)
     }
 }
 
@@ -1161,6 +1185,8 @@ struct Cli {
     yes: bool,
     preview: bool,
     no_input: bool,
+    bind: bool,
+    forwards: Vec<String>,
     gateway_source: Option<PathBuf>,
     gateway_line: Option<usize>,
     vm_source: Option<PathBuf>,
@@ -1196,6 +1222,8 @@ impl Cli {
         let mut preview = false;
         let host = None;
         let mut no_input = false;
+        let mut bind = false;
+        let mut forwards = Vec::new();
         let mut gateway_source = None;
         let mut gateway_line = None;
         let mut vm_source = None;
@@ -1337,6 +1365,15 @@ impl Cli {
                 id = Some(next(text)?);
             } else if text == "--no-input" || text == "--non-interactive" {
                 no_input = true;
+            } else if text == "--bind" {
+                bind = true;
+            } else if let Some(value) = text.strip_prefix("--bind=") {
+                bind = true;
+                forwards.push(value.to_string());
+            } else if text == "--forward" {
+                forwards.push(next(text)?);
+            } else if let Some(value) = text.strip_prefix("--forward=") {
+                forwards.push(value.to_string());
             } else if matches!(
                 text,
                 "--personal"
@@ -1530,6 +1567,8 @@ impl Cli {
             yes,
             preview,
             no_input,
+            bind,
+            forwards,
             gateway_source,
             gateway_line,
             vm_source,

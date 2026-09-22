@@ -4,7 +4,7 @@
 
 **Blocked by:** 06: Update, rename, and delete HostEntries losslessly; 09: Open a paired VM shell in one terminal.
 
-**Status:** ready-for-agent
+**Status:** claimed
 
 - [ ] A normal connect opens no app-added service forwarding and asks no forwarding question.
 - [ ] Repeated `##PORT` declarations produce unique service choices with loopback destination and matching local defaults.

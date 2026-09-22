@@ -1,9 +1,10 @@
 use crate::discovery::HostEntry;
 use crate::mutation::{self, UpdateRequest};
 use crate::pair::PairedRoute;
+use crate::session::{self, ServiceForward};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, IsTerminal, Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -19,6 +20,7 @@ use std::os::unix::process::CommandExt;
 
 const SYSTEM_CONFIG: &str = "/etc/ssh/ssh_config";
 const MASTER_TIMEOUT: Duration = Duration::from_secs(30);
+const FORWARD_READY_TIMEOUT: Duration = Duration::from_secs(5);
 const POLL_INTERVAL: Duration = Duration::from_millis(40);
 
 static SIGNAL: AtomicI32 = AtomicI32::new(0);
@@ -74,6 +76,17 @@ enum PasswordSource {
     Supplied,
     Prompted,
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ForwardStage {
+    None,
+    Transit,
+    Service,
+}
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PairedCredentials {
+    pub gateway_password_fd: Option<i32>,
+    pub vm_password_fd: Option<i32>,
+}
 
 struct PasswordAttempt {
     bytes: Vec<u8>,
@@ -106,7 +119,6 @@ impl PasswordAttempt {
         }
     }
 }
-
 struct Runtime {
     dir: PathBuf,
     config: PathBuf,
@@ -115,12 +127,60 @@ struct Runtime {
     known_hosts: PathBuf,
     entry: HostEntry,
     configured_password: Option<String>,
+    forwards: Vec<ServiceForward>,
+}
+
+struct OwnedMaster {
+    runtime: Runtime,
+    child: Child,
+}
+
+struct SessionService {
+    masters: Vec<OwnedMaster>,
+}
+
+impl SessionService {
+    fn new() -> Self {
+        Self {
+            masters: Vec::new(),
+        }
+    }
+
+    fn add(&mut self, runtime: Runtime, child: Child) -> usize {
+        self.masters.push(OwnedMaster { runtime, child });
+        self.masters.len() - 1
+    }
+
+    fn runtime(&self, index: usize) -> &Runtime {
+        &self.masters[index].runtime
+    }
+
+    fn stop(&mut self) {
+        while let Some(mut master) = self.masters.pop() {
+            stop_master(&master.runtime, &mut master.child);
+        }
+    }
+}
+
+impl Drop for SessionService {
+    fn drop(&mut self) {
+        self.stop();
+    }
 }
 
 impl Runtime {
-    fn create(entry: &HostEntry, home: &Path, selected_alias: &str) -> Result<Self, String> {
-        let content = compile_config(entry, selected_alias)?;
-        Self::create_with_content(entry, home, selected_alias, content)
+    fn create(
+        entry: &HostEntry,
+        home: &Path,
+        selected_alias: &str,
+        forwards: &[ServiceForward],
+    ) -> Result<Self, String> {
+        let content = if forwards.is_empty() {
+            compile_config(entry, selected_alias)?
+        } else {
+            compile_config_with_forwards(entry, selected_alias, forwards)?
+        };
+        Self::create_with_content(entry, home, selected_alias, content, forwards)
     }
 
     fn create_with_content(
@@ -128,6 +188,7 @@ impl Runtime {
         home: &Path,
         selected_alias: &str,
         content: String,
+        forwards: &[ServiceForward],
     ) -> Result<Self, String> {
         if !entry.aliases.iter().any(|alias| alias == selected_alias) {
             return Err("CONFIG_CHANGED: selected alias no longer exists".to_string());
@@ -147,6 +208,7 @@ impl Runtime {
             known_hosts,
             entry: entry.clone(),
             configured_password,
+            forwards: forwards.to_vec(),
         })
     }
 }
@@ -173,9 +235,20 @@ pub fn open_with_password_fd(
     selected_alias: &str,
     password_fd: Option<i32>,
 ) -> Result<(), String> {
+    open_with_password_fd_and_forwards(entry, home, no_input, selected_alias, password_fd, &[])
+}
+
+pub fn open_with_password_fd_and_forwards(
+    entry: &HostEntry,
+    home: &Path,
+    no_input: bool,
+    selected_alias: &str,
+    password_fd: Option<i32>,
+    forwards: &[ServiceForward],
+) -> Result<(), String> {
     SIGNAL.store(0, Ordering::Relaxed);
     install_signal_handlers();
-    let result = open_session(entry, home, no_input, selected_alias, password_fd);
+    let result = open_session(entry, home, no_input, selected_alias, password_fd, forwards);
     reset_signal_handlers();
     result
 }
@@ -186,8 +259,10 @@ fn open_session(
     no_input: bool,
     selected_alias: &str,
     password_fd: Option<i32>,
+    forwards: &[ServiceForward],
 ) -> Result<(), String> {
-    let runtime = Runtime::create(entry, home, selected_alias)?;
+    session::preflight(forwards)?;
+    let runtime = Runtime::create(entry, home, selected_alias, forwards)?;
     let mut attempt = match password_fd {
         Some(fd) => Some(read_password_fd(fd)?),
         None => runtime
@@ -197,8 +272,17 @@ fn open_session(
     };
     let mut enrolled = false;
     let master = loop {
-        let mut master = spawn_master(&runtime, no_input, attempt.as_ref(), false)?;
-        match wait_for_master(&runtime, &mut master, no_input) {
+        let mut master = spawn_master(&runtime, no_input, attempt.as_ref(), !forwards.is_empty())?;
+        match wait_for_master(
+            &runtime,
+            &mut master,
+            no_input,
+            if forwards.is_empty() {
+                ForwardStage::None
+            } else {
+                ForwardStage::Service
+            },
+        ) {
             Ok(()) => break master,
             Err(error) => {
                 stop_master(&runtime, &mut master);
@@ -223,28 +307,16 @@ fn open_session(
             }
         }
     };
-    let mut master = master;
+    let mut service = SessionService::new();
+    let master_index = service.add(runtime, master);
     if let Some(attempt) = attempt.as_ref()
-        && let Err(error) = save_replacement(&runtime, attempt, no_input)
+        && let Err(error) = save_replacement(service.runtime(master_index), attempt, no_input)
     {
-        stop_master(&runtime, &mut master);
         return Err(error);
     }
-    let mut shell = match spawn_shell(&runtime, no_input) {
-        Ok(shell) => shell,
-        Err(error) => {
-            stop_master(&runtime, &mut master);
-            return Err(error);
-        }
-    };
-    let status = match wait_for_shell(&mut shell) {
-        Ok(status) => status,
-        Err(error) => {
-            stop_master(&runtime, &mut master);
-            return Err(error);
-        }
-    };
-    stop_master(&runtime, &mut master);
+    let mut shell = spawn_shell(service.runtime(master_index), no_input)?;
+    let status = wait_for_shell(&mut shell)?;
+    service.stop();
     if let Some(signal) = received_signal() {
         return Err(format!("SESSION_INTERRUPTED: signal {signal}"));
     }
@@ -264,6 +336,29 @@ pub fn open_paired(
     gateway_password_fd: Option<i32>,
     vm_password_fd: Option<i32>,
 ) -> Result<(), String> {
+    open_paired_with_forwards(
+        route,
+        home,
+        no_input,
+        gateway_alias,
+        vm_alias,
+        PairedCredentials {
+            gateway_password_fd,
+            vm_password_fd,
+        },
+        &[],
+    )
+}
+
+pub fn open_paired_with_forwards(
+    route: &PairedRoute,
+    home: &Path,
+    no_input: bool,
+    gateway_alias: &str,
+    vm_alias: &str,
+    credentials: PairedCredentials,
+    forwards: &[ServiceForward],
+) -> Result<(), String> {
     SIGNAL.store(0, Ordering::Relaxed);
     install_signal_handlers();
     let result = open_paired_session(
@@ -272,8 +367,8 @@ pub fn open_paired(
         no_input,
         gateway_alias,
         vm_alias,
-        gateway_password_fd,
-        vm_password_fd,
+        credentials,
+        forwards,
     );
     reset_signal_handlers();
     result
@@ -285,9 +380,10 @@ fn open_paired_session(
     no_input: bool,
     gateway_alias: &str,
     vm_alias: &str,
-    gateway_password_fd: Option<i32>,
-    vm_password_fd: Option<i32>,
+    credentials: PairedCredentials,
+    forwards: &[ServiceForward],
 ) -> Result<(), String> {
+    session::preflight(forwards).map_err(|error| format!("VM_{error}"))?;
     let transit_port = allocate_transit_port()?;
     let gateway_config = compile_gateway_config(
         &route.gateway,
@@ -301,64 +397,49 @@ fn open_paired_session(
         vm_alias,
         transit_port,
         &stable_vm_host_key_alias(&route.vm_id),
+        forwards,
     )?;
     let gateway_runtime =
-        Runtime::create_with_content(&route.gateway, home, gateway_alias, gateway_config)?;
-    let vm_runtime = Runtime::create_with_content(&route.vm, home, vm_alias, vm_config)?;
-    let mut gateway_attempt = password_attempt(&gateway_runtime, gateway_password_fd)
+        Runtime::create_with_content(&route.gateway, home, gateway_alias, gateway_config, &[])?;
+    let vm_runtime = Runtime::create_with_content(&route.vm, home, vm_alias, vm_config, forwards)?;
+    let mut gateway_attempt = password_attempt(&gateway_runtime, credentials.gateway_password_fd)
         .map_err(|error| paired_stage_error("gateway", error))?;
-    let mut vm_attempt = password_attempt(&vm_runtime, vm_password_fd)
+    let mut vm_attempt = password_attempt(&vm_runtime, credentials.vm_password_fd)
         .map_err(|error| paired_stage_error("VM", error))?;
 
-    let mut gateway_master = authenticate_paired_master(
+    let gateway_master = authenticate_paired_master(
         &gateway_runtime,
         no_input,
         &mut gateway_attempt,
         "gateway",
-        true,
+        ForwardStage::Transit,
     )?;
-    let mut vm_master =
-        match authenticate_paired_master(&vm_runtime, no_input, &mut vm_attempt, "VM", false) {
-            Ok(master) => master,
-            Err(error) => {
-                stop_master(&gateway_runtime, &mut gateway_master);
-                return Err(error);
-            }
-        };
+    let mut service = SessionService::new();
+    let gateway_index = service.add(gateway_runtime, gateway_master);
+    let vm_master = authenticate_paired_master(
+        &vm_runtime,
+        no_input,
+        &mut vm_attempt,
+        "VM",
+        if forwards.is_empty() {
+            ForwardStage::None
+        } else {
+            ForwardStage::Service
+        },
+    )?;
+    let vm_index = service.add(vm_runtime, vm_master);
 
-    if let Some(attempt) = gateway_attempt.as_ref()
-        && let Err(error) = save_replacement_for(&gateway_runtime, attempt, no_input, "gateway")
-    {
-        stop_master(&vm_runtime, &mut vm_master);
-        stop_master(&gateway_runtime, &mut gateway_master);
-        return Err(error);
+    if let Some(attempt) = gateway_attempt.as_ref() {
+        save_replacement_for(service.runtime(gateway_index), attempt, no_input, "gateway")?;
     }
-    if let Some(attempt) = vm_attempt.as_ref()
-        && let Err(error) = save_replacement_for(&vm_runtime, attempt, no_input, "VM")
-    {
-        stop_master(&vm_runtime, &mut vm_master);
-        stop_master(&gateway_runtime, &mut gateway_master);
-        return Err(error);
+    if let Some(attempt) = vm_attempt.as_ref() {
+        save_replacement_for(service.runtime(vm_index), attempt, no_input, "VM")?;
     }
 
-    let mut shell = match spawn_shell(&vm_runtime, no_input) {
-        Ok(shell) => shell,
-        Err(error) => {
-            stop_master(&vm_runtime, &mut vm_master);
-            stop_master(&gateway_runtime, &mut gateway_master);
-            return Err(format!("VM_SESSION_FAILED: {error}"));
-        }
-    };
-    let status = match wait_for_shell(&mut shell) {
-        Ok(status) => status,
-        Err(error) => {
-            stop_master(&vm_runtime, &mut vm_master);
-            stop_master(&gateway_runtime, &mut gateway_master);
-            return Err(error);
-        }
-    };
-    stop_master(&vm_runtime, &mut vm_master);
-    stop_master(&gateway_runtime, &mut gateway_master);
+    let mut shell = spawn_shell(service.runtime(vm_index), no_input)
+        .map_err(|error| format!("VM_SESSION_FAILED: {error}"))?;
+    let status = wait_for_shell(&mut shell)?;
+    service.stop();
     if let Some(signal) = received_signal() {
         return Err(format!("SESSION_INTERRUPTED: signal {signal}"));
     }
@@ -387,13 +468,18 @@ fn authenticate_paired_master(
     no_input: bool,
     attempt: &mut Option<PasswordAttempt>,
     role: &str,
-    require_forward: bool,
+    forward_stage: ForwardStage,
 ) -> Result<Child, String> {
     let mut enrolled = false;
     loop {
-        let mut master = spawn_master(runtime, no_input, attempt.as_ref(), require_forward)
-            .map_err(|error| paired_stage_error(role, error))?;
-        match wait_for_master(runtime, &mut master, no_input) {
+        let mut master = spawn_master(
+            runtime,
+            no_input,
+            attempt.as_ref(),
+            matches!(forward_stage, ForwardStage::Transit | ForwardStage::Service),
+        )
+        .map_err(|error| paired_stage_error(role, error))?;
+        match wait_for_master(runtime, &mut master, no_input, forward_stage) {
             Ok(()) => return Ok(master),
             Err(error) => {
                 stop_master(runtime, &mut master);
@@ -425,7 +511,13 @@ fn paired_stage_error(role: &str, error: String) -> String {
     if error.starts_with("SESSION_INTERRUPTED") {
         return error;
     }
-    if role.eq_ignore_ascii_case("gateway") && (error.contains("forward") || error.contains("bind"))
+    if error.starts_with("SERVICE_BIND_FAILED") {
+        return format!("{}_SERVICE_BIND_FAILED: {error}", role.to_ascii_uppercase());
+    }
+    if role.eq_ignore_ascii_case("gateway")
+        && (error.starts_with("TRANSIT_BIND_FAILED")
+            || error.contains("forward")
+            || error.contains("bind"))
     {
         return format!("TRANSIT_BIND_FAILED: gateway transit forward failed: {error}");
     }
@@ -705,7 +797,12 @@ fn append_ssh_args(
     ]);
 }
 
-fn wait_for_master(runtime: &Runtime, master: &mut Child, no_input: bool) -> Result<(), String> {
+fn wait_for_master(
+    runtime: &Runtime,
+    master: &mut Child,
+    no_input: bool,
+    forward_stage: ForwardStage,
+) -> Result<(), String> {
     let started = SystemTime::now();
     loop {
         if let Some(signal) = received_signal() {
@@ -719,10 +816,28 @@ fn wait_for_master(runtime: &Runtime, master: &mut Child, no_input: bool) -> Res
             if !no_input && !stderr.is_empty() {
                 eprint!("{stderr}");
             }
-            return Err(classify_master_failure(status, &stderr, no_input));
+            return Err(classify_master_failure(
+                status,
+                &stderr,
+                no_input,
+                forward_stage,
+            ));
         }
         if control_master_ready(runtime) {
-            return Ok(());
+            if matches!(forward_stage, ForwardStage::Service) && !service_forwards_ready(runtime) {
+                if started
+                    .elapsed()
+                    .unwrap_or_default()
+                    .ge(&FORWARD_READY_TIMEOUT)
+                {
+                    return Err(
+                        "SERVICE_BIND_FAILED: timed out waiting for requested service listener"
+                            .to_string(),
+                    );
+                }
+            } else {
+                return Ok(());
+            }
         }
         if started.elapsed().unwrap_or_default().ge(&MASTER_TIMEOUT) {
             return Err(
@@ -731,6 +846,16 @@ fn wait_for_master(runtime: &Runtime, master: &mut Child, no_input: bool) -> Res
         }
         thread::sleep(POLL_INTERVAL);
     }
+}
+
+fn service_forwards_ready(runtime: &Runtime) -> bool {
+    runtime.forwards.iter().all(|forward| {
+        TcpStream::connect_timeout(
+            &std::net::SocketAddr::from(([127, 0, 0, 1], forward.local_port)),
+            Duration::from_millis(100),
+        )
+        .is_ok()
+    })
 }
 
 fn wait_for_shell(shell: &mut Child) -> Result<ExitStatus, String> {
@@ -789,7 +914,12 @@ fn read_child_stderr(child: &mut Child) -> String {
     output
 }
 
-fn classify_master_failure(status: ExitStatus, stderr: &str, no_input: bool) -> String {
+fn classify_master_failure(
+    status: ExitStatus,
+    stderr: &str,
+    no_input: bool,
+    forward_stage: ForwardStage,
+) -> String {
     if stderr.contains("REMOTE HOST IDENTIFICATION HAS CHANGED")
         || stderr.contains("Offending ")
         || stderr.contains("host key for .* has changed")
@@ -806,6 +936,26 @@ fn classify_master_failure(status: ExitStatus, stderr: &str, no_input: bool) -> 
         return "HOST_KEY_TRUST_REQUIRED: host key requires interactive confirmation".to_string();
     }
     let detail = stderr.lines().last().unwrap_or_default().trim();
+    if matches!(forward_stage, ForwardStage::Transit)
+        && (stderr.to_ascii_lowercase().contains("forward")
+            || stderr.to_ascii_lowercase().contains("bind"))
+    {
+        return if detail.is_empty() {
+            "TRANSIT_BIND_FAILED: gateway transit forward failed".to_string()
+        } else {
+            format!("TRANSIT_BIND_FAILED: {detail}")
+        };
+    }
+    if matches!(forward_stage, ForwardStage::Service)
+        && (stderr.to_ascii_lowercase().contains("forward")
+            || stderr.to_ascii_lowercase().contains("bind"))
+    {
+        return if detail.is_empty() {
+            "SERVICE_BIND_FAILED: requested service forward failed".to_string()
+        } else {
+            format!("SERVICE_BIND_FAILED: {detail}")
+        };
+    }
     if detail.is_empty() {
         format!("SSH_AUTH_FAILED: OpenSSH exited with {status}")
     } else {
@@ -1002,6 +1152,9 @@ fn save_replacement_for(
 #[derive(Clone, Copy)]
 enum RuntimeTransform<'a> {
     None,
+    Service {
+        forwards: &'a [ServiceForward],
+    },
     Gateway {
         transit_host: &'a str,
         transit_port: u16,
@@ -1010,11 +1163,24 @@ enum RuntimeTransform<'a> {
     Vm {
         local_port: u16,
         host_key_alias: &'a str,
+        forwards: &'a [ServiceForward],
     },
 }
 
 fn compile_config(entry: &HostEntry, selected_alias: &str) -> Result<String, String> {
     compile_config_with_transform(entry, selected_alias, RuntimeTransform::None)
+}
+
+fn compile_config_with_forwards(
+    entry: &HostEntry,
+    selected_alias: &str,
+    forwards: &[ServiceForward],
+) -> Result<String, String> {
+    compile_config_with_transform(
+        entry,
+        selected_alias,
+        RuntimeTransform::Service { forwards },
+    )
 }
 
 fn compile_gateway_config(
@@ -1040,6 +1206,7 @@ fn compile_vm_config(
     selected_alias: &str,
     local_port: u16,
     host_key_alias: &str,
+    forwards: &[ServiceForward],
 ) -> Result<String, String> {
     compile_config_with_transform(
         entry,
@@ -1047,10 +1214,28 @@ fn compile_vm_config(
         RuntimeTransform::Vm {
             local_port,
             host_key_alias,
+            forwards,
         },
     )
 }
 
+fn append_service_forwards(output: &mut String, forwards: &[ServiceForward]) {
+    for forward in forwards {
+        output.push_str("  LocalForward 127.0.0.1:");
+        output.push_str(&forward.local_port.to_string());
+        output.push(' ');
+        if forward.destination_host.contains(':') && !forward.destination_host.starts_with('[') {
+            output.push('[');
+            output.push_str(&forward.destination_host);
+            output.push(']');
+        } else {
+            output.push_str(&forward.destination_host);
+        }
+        output.push(':');
+        output.push_str(&forward.remote_port.to_string());
+        output.push('\n');
+    }
+}
 fn compile_config_with_transform(
     entry: &HostEntry,
     selected_alias: &str,
@@ -1183,9 +1368,11 @@ fn compile_config_with_transform(
                 "PAIR_ROUTE_CHANGED: approved gateway transit has {gateway_forward_matches} current LocalForward candidates"
             ));
         }
+        RuntimeTransform::Service { forwards } => append_service_forwards(&mut output, forwards),
         RuntimeTransform::Vm {
             local_port,
             host_key_alias,
+            forwards,
         } => {
             if !hostname_written {
                 output.push_str("  HostName 127.0.0.1\n");
@@ -1200,6 +1387,7 @@ fn compile_config_with_transform(
                 output.push_str(host_key_alias);
                 output.push('\n');
             }
+            append_service_forwards(&mut output, forwards);
         }
         RuntimeTransform::None | RuntimeTransform::Gateway { .. } => {}
     }
@@ -1527,9 +1715,14 @@ fn set_mode(path: &Path, mode: u32) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{compile_config, known_hosts_path};
+    use super::{
+        Runtime, compile_config, compile_config_with_forwards, known_hosts_path,
+        paired_stage_error, service_forwards_ready,
+    };
     use crate::discovery::{HostEntry, Provenance, SourceIdentity};
+    use crate::session::ServiceForward;
     use std::fs;
+    use std::net::TcpListener;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1573,6 +1766,70 @@ mod tests {
         assert!(!compiled.contains("##SSHX"));
         assert!(!compiled.contains("comment"));
         fs::remove_dir_all(directory).expect("fixture should be removed");
+    }
+
+    #[test]
+    fn runtime_config_adds_loopback_service_forwards_without_metadata_or_secrets() {
+        let directory = tempfile_directory();
+        let path = directory.join("config");
+        let text = concat!(
+            "##SSHX ID=secret\n",
+            "Host exact\n",
+            "  HostName example.test\n",
+            "  ##PORT 5432\n",
+            "  ##SSHX SERVICE 5432 HOST=db.internal LOCAL=15432\n",
+            "  ##PASSWORD never-copy-this\n",
+        );
+        fs::write(&path, text).expect("fixture should be written");
+        let mut selected = entry(path.clone(), &["exact"]);
+        selected.source.byte_start = text.find("Host exact").expect("host should exist");
+        selected.source.byte_end = text.len();
+        let forwards = [crate::session::ServiceForward {
+            id: "5432#1".to_string(),
+            remote_port: 5432,
+            destination_host: "db.internal".to_string(),
+            local_port: 15432,
+        }];
+        let compiled = compile_config_with_forwards(&selected, "exact", &forwards)
+            .expect("service config should compile");
+        assert!(compiled.contains("LocalForward 127.0.0.1:15432 db.internal:5432"));
+        assert!(!compiled.contains("##SSHX"));
+        assert!(!compiled.contains("##PORT"));
+        assert!(!compiled.contains("never-copy-this"));
+        assert_eq!(
+            paired_stage_error(
+                "VM",
+                "SERVICE_BIND_FAILED: requested service forward failed".to_string()
+            ),
+            "VM_SERVICE_BIND_FAILED: SERVICE_BIND_FAILED: requested service forward failed"
+        );
+        fs::remove_dir_all(directory).expect("fixture should be removed");
+    }
+
+    #[test]
+    fn service_readiness_requires_each_local_listener() {
+        let directory = tempfile_directory();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener should bind");
+        let port = listener.local_addr().expect("listener address").port();
+        let runtime = Runtime {
+            dir: directory.clone(),
+            config: directory.join("config"),
+            socket: directory.join("master.sock"),
+            alias: "exact".to_string(),
+            known_hosts: directory.join("known_hosts"),
+            entry: entry(directory.join("source"), &["exact"]),
+            configured_password: None,
+            forwards: vec![ServiceForward {
+                id: "5432#1".to_string(),
+                remote_port: 5432,
+                destination_host: "127.0.0.1".to_string(),
+                local_port: port,
+            }],
+        };
+        assert!(service_forwards_ready(&runtime));
+        drop(listener);
+        assert!(!service_forwards_ready(&runtime));
+        drop(runtime);
     }
 
     #[test]
