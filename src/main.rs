@@ -2,8 +2,8 @@ use serde::Serialize;
 use sshx::discovery::{HostEntry, discover_roots, scope_for_path};
 use sshx::mutation::{self, CreateRequest, MutationKind, UpdateRequest};
 use sshx::output::{
-    OutputFormat, render_create, render_diagnostic, render_edit, render_human, render_machine,
-    render_pair, render_pairs, render_tunnels,
+    OutputFormat, render_create, render_diagnostic, render_doctor, render_edit, render_human,
+    render_machine, render_pair, render_pairs, render_tunnels,
 };
 use sshx::settings::{self, RegisteredRoot};
 use std::env;
@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::process;
 const USAGE: &str = "Usage: sshx [--version]";
 const HOST_USAGE: &str = "Usage: sshx [--config PATH] host list [--format human|json|yaml]\n       sshx [--config PATH] host show SELECTOR [--format human|json|yaml]\n       sshx [--config PATH] host create --scope SCOPE --file PATH --alias ALIAS --hostname HOSTNAME [options]\n       sshx [--config PATH] host update SELECTOR [options]\n       sshx [--config PATH] host rename SELECTOR --alias ALIAS [options]\n       sshx [--config PATH] host delete SELECTOR [options]";
-const SETUP_USAGE: &str = "Usage: sshx setup [--personal PATH] [--work PATH] [--project NAME]\n       sshx connect [SELECTOR] [--id ID] [--source PATH --line NUMBER] [--password-fd FD] [--gateway-password-fd FD --vm-password-fd FD] [--bind] [--forward REMOTE[=LOCAL]] [--no-input]\n       sshx tunnel direct start [SELECTOR] [-L SPEC] [-R SPEC] [-D SPEC] [--allow-bind]\n       sshx tunnel paired start [SELECTOR] [--bind] [--forward REMOTE[=LOCAL]] [--no-input]\n       sshx tunnel direct list|status ID|stop ID|restart ID\n       sshx tunnel paired list|status ID|stop ID|restart ID\n       sshx pair setup [GATEWAY] [VM] [--gateway ID] [--vm ID] [--transit-host HOST --transit-port PORT]";
+const SETUP_USAGE: &str = "Usage: sshx setup [--personal PATH] [--work PATH] [--project NAME]\n       sshx doctor [--format human|json|yaml]\n       sshx connect [SELECTOR] [--id ID] [--source PATH --line NUMBER] [--password-fd FD] [--gateway-password-fd FD --vm-password-fd FD] [--bind] [--forward REMOTE[=LOCAL]] [--no-input]\n       sshx tunnel direct start [SELECTOR] [-L SPEC] [-R SPEC] [-D SPEC] [--allow-bind]\n       sshx tunnel paired start [SELECTOR] [--bind] [--forward REMOTE[=LOCAL]] [--no-input]\n       sshx tunnel direct list|status ID|stop ID|restart ID\n       sshx tunnel paired list|status ID|stop ID|restart ID\n       sshx pair setup [GATEWAY] [VM] [--gateway ID] [--vm ID] [--transit-host HOST --transit-port PORT]";
 
 fn main() {
     match run(env::args_os().skip(1).collect()) {
@@ -47,6 +47,26 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
         return run_setup(&cli);
     }
     let home = home_dir()?;
+    if matches!(&cli.command, Command::Doctor) {
+        let (roots, settings_error) = doctor_roots(&cli, &home);
+        let report = sshx::doctor::run(
+            &home,
+            &roots,
+            settings_error.as_deref(),
+            cli.password_stdin
+                || cli.password_fd.is_some()
+                || cli.gateway_password_fd.is_some()
+                || cli.vm_password_fd.is_some(),
+            sshx::doctor::Selection {
+                id: cli.id.clone(),
+                source: cli.source.clone(),
+                line: cli.line,
+                alias: cli.alias.clone(),
+            },
+        );
+        print!("{}", render_doctor(&report, cli.format)?);
+        return Ok(());
+    }
     match &cli.command {
         Command::TunnelList => {
             let response = sshx::tunnel::list(&home)?;
@@ -230,6 +250,7 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
             Ok(())
         }
         Command::Setup
+        | Command::Doctor
         | Command::CreateHost
         | Command::UpdateHost(_)
         | Command::RenameHost(_)
@@ -980,6 +1001,59 @@ fn render_roots(roots: &[RegisteredRoot], format: OutputFormat) -> Result<(), St
     Ok(())
 }
 
+fn doctor_roots(cli: &Cli, home: &std::path::Path) -> (Vec<RegisteredRoot>, Option<String>) {
+    if !cli.roots.is_empty() {
+        return (
+            cli.roots
+                .iter()
+                .map(|root| RegisteredRoot {
+                    scope: root.scope.clone(),
+                    path: settings::normalize_path(&root.path, home),
+                    project: root.project.clone(),
+                })
+                .collect(),
+            None,
+        );
+    }
+    if let Some(config) = &cli.config {
+        let path = settings::normalize_path(config, home);
+        return (
+            vec![RegisteredRoot {
+                scope: scope_for_path(&path),
+                path,
+                project: cli.projects.first().cloned(),
+            }],
+            None,
+        );
+    }
+    match settings::load(home) {
+        Ok(roots) if !roots.is_empty() => (roots, None),
+        Ok(_) => {
+            let detected = settings::auto_detect(home);
+            if !detected.is_empty() {
+                (detected, None)
+            } else {
+                (
+                    vec![RegisteredRoot {
+                        scope: "personal".to_string(),
+                        path: home.join(".ssh/config"),
+                        project: None,
+                    }],
+                    None,
+                )
+            }
+        }
+        Err(error) => (
+            vec![RegisteredRoot {
+                scope: "personal".to_string(),
+                path: home.join(".ssh/config"),
+                project: None,
+            }],
+            Some(error),
+        ),
+    }
+}
+
 fn registered_roots(cli: &Cli) -> Result<Vec<RegisteredRoot>, String> {
     if let Some(config) = &cli.config {
         let path = settings::normalize_path(config, &home_dir()?);
@@ -1253,6 +1327,7 @@ enum Command {
     },
     PairList,
     PairValidate,
+    Doctor,
     Setup,
     TunnelStart(Option<String>),
     TunnelDirectStart(Option<String>),
@@ -1678,6 +1753,7 @@ impl Cli {
             }
             [pair, list] if pair == "pair" && list == "list" => Command::PairList,
             [pair, validate] if pair == "pair" && validate == "validate" => Command::PairValidate,
+            [doctor] if doctor == "doctor" => Command::Doctor,
             [connect] if connect == "connect" => Command::Connect(None),
             [connect, selector] if connect == "connect" => Command::Connect(Some(selector.clone())),
             [setup] if setup == "setup" => Command::Setup,
@@ -1753,7 +1829,7 @@ impl Cli {
                 }
                 Command::PairSetup { gateway, vm }
             }
-            Command::PairList | Command::PairValidate => command,
+            Command::PairList | Command::PairValidate | Command::Doctor => command,
             Command::TunnelStart(selector) => Command::TunnelStart(selector),
             Command::TunnelDirectStart(selector) => Command::TunnelDirectStart(selector),
             Command::TunnelPairedStart(selector) => Command::TunnelPairedStart(selector),

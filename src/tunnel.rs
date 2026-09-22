@@ -131,6 +131,38 @@ pub struct TunnelResponse {
     pub tunnels: Vec<TunnelView>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct DoctorTunnel {
+    pub view: TunnelView,
+    pub recorded_state: String,
+    pub control_dir: PathBuf,
+    pub control_socket: PathBuf,
+    pub runtime_config: PathBuf,
+    pub control_dir_exists: bool,
+    pub control_socket_exists: bool,
+    pub runtime_config_exists: bool,
+}
+pub(crate) fn doctor_tunnels(home: &Path) -> Result<Vec<DoctorTunnel>, String> {
+    let root = registry_root(home);
+    let registry = read_registry(&root)?;
+    let mut tunnels = Vec::with_capacity(registry.tunnels.len());
+    for record in registry.tunnels {
+        let view = view_at(&root, &record);
+        let path_state = |path: &Path| fs::symlink_metadata(path).is_ok();
+        tunnels.push(DoctorTunnel {
+            view,
+            recorded_state: record.state.clone(),
+            control_dir: PathBuf::from(&record.control_dir),
+            control_socket: PathBuf::from(&record.control_socket),
+            runtime_config: PathBuf::from(&record.runtime_config),
+            control_dir_exists: path_state(Path::new(&record.control_dir)),
+            control_socket_exists: path_state(Path::new(&record.control_socket)),
+            runtime_config_exists: path_state(Path::new(&record.runtime_config)),
+        });
+    }
+    Ok(tunnels)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn start(
     entry: &HostEntry,
@@ -990,6 +1022,10 @@ fn view(record: &RegistryEntry) -> TunnelView {
     let root = Path::new(&record.control_dir)
         .parent()
         .unwrap_or_else(|| Path::new("/"));
+    view_at(root, record)
+}
+
+fn view_at(root: &Path, record: &RegistryEntry) -> TunnelView {
     let (master_status, gateway_master_status, vm_master_status, _control_safe, config_safe) =
         if record.kind == "paired" {
             let control_safe = validate_pair_control_reference(root, record).is_ok();

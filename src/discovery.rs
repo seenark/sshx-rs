@@ -583,7 +583,7 @@ fn split_lines(text: &str) -> Vec<Line> {
     lines
 }
 
-fn tokenize(line: &str) -> Vec<String> {
+pub(crate) fn tokenize(line: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut token = String::new();
     let mut quote = None;
@@ -659,7 +659,7 @@ fn directive_tokens(line: &str) -> Vec<String> {
     tokens
 }
 
-fn expand_include(pattern: &str, base: &Path) -> Vec<PathBuf> {
+pub(crate) fn expand_include(pattern: &str, base: &Path) -> Vec<PathBuf> {
     let pattern = expand_tilde(pattern);
     let pattern = PathBuf::from(pattern);
     let pattern = if pattern.is_absolute() {

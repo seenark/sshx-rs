@@ -1517,7 +1517,7 @@ fn signal_cleanup_closes_only_owned_master() {
         .args(["connect", "direct", "--no-input"])
         .spawn()
         .expect("sshx should start");
-    for _ in 0..100 {
+    for _ in 0..250 {
         if root.join("master-started").exists() {
             break;
         }

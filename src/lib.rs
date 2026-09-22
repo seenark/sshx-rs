@@ -1,5 +1,6 @@
 pub mod connect;
 pub mod discovery;
+pub mod doctor;
 pub mod mutation;
 pub mod output;
 pub mod pair;

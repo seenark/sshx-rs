@@ -354,6 +354,52 @@ pub fn render_tunnels(
     Ok(rendered)
 }
 
+pub fn render_doctor(
+    report: &crate::doctor::DoctorReport,
+    format: OutputFormat,
+) -> Result<String, String> {
+    if format.is_machine() {
+        let mut rendered = match format {
+            OutputFormat::Json => serde_json::to_string_pretty(report)
+                .map_err(|error| format!("cannot render JSON output: {error}"))?,
+            OutputFormat::Yaml => serde_yaml::to_string(report)
+                .map_err(|error| format!("cannot render YAML output: {error}"))?,
+            OutputFormat::Human => unreachable!(),
+        };
+        if !rendered.ends_with('\n') {
+            rendered.push('\n');
+        }
+        return Ok(rendered);
+    }
+
+    let mut rendered = String::from("Doctor: local configuration and runtime checks\n");
+    rendered.push_str(
+        "Evidence: local and fixture checks only; remote server validation: not run.\n\n",
+    );
+    for root in &report.roots {
+        rendered.push_str(&format!(
+            "root {}: {} ({})\n",
+            root.scope, root.path, root.status
+        ));
+    }
+    for known_hosts in &report.known_hosts {
+        rendered.push_str(&format!(
+            "known-hosts {}: {} ({})\n",
+            known_hosts.scope, known_hosts.path, known_hosts.status
+        ));
+    }
+    for finding in &report.findings {
+        rendered.push_str(&format!(
+            "[{}] {} {}: {}\n  Next: {}\n",
+            finding.severity, finding.stage, finding.code, finding.message, finding.guidance
+        ));
+    }
+    if report.findings.is_empty() {
+        rendered.push_str("No findings.\n");
+    }
+    Ok(rendered)
+}
+
 #[cfg(test)]
 mod tests {
     use super::OutputFormat;

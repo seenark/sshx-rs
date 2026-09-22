@@ -1728,7 +1728,7 @@ enum RuntimeTransform<'a> {
         forwards: &'a [ServiceForward],
     },
 }
-fn compile_config(entry: &HostEntry, selected_alias: &str) -> Result<String, String> {
+pub(crate) fn compile_config(entry: &HostEntry, selected_alias: &str) -> Result<String, String> {
     compile_config_with_transform(entry, selected_alias, RuntimeTransform::None)
 }
 
