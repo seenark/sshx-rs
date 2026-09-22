@@ -1,0 +1,119 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - name: Install Linux prerequisites
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y openssh-client sshpass
+      - name: Install macOS prerequisites
+        if: runner.os == 'macOS'
+        run: |
+          brew install sshpass
+          command -v ssh
+          command -v sshpass
+      - run: mise exec -- cargo fmt --all -- --check
+      - run: mise exec -- cargo clippy --all-targets --all-features -- -D warnings
+      - run: mise exec -- cargo test --all-targets --all-features
+      - run: mise exec -- ./scripts/test-release-package.sh
+
+  package:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            target: aarch64-apple-darwin
+          - runner: macos-13
+            target: x86_64-apple-darwin
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - name: Check tag matches package version
+        id: version
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          package_version="$(mise exec -- cargo metadata --no-deps --format-version=1 | python3 -c 'import json, sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+          test "$version" = "$package_version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Install target
+        run: mise exec -- rustup target add "${{ matrix.target }}"
+      - name: Build release binary
+        run: mise exec -- cargo build --locked --release --target "${{ matrix.target }}"
+      - name: Package release asset
+        run: ./scripts/package-release.sh "${{ steps.version.outputs.version }}" "${{ matrix.target }}" dist
+      - name: Verify release asset
+        run: ./scripts/verify-release-archive.sh "${{ steps.version.outputs.version }}" "${{ matrix.target }}" dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test "$(find dist -type f | wc -l | tr -d ' ')" -eq 8
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --verify-tag \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes
+
+  mise-smoke:
+    needs: publish
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      HOME: ${{ runner.temp }}/sshx-mise-home
+      MISE_CONFIG_DIR: ${{ runner.temp }}/sshx-mise-config
+      MISE_DATA_DIR: ${{ runner.temp }}/sshx-mise-data
+      MISE_CACHE_DIR: ${{ runner.temp }}/sshx-mise-cache
+      MISE_STATE_DIR: ${{ runner.temp }}/sshx-mise-state
+      MISE_YES: '1'
+    steps:
+      - uses: jdx/mise-action@v2
+      - name: Install published release in fresh mise environment
+        run: |
+          mkdir -p "$HOME" "$MISE_CONFIG_DIR" "$MISE_DATA_DIR" "$MISE_CACHE_DIR" "$MISE_STATE_DIR"
+          version="${GITHUB_REF_NAME#v}"
+          mise ls-remote github:seenark/sshx-rs
+          mise use -g github:seenark/sshx-rs
+          actual="$(mise exec -- sshx --version)"
+          test "$actual" = "sshx $version"

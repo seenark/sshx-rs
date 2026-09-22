@@ -4,7 +4,7 @@
 
 **Blocked by:** 13: Diagnose configuration and runtime state.
 
-**Status:** ready-for-agent
+**Status:** claimed
 
 - [ ] The repository glossary and ADRs record the approved domain terms, OpenSSH engine choice, filesystem source of truth, and tunnel ownership decision.
 - [ ] Setup and troubleshooting documentation covers roots, Pair setup, direct and paired shells, service forwards, standalone lifecycle, permissions, authentication, host keys, ports, and route failures.
