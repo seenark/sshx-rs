@@ -2,9 +2,11 @@
 
 **What to build:** Let exact HostEntries use native OpenSSH `ProxyCommand` behavior for direct interactive sessions and direct standalone tunnels, including Cloudflare commands that contain OpenSSH `%` tokens.
 
-**Blocked by:** None (can start immediately).
+Type: task
 
-**Status:** resolved
+Status: resolved
+
+Blocked by: none (can start immediately)
 
 - [x] A `ProxyCommand` inside the exact selected HostEntry block is copied into the private runtime configuration without parsing, rewriting, expanding, or executable allowlisting.
 - [x] OpenSSH receives and expands tokens such as `%h`, `%p`, and `%r` for direct interactive connections.
@@ -17,11 +19,11 @@
 
 ## Answer
 
-Integrated backend commit `9b34bb8c332975d6a3aa7c781118be8f3b9eb364` as `3505abe`. Exact HostEntry `ProxyCommand` text now reaches direct session and standalone tunnel runtime configs unchanged, including OpenSSH `%` tokens; Pair routes reject the directive with a route conflict, while `ProxyJump` remains unsupported.
+The direct compiler now captures `ProxyCommand` arguments from the raw directive before inline-comment handling, preserving `#` and OpenSSH `%h`, `%p`, and `%r` tokens unchanged. Direct sessions and standalone tunnels keep this behavior; Pair routes still reject `ProxyCommand`, and `ProxyJump` remains unsupported.
 
-Evidence from backend verification:
+Evidence:
 
-- `cargo test --test proxycommand` — 6 passed.
-- `cargo test --lib connect` — 7 passed.
-- Full suite — 71 passed across 7 suites.
+- `cargo test --test proxycommand` — 7 passed.
+- `cargo test --test cli direct_connect_compiles_exact_block_and_uses_owned_master -- --exact` — passed.
+- `cargo test --all-targets --all-features` — passed.
 - `cargo check --all-targets`, clippy with `-D warnings`, and `cargo fmt --all -- --check` — passed.

@@ -1,7 +1,7 @@
 mod help;
 mod picker;
 use serde::Serialize;
-use sshx::discovery::{HostEntry, discover_roots, scope_for_path};
+use sshx::discovery::{Catalog, DiscoveryRoot, HostEntry, discover_roots, scope_for_path};
 use sshx::mutation::{self, CreateRequest, MutationKind, UpdateRequest};
 use sshx::output::{
     OutputFormat, render_create, render_diagnostic, render_doctor, render_edit, render_human,
@@ -28,7 +28,7 @@ fn main() {
     }
 }
 
-fn help_path(args: &[OsString]) -> Option<Vec<String>> {
+fn help_path(args: &[OsString]) -> Option<Result<help::HelpPage, String>> {
     let mut tokens = Vec::new();
     let mut index = 0;
     while index < args.len() {
@@ -47,74 +47,16 @@ fn help_path(args: &[OsString]) -> Option<Vec<String>> {
 
     let command_tokens = command_path(&tokens);
     if command_tokens.first().map(String::as_str) == Some("help") {
-        return Some(canonical_help_path(command_tokens[1..].to_vec()));
+        let path = command_tokens[1..].to_vec();
+        return Some(help::resolve(&path));
     }
     tokens
         .iter()
         .position(|token| matches!(token.as_str(), "-h" | "--help"))
-        .map(|position| canonical_help_path(command_path(&tokens[..position])))
-}
-
-fn canonical_help_path(path: Vec<String>) -> Vec<String> {
-    if matches!(
-        path.first().map(String::as_str),
-        Some("setup" | "doctor" | "connect")
-    ) {
-        return path.into_iter().take(1).collect();
-    }
-    if path.first().map(String::as_str) == Some("tunnel") {
-        match path.as_slice() {
-            [tunnel] if tunnel == "tunnel" => return path,
-            [tunnel, group]
-                if tunnel == "tunnel" && matches!(group.as_str(), "direct" | "paired") =>
-            {
-                return path;
-            }
-            [tunnel, command, ..]
-                if tunnel == "tunnel"
-                    && matches!(
-                        command.as_str(),
-                        "start" | "list" | "status" | "stop" | "restart"
-                    ) =>
-            {
-                return vec!["tunnel".to_string(), command.clone()];
-            }
-            [tunnel, group, command, ..]
-                if tunnel == "tunnel"
-                    && matches!(group.as_str(), "direct" | "paired")
-                    && matches!(
-                        command.as_str(),
-                        "start" | "list" | "status" | "stop" | "restart"
-                    ) =>
-            {
-                return vec!["tunnel".to_string(), group.clone(), command.clone()];
-            }
-            _ => {}
-        }
-    }
-    match path.as_slice() {
-        [host, command, ..]
-            if host == "host"
-                && matches!(
-                    command.as_str(),
-                    "list" | "show" | "create" | "update" | "rename" | "delete"
-                ) =>
-        {
-            vec![host.clone(), command.clone()]
-        }
-        [pair, command, ..]
-            if pair == "pair"
-                && matches!(command.as_str(), "setup" | "create" | "list" | "validate") =>
-        {
-            let command = if command == "create" {
-                "setup"
-            } else {
-                command.as_str()
-            };
-            vec![pair.clone(), command.to_string()]
-        }
-        _ => path,
-    }
+        .map(|position| {
+            let path = command_path(&tokens[..position]);
+            help::resolve(&path)
+        })
 }
 
 fn command_path(tokens: &[String]) -> Vec<String> {
@@ -213,8 +155,8 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
         println!("{}", sshx::VERSION);
         return Ok(());
     }
-    if let Some(path) = help_path(&args) {
-        println!("{}", help::render(&path)?);
+    if let Some(page) = help_path(&args) {
+        println!("{}", help::render_page(page?));
         return Ok(());
     }
 
@@ -285,7 +227,7 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
         return run_pair(&cli, &roots);
     }
     let configured = settings::discovery_roots(&roots);
-    let catalog = discover_roots(&configured).map_err(|error| error.to_string())?;
+    let catalog = discover_with_permission_repair(&configured, cli.no_input)?;
     let mut diagnostics = catalog.diagnostics.clone();
     diagnostics.extend(sshx::pair::diagnostics(&catalog.entries));
     for diagnostic in &diagnostics {
@@ -465,6 +407,33 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
     }
 }
 
+fn discover_with_permission_repair(
+    configured: &[DiscoveryRoot],
+    no_input: bool,
+) -> Result<Catalog, String> {
+    match discover_roots(configured) {
+        Ok(catalog) => Ok(catalog),
+        Err(error) => {
+            let message = error.to_string();
+            if !message.starts_with("cannot read config ") {
+                return Err(message);
+            }
+            let mut repaired = false;
+            for root in configured {
+                if !message.contains(root.path.to_string_lossy().as_ref()) {
+                    continue;
+                }
+                repaired |= sshx::connect::repair_discovery_permissions(&root.path, no_input)?;
+            }
+            if repaired {
+                discover_roots(configured).map_err(|error| error.to_string())
+            } else {
+                Err(message)
+            }
+        }
+    }
+}
+
 fn requested_forwards(
     entry: &HostEntry,
     cli: &Cli,
@@ -493,12 +462,12 @@ fn validate_connect_without_catalog(cli: &Cli) -> Result<(), String> {
     if selector.is_some() || cli.id.is_some() {
         return Ok(());
     }
-    if cli.source.is_some() != cli.line.is_some() {
+    if cli.location.source.is_some() != cli.location.line.is_some() {
         return Err(
             "SELECTOR_INCOMPLETE: --source and --line must be provided together".to_string(),
         );
     }
-    if cli.source.is_some() {
+    if cli.location.source.is_some() {
         return Err("SELECTOR_INCOMPLETE: alias is required with --source and --line".to_string());
     }
     if cli.no_input {
@@ -524,7 +493,7 @@ fn render_entries(
 fn run_pair(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), String> {
     let configured = settings::discovery_roots(roots);
     mutation::validate_mutation_roots(&configured)?;
-    let initial = discover_roots(&configured).map_err(|error| error.to_string())?;
+    let initial = discover_with_permission_repair(&configured, cli.no_input)?;
     let mut journal_paths = configured
         .iter()
         .map(|root| root.path.clone())
@@ -536,7 +505,7 @@ fn run_pair(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), String> {
             .map(|entry| PathBuf::from(&entry.source.path)),
     );
     mutation::recover_pair_journals(&journal_paths)?;
-    let catalog = discover_roots(&configured).map_err(|error| error.to_string())?;
+    let catalog = discover_with_permission_repair(&configured, cli.no_input)?;
     let diagnostics = sshx::pair::diagnostics(&catalog.entries);
     for diagnostic in &catalog.diagnostics {
         eprintln!("{}", render_diagnostic(diagnostic));
@@ -554,16 +523,19 @@ fn run_pair(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), String> {
             let gateway = select_pair_entry(
                 &catalog.entries,
                 gateway.as_deref(),
-                cli.gateway_source.as_ref().or(cli.source.as_ref()),
-                cli.gateway_line.or(cli.line),
+                cli.gateway_location
+                    .source
+                    .as_ref()
+                    .or(cli.location.source.as_ref()),
+                cli.gateway_location.line.or(cli.location.line),
                 "gateway",
                 cli.no_input,
             )?;
             let vm = select_pair_entry(
                 &catalog.entries,
                 vm.as_deref(),
-                cli.vm_source.as_ref(),
-                cli.vm_line,
+                cli.vm_location.source.as_ref(),
+                cli.vm_location.line,
                 "VM",
                 cli.no_input,
             )?;
@@ -828,7 +800,7 @@ fn run_host_create(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), String> {
 fn run_host_edit(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), String> {
     let configured = settings::discovery_roots(roots);
     mutation::validate_mutation_roots(&configured)?;
-    let catalog = discover_roots(&configured).map_err(|error| error.to_string())?;
+    let catalog = discover_with_permission_repair(&configured, cli.no_input)?;
     for diagnostic in &catalog.diagnostics {
         eprintln!("{}", render_diagnostic(diagnostic));
     }
@@ -1266,8 +1238,8 @@ fn doctor_report(
             || cli.vm_password_fd.is_some(),
         sshx::doctor::Selection {
             id: cli.id.clone(),
-            source: cli.source.clone(),
-            line: cli.line,
+            source: cli.location.source.clone(),
+            line: cli.location.line,
             alias: cli.alias.clone(),
         },
     )
@@ -1308,7 +1280,10 @@ fn run_doctor_fix(
         "{}",
         render_doctor_with_repairs(&output_report, &results, cli.format)?
     );
-    if results.iter().any(|result| result.outcome == "failed") {
+    if results
+        .iter()
+        .any(|result| result.outcome == sshx::permissions::RepairOutcome::Failed)
+    {
         return Err("PERMISSION_REPAIR_FAILED: one or more repairs failed".to_string());
     }
     if !sshx::doctor::unsafe_permission_findings(&final_report).is_empty() {
@@ -1323,10 +1298,9 @@ fn skipped_repairs(
 ) -> Vec<sshx::permissions::RepairResult> {
     candidates
         .iter()
-        .cloned()
         .map(|candidate| sshx::permissions::RepairResult {
-            candidate,
-            outcome: "skipped".to_string(),
+            candidate: candidate.clone(),
+            outcome: sshx::permissions::RepairOutcome::Skipped,
             detail: detail.to_string(),
         })
         .collect()
@@ -1458,7 +1432,7 @@ fn registered_roots(cli: &Cli) -> Result<Vec<RegisteredRoot>, String> {
 }
 
 fn filter_entries<'a>(entries: &'a [HostEntry], cli: &Cli) -> Vec<&'a HostEntry> {
-    let source = cli.source.as_ref().map(|path| {
+    let source = cli.location.source.as_ref().map(|path| {
         settings::normalize_path(path, &home_dir().unwrap_or_else(|_| PathBuf::from(".")))
             .to_string_lossy()
             .into_owned()
@@ -1478,7 +1452,10 @@ fn filter_entries<'a>(entries: &'a [HostEntry], cli: &Cli) -> Vec<&'a HostEntry>
                 && source
                     .as_deref()
                     .is_none_or(|path| entry.source.path == path)
-                && cli.line.is_none_or(|line| entry.source.line_start == line)
+                && cli
+                    .location
+                    .line
+                    .is_none_or(|line| entry.source.line_start == line)
                 && cli.id.as_deref().is_none_or(|id| entry.id == id)
         })
         .collect()
@@ -1506,12 +1483,12 @@ fn select_connect_entry<'a>(
     picker_label: &str,
 ) -> Result<picker::Selection<'a>, String> {
     let selector = cli.id.as_deref().or(positional);
-    if cli.source.is_some() != cli.line.is_some() {
+    if cli.location.source.is_some() != cli.location.line.is_some() {
         return Err(
             "SELECTOR_INCOMPLETE: --source and --line must be provided together".to_string(),
         );
     }
-    if selector.is_none() && cli.source.is_some() {
+    if selector.is_none() && cli.location.source.is_some() {
         return Err("SELECTOR_INCOMPLETE: alias is required with --source and --line".to_string());
     }
     let Some(selector) = selector else {
@@ -1546,12 +1523,16 @@ fn select_connect_entry<'a>(
             positional.is_none_or(|alias| entry.aliases.iter().any(|candidate| candidate == alias))
         })
         .filter(|entry| {
-            cli.source.as_ref().is_none_or(|source| {
+            cli.location.source.as_ref().is_none_or(|source| {
                 let home = home_dir().unwrap_or_else(|_| PathBuf::from("."));
                 entry.source.path == settings::normalize_path(source, &home).to_string_lossy()
             })
         })
-        .filter(|entry| cli.line.is_none_or(|line| entry.source.line_start == line))
+        .filter(|entry| {
+            cli.location
+                .line
+                .is_none_or(|line| entry.source.line_start == line)
+        })
         .collect::<Vec<_>>();
 
     match matches.as_slice() {
@@ -1563,7 +1544,7 @@ fn select_connect_entry<'a>(
                 .unwrap_or_default();
             Ok(picker::Selection { entry, alias })
         }
-        [] if cli.source.is_some() => Err(format!(
+        [] if cli.location.source.is_some() => Err(format!(
             "HOST_MISMATCH: selector `{selector}` does not match source and Host line"
         )),
         [] => Err(format!(
@@ -2034,6 +2015,12 @@ struct RootRequest {
     project: Option<String>,
 }
 
+#[derive(Debug, Default)]
+struct SourceLocation {
+    source: Option<PathBuf>,
+    line: Option<usize>,
+}
+
 #[derive(Debug)]
 struct Cli {
     config: Option<PathBuf>,
@@ -2042,8 +2029,7 @@ struct Cli {
     command: Command,
     scopes: Vec<String>,
     projects: Vec<String>,
-    source: Option<PathBuf>,
-    line: Option<usize>,
+    location: SourceLocation,
     id: Option<String>,
     alias: Option<String>,
     hostname: Option<String>,
@@ -2068,10 +2054,8 @@ struct Cli {
     no_input: bool,
     bind: bool,
     forwards: Vec<String>,
-    gateway_source: Option<PathBuf>,
-    gateway_line: Option<usize>,
-    vm_source: Option<PathBuf>,
-    vm_line: Option<usize>,
+    gateway_location: SourceLocation,
+    vm_location: SourceLocation,
     transit_host: Option<String>,
     transit_port: Option<u16>,
     roots: Vec<RootRequest>,
@@ -2084,8 +2068,7 @@ impl Cli {
         let mut action = None;
         let mut scopes = Vec::new();
         let mut projects = Vec::new();
-        let mut source = None;
-        let mut line = None;
+        let mut location = SourceLocation::default();
         let mut id = None;
         let mut alias = None;
         let mut hostname = None;
@@ -2111,10 +2094,8 @@ impl Cli {
         let mut no_input = false;
         let mut bind = false;
         let mut forwards = Vec::new();
-        let mut gateway_source = None;
-        let mut gateway_line = None;
-        let mut vm_source = None;
-        let mut vm_line = None;
+        let mut gateway_location = SourceLocation::default();
+        let mut vm_location = SourceLocation::default();
         let mut gateway_selector = None;
         let mut vm_selector = None;
         let mut transit_host = None;
@@ -2152,9 +2133,9 @@ impl Cli {
             } else if text == "--project" {
                 projects.push(next(text)?);
             } else if text == "--source" || text == "--source-file" {
-                source = Some(PathBuf::from(next(text)?));
+                location.source = Some(PathBuf::from(next(text)?));
             } else if text == "--line" || text == "--host-line" {
-                line = Some(
+                location.line = Some(
                     next(text)?
                         .parse()
                         .map_err(|_| "--line requires a number".to_string())?,
@@ -2165,17 +2146,17 @@ impl Cli {
             } else if text == "--vm" || text == "--vm-id" || text == "--vm-selector" {
                 vm_selector = Some(next(text)?);
             } else if text == "--gateway-source" {
-                gateway_source = Some(PathBuf::from(next(text)?));
+                gateway_location.source = Some(PathBuf::from(next(text)?));
             } else if text == "--gateway-line" {
-                gateway_line = Some(
+                gateway_location.line = Some(
                     next(text)?
                         .parse()
                         .map_err(|_| "--gateway-line requires a number".to_string())?,
                 );
             } else if text == "--vm-source" {
-                vm_source = Some(PathBuf::from(next(text)?));
+                vm_location.source = Some(PathBuf::from(next(text)?));
             } else if text == "--vm-line" {
-                vm_line = Some(
+                vm_location.line = Some(
                     next(text)?
                         .parse()
                         .map_err(|_| "--vm-line requires a number".to_string())?,
@@ -2489,7 +2470,11 @@ impl Cli {
                 Command::Connect(selector.or(host).or_else(|| alias.clone()))
             }
             Command::CreateHost => {
-                if host.is_some() || id.is_some() || source.is_some() || line.is_some() {
+                if host.is_some()
+                    || id.is_some()
+                    || location.source.is_some()
+                    || location.line.is_some()
+                {
                     return Err(
                         "SELECTOR_CONFLICT: host create does not accept host selectors".to_string(),
                     );
@@ -2573,8 +2558,7 @@ impl Cli {
             command,
             scopes,
             projects,
-            source,
-            line,
+            location,
             id,
             alias,
             hostname,
@@ -2599,10 +2583,8 @@ impl Cli {
             no_input,
             bind,
             forwards,
-            gateway_source,
-            gateway_line,
-            vm_source,
-            vm_line,
+            gateway_location,
+            vm_location,
             transit_host,
             transit_port,
             roots,

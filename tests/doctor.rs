@@ -433,22 +433,22 @@ fn repair_plan_covers_only_eligible_private_paths() {
     let planned = report
         .repairs
         .iter()
-        .map(|candidate| (candidate.path.clone(), candidate.file))
+        .map(|candidate| (candidate.path.clone(), candidate.target))
         .collect::<Vec<_>>();
     assert!(
-        planned.contains(&(settings_path.clone(), true)),
+        planned.contains(&(settings_path.clone(), permissions::PermissionTarget::File)),
         "settings should be planned: {planned:?}"
     );
     assert!(
-        planned.contains(&(app_dir.clone(), false)),
+        planned.contains(&(app_dir.clone(), permissions::PermissionTarget::Directory)),
         "app dir should be planned: {planned:?}"
     );
     assert!(
-        planned.contains(&(work_hosts.clone(), true)),
+        planned.contains(&(work_hosts.clone(), permissions::PermissionTarget::File)),
         "work known-hosts should be planned: {planned:?}"
     );
     assert!(
-        planned.contains(&(config.clone(), true)),
+        planned.contains(&(config.clone(), permissions::PermissionTarget::File)),
         "password-bearing config should be planned: {planned:?}"
     );
     assert!(
@@ -551,16 +551,12 @@ fn apply_all_repairs_exact_modes_and_continues_after_failure() {
         .iter()
         .find(|result| result.candidate.path == known_hosts)
         .expect("removed path should still be reported");
-    assert_eq!(missing.outcome, "skipped");
+    assert_eq!(missing.outcome, permissions::RepairOutcome::Skipped);
     for result in &results {
-        if result.outcome == "fixed" {
+        if result.outcome == permissions::RepairOutcome::Fixed {
             assert_eq!(
                 mode_of(&result.candidate.path),
-                if result.candidate.file {
-                    permissions::PRIVATE_FILE_MODE
-                } else {
-                    permissions::PRIVATE_DIR_MODE
-                }
+                result.candidate.target.private_mode()
             );
         }
     }
@@ -593,7 +589,10 @@ fn settings_save_creates_private_modes_regardless_of_umask() {
 
 #[test]
 fn manual_chmod_hint_is_shell_quoted() {
-    let hint = permissions::manual_chmod_command(&PathBuf::from("/tmp/my config's/id_rsa"), true);
+    let hint = permissions::manual_chmod_command(
+        &PathBuf::from("/tmp/my config's/id_rsa"),
+        permissions::PermissionTarget::File,
+    );
     assert_eq!(hint, "chmod 600 '/tmp/my config'\\''s/id_rsa'");
 }
 #[test]
@@ -604,7 +603,7 @@ fn permission_contract_rejects_shared_files_and_symlink_components() {
     let hard_link = home.join("shared-copy");
     fs::hard_link(&shared, &hard_link).expect("hard link should be created");
     assert!(
-        permissions::assess(&shared, true).is_err(),
+        permissions::assess(&shared, permissions::PermissionTarget::File).is_err(),
         "shared file must not be eligible"
     );
 
@@ -616,7 +615,7 @@ fn permission_contract_rejects_shared_files_and_symlink_components() {
     std::os::unix::fs::symlink(&real_dir, &symlink_dir).expect("symlink should be created");
     let through_symlink = symlink_dir.join("target");
     assert!(
-        permissions::assess(&through_symlink, true).is_err(),
+        permissions::assess(&through_symlink, permissions::PermissionTarget::File).is_err(),
         "path through symlink must not be eligible"
     );
     fs::remove_dir_all(root).unwrap();

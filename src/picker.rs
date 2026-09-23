@@ -56,114 +56,139 @@ pub fn select<'a>(entries: &[&'a HostEntry], label: &str) -> Result<Selection<'a
     if entries.is_empty() {
         return Err("HOST_NOT_FOUND: no hosts match current filters".to_string());
     }
-    if !io::stdin().is_terminal() {
-        return Err(format!(
+
+    with_terminal(
+        format!(
             "HOST_REQUIRED: {label} requires a HostEntry selector with a usable interactive terminal"
-        ));
-    }
+        ),
+        |input, error, fd| {
+            let mut query = String::new();
+            let mut selected = 0usize;
 
-    let input = io::stdin();
-    let fd = input.as_raw_fd();
-    let _raw_mode = RawMode::enter(fd)?;
-    let mut input = input;
-    let mut error = io::stderr();
-    let mut query = String::new();
-    let mut selected = 0usize;
-
-    loop {
-        let rows = matching_rows(entries, &query);
-        if rows.is_empty() {
-            selected = 0;
-        } else {
-            selected = selected.min(rows.len() - 1);
-        }
-        render(&mut error, &rows, &query, selected, label)?;
-
-        let mut byte = [0u8; 1];
-        input
-            .read_exact(&mut byte)
-            .map_err(|error| format!("HOST_REQUIRED: cannot read picker input: {error}"))?;
-        match byte[0] {
-            b'\r' | b'\n' => {
-                if let Some(row) = rows.get(selected) {
-                    clear(&mut error)?;
-                    return Ok(Selection {
-                        entry: row.entry,
-                        alias: row.alias,
-                    });
-                }
-            }
-            0x03 | 0x1b => {
-                if byte[0] == 0x1b && arrow_key(&mut input)? {
-                    match read_arrow(&mut input)? {
-                        Some(b'A') if selected > 0 => selected -= 1,
-                        Some(b'B') if selected + 1 < rows.len() => selected += 1,
-                        _ => {}
-                    }
+            loop {
+                let rows = matching_rows(entries, &query);
+                if rows.is_empty() {
+                    selected = 0;
                 } else {
-                    clear(&mut error)?;
-                    return Err(CANCELLED.to_string());
+                    selected = selected.min(rows.len() - 1);
+                }
+                render(error, &rows, &query, selected, label)?;
+
+                match read_event(input, fd, "HOST_REQUIRED", "HOST_REQUIRED")? {
+                    PickerEvent::Enter => {
+                        if let Some(row) = rows.get(selected) {
+                            return Ok(Selection {
+                                entry: row.entry,
+                                alias: row.alias,
+                            });
+                        }
+                    }
+                    PickerEvent::Cancel => return Err(CANCELLED.to_string()),
+                    PickerEvent::Up => selected = selected.saturating_sub(1),
+                    PickerEvent::Down if selected + 1 < rows.len() => selected += 1,
+                    PickerEvent::Backspace => {
+                        query.pop();
+                    }
+                    PickerEvent::Character(byte) => {
+                        query.push(byte as char);
+                        selected = 0;
+                    }
+                    PickerEvent::Down | PickerEvent::Ignore => {}
                 }
             }
-            0x08 | 0x7f => {
-                query.pop();
-            }
-            byte if byte.is_ascii_graphic() || byte == b' ' => {
-                query.push(byte as char);
-                selected = 0;
-            }
-            _ => {}
-        }
-    }
+        },
+    )
 }
 
 pub fn select_menu(options: &[&str], label: &str) -> Result<usize, String> {
     if options.is_empty() {
         return Err("ACTION_UNAVAILABLE: no host actions are available".to_string());
     }
-    if !io::stdin().is_terminal() {
-        return Err(format!(
-            "ACTION_REQUIRED: {label} requires a usable interactive terminal"
-        ));
+
+    with_terminal(
+        format!("ACTION_REQUIRED: {label} requires a usable interactive terminal"),
+        |input, error, fd| {
+            let mut selected = 0usize;
+
+            loop {
+                render_menu(error, options, selected, label)?;
+
+                match read_event(input, fd, "ACTION_REQUIRED", "HOST_REQUIRED")? {
+                    PickerEvent::Enter => return Ok(selected),
+                    PickerEvent::Cancel => return Err(CANCELLED.to_string()),
+                    PickerEvent::Up => selected = selected.saturating_sub(1),
+                    PickerEvent::Down if selected + 1 < options.len() => selected += 1,
+                    PickerEvent::Down
+                    | PickerEvent::Backspace
+                    | PickerEvent::Character(_)
+                    | PickerEvent::Ignore => {}
+                }
+            }
+        },
+    )
+}
+
+fn with_terminal<T>(
+    not_terminal_error: String,
+    run: impl FnOnce(&mut io::Stdin, &mut io::Stderr, libc::c_int) -> Result<T, String>,
+) -> Result<T, String> {
+    let input = io::stdin();
+    if !input.is_terminal() {
+        return Err(not_terminal_error);
     }
 
-    let input = io::stdin();
     let fd = input.as_raw_fd();
     let _raw_mode = RawMode::enter(fd)?;
     let mut input = input;
     let mut error = io::stderr();
-    let mut selected = 0usize;
+    let result = run(&mut input, &mut error, fd);
+    if result.is_ok() || matches!(&result, Err(error) if error == CANCELLED) {
+        clear(&mut error)?;
+    }
+    result
+}
 
-    loop {
-        render_menu(&mut error, options, selected, label)?;
-        let mut byte = [0u8; 1];
-        input
-            .read_exact(&mut byte)
-            .map_err(|error| format!("ACTION_REQUIRED: cannot read menu input: {error}"))?;
-        match byte[0] {
-            b'\r' | b'\n' => {
-                clear(&mut error)?;
-                return Ok(selected);
+enum PickerEvent {
+    Enter,
+    Cancel,
+    Up,
+    Down,
+    Backspace,
+    Character(u8),
+    Ignore,
+}
+
+fn read_event(
+    input: &mut impl Read,
+    fd: libc::c_int,
+    input_error_prefix: &str,
+    escape_error_prefix: &str,
+) -> Result<PickerEvent, String> {
+    let mut byte = [0u8; 1];
+    input
+        .read_exact(&mut byte)
+        .map_err(|error| format!("{input_error_prefix}: cannot read picker input: {error}"))?;
+
+    match byte[0] {
+        b'\r' | b'\n' => Ok(PickerEvent::Enter),
+        0x03 => Ok(PickerEvent::Cancel),
+        0x1b => {
+            if !arrow_key(input, fd, escape_error_prefix)? {
+                return Ok(PickerEvent::Cancel);
             }
-            0x03 | 0x1b => {
-                if byte[0] == 0x1b && arrow_key(&mut input)? {
-                    match read_arrow(&mut input)? {
-                        Some(b'A') if selected > 0 => selected -= 1,
-                        Some(b'B') if selected + 1 < options.len() => selected += 1,
-                        _ => {}
-                    }
-                } else {
-                    clear(&mut error)?;
-                    return Err(CANCELLED.to_string());
-                }
+            match read_arrow(input, escape_error_prefix)? {
+                b'A' => Ok(PickerEvent::Up),
+                b'B' => Ok(PickerEvent::Down),
+                _ => Ok(PickerEvent::Ignore),
             }
-            _ => {}
         }
+        0x08 | 0x7f => Ok(PickerEvent::Backspace),
+        byte if byte.is_ascii_graphic() || byte == b' ' => Ok(PickerEvent::Character(byte)),
+        _ => Ok(PickerEvent::Ignore),
     }
 }
 
-fn arrow_key(input: &mut impl Read) -> Result<bool, String> {
-    let fd = io::stdin().as_raw_fd();
+fn arrow_key(input: &mut impl Read, fd: libc::c_int, error_prefix: &str) -> Result<bool, String> {
     let mut poll = libc::pollfd {
         fd,
         events: libc::POLLIN,
@@ -172,7 +197,7 @@ fn arrow_key(input: &mut impl Read) -> Result<bool, String> {
     let result = unsafe { libc::poll(&mut poll, 1, 30) };
     if result < 0 {
         return Err(format!(
-            "HOST_REQUIRED: cannot read picker input: {}",
+            "{error_prefix}: cannot read picker input: {}",
             io::Error::last_os_error()
         ));
     }
@@ -182,16 +207,16 @@ fn arrow_key(input: &mut impl Read) -> Result<bool, String> {
     let mut prefix = [0u8; 1];
     input
         .read_exact(&mut prefix)
-        .map_err(|error| format!("HOST_REQUIRED: cannot read picker input: {error}"))?;
+        .map_err(|error| format!("{error_prefix}: cannot read picker input: {error}"))?;
     Ok(prefix[0] == b'[')
 }
 
-fn read_arrow(input: &mut impl Read) -> Result<Option<u8>, String> {
+fn read_arrow(input: &mut impl Read, error_prefix: &str) -> Result<u8, String> {
     let mut direction = [0u8; 1];
     input
         .read_exact(&mut direction)
-        .map_err(|error| format!("HOST_REQUIRED: cannot read picker input: {error}"))?;
-    Ok(Some(direction[0]))
+        .map_err(|error| format!("{error_prefix}: cannot read picker input: {error}"))?;
+    Ok(direction[0])
 }
 
 fn matching_rows<'a>(entries: &[&'a HostEntry], query: &str) -> Vec<Row<'a>> {
@@ -353,8 +378,23 @@ fn clear(error: &mut impl Write) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{fuzzy_score, matching_rows};
+    use super::{PickerEvent, fuzzy_score, matching_rows, read_event};
     use sshx::discovery::{HostEntry, SourceIdentity};
+    use std::io::Cursor;
+    #[test]
+    fn event_decoder_preserves_enter_and_ctrl_c() {
+        let mut enter = Cursor::new(vec![b'\n']);
+        assert!(matches!(
+            read_event(&mut enter, -1, "HOST_REQUIRED", "HOST_REQUIRED"),
+            Ok(PickerEvent::Enter)
+        ));
+
+        let mut cancel = Cursor::new(vec![0x03]);
+        assert!(matches!(
+            read_event(&mut cancel, -1, "ACTION_REQUIRED", "HOST_REQUIRED"),
+            Ok(PickerEvent::Cancel)
+        ));
+    }
 
     fn host(
         id: &str,

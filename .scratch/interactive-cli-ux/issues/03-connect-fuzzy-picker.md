@@ -2,9 +2,11 @@
 
 **What to build:** Replace the selectorless `connect` numbered prompt with a built-in live fuzzy picker that selects one exact HostEntry alias while preserving deterministic explicit selectors.
 
-**Blocked by:** None (can start immediately).
+Type: task
 
-**Status:** resolved
+Status: resolved
+
+Blocked by: none (can start immediately)
 
 - [x] `sshx connect` without a selector and with a usable TTY opens a live picker whose visible rows update as the query changes.
 - [x] The picker renders one row per alias and shows destination, project and scope when present, plus source path and line number.

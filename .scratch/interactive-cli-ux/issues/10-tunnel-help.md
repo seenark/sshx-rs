@@ -2,9 +2,11 @@
 
 **What to build:** Extend command-aware help across direct, paired, and compatibility tunnel spellings so each accepted start, list, status, stop, and restart path explains its actual standalone tunnel behavior.
 
-**Blocked by:** 04: Use the fuzzy picker for every interactive HostEntry selection; 08: Provide nested help for root and top-level workflows.
+Type: task
 
-**Status:** resolved
+Status: resolved
+
+Blocked by: 04, 08
 
 - [x] Help exists for the `tunnel`, `tunnel direct`, and `tunnel paired` groups through all three accepted help forms.
 - [x] Help exists for every accepted `start`, `list`, `status`, `stop`, and `restart` spelling under the root tunnel group and its direct or paired groups.
@@ -15,6 +17,13 @@
 - [x] Successful help uses deterministic plain stdout and exit `0`; parse errors use stderr, exit `2`, and the nearest relevant usage.
 - [x] Examples contain no real passwords and use canonical standalone tunnel, Pair, gateway, and VM terminology.
 
-**Answer:** Added deterministic plain-text help routing and pages for every tunnel group, start mode, lifecycle operation, and direct/paired alias. Help documents exact selectors, source and Host line disambiguation, fuzzy picker fallback, forwarding and password descriptors, Pair and ProxyCommand boundaries, tunnel ownership, stable IDs, lifecycle output, cancellation, errors, and exit behavior.
+## Answer
 
-**Evidence:** `cargo test --test cli` (84 passed); `cargo fmt --all -- --check`; `cargo check --all-targets`; `cargo clippy --all-targets --all-features -- -D warnings`.
+Added deterministic plain-text help routing and pages for every tunnel group, start mode, lifecycle operation, and direct/paired alias. Help documents exact selectors, source and Host line disambiguation, fuzzy picker fallback, forwarding and password descriptors, Pair and ProxyCommand boundaries, tunnel ownership, stable IDs, lifecycle output, cancellation, errors, and exit behavior.
+
+Evidence:
+
+- `cargo test --test cli` (84 passed)
+- `cargo fmt --all -- --check`
+- `cargo check --all-targets`
+- `cargo clippy --all-targets --all-features -- -D warnings`

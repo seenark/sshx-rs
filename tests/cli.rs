@@ -721,6 +721,8 @@ fn tunnel_help_documents_runtime_contract_and_nearest_usage() {
                 "registry",
                 "master_status",
                 "listener_status",
+                "master responsive",
+                "listener ready",
                 "does not select discovery roots",
             ][..],
         ),
@@ -731,7 +733,8 @@ fn tunnel_help_documents_runtime_contract_and_nearest_usage() {
                 "TUNNEL_NOT_FOUND",
                 "master",
                 "listener",
-                "application",
+                "master responsive",
+                "listener ready",
                 "does not select discovery roots",
             ][..],
         ),
@@ -776,6 +779,20 @@ fn tunnel_help_documents_runtime_contract_and_nearest_usage() {
                 assert!(
                     text.contains(fragment),
                     "{full_path}: missing {fragment}\n{text}"
+                );
+            }
+            if path.ends_with("list") || path.ends_with("status") {
+                assert!(
+                    !text.contains("live health"),
+                    "{full_path}: forbidden live health wording\n{text}"
+                );
+                assert!(
+                    !text.contains("application health"),
+                    "{full_path}: forbidden application health wording\n{text}"
+                );
+                assert!(
+                    !text.contains("application_health"),
+                    "{full_path}: forbidden application_health field claim\n{text}"
                 );
             }
             if !path.ends_with("list") {
@@ -3499,6 +3516,41 @@ fn doctor_fix_permissions_applies_after_one_tty_confirmation() {
 
 #[cfg(unix)]
 #[test]
+fn doctor_fix_permissions_repairs_mode_zero_password_config_once() {
+    let (root, home) = canonical_fixture_root();
+    let config = home.join(".ssh/config");
+    write(
+        &config,
+        "Host password\n  HostName password.example\n  ##PASSWORD stored-secret\n",
+    );
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o000)).unwrap();
+    let bin = fake_ssh(&root);
+    let (status, output) = run_with_pty_header(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "doctor",
+            "--fix-permissions",
+        ],
+        &bin,
+        &root,
+        b"y\n",
+        b"Repair plan:",
+    );
+    assert!(status.success(), "status={status:?} output={output}");
+    assert_eq!(output.matches("Repair plan:").count(), 1, "output={output}");
+    assert_eq!(
+        output.matches("Apply permission repairs?").count(),
+        1,
+        "output={output}"
+    );
+    assert_eq!(mode_of(&config), 0o600);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
 fn doctor_fix_permissions_yes_still_requires_confirmation() {
     let (root, home) = canonical_fixture_root();
     let config = home.join(".ssh/config");
@@ -3506,6 +3558,7 @@ fn doctor_fix_permissions_yes_still_requires_confirmation() {
         &config,
         "Host password\n  HostName password.example\n  ##PASSWORD stored-secret\n",
     );
+
     fs::set_permissions(&config, fs::Permissions::from_mode(0o644)).unwrap();
     let bin = fake_ssh(&root);
     let (status, output) = run_with_pty_header(
@@ -3555,6 +3608,36 @@ fn direct_connect_repairs_password_config_before_retry() {
     assert!(output.contains("current mode: 644"), "output={output}");
     assert!(output.contains("required mode: 600"), "output={output}");
     assert!(output.contains("reason:"), "output={output}");
+    assert_eq!(mode_of(&config), 0o600);
+    assert!(output.contains("direct-shell"), "output={output}");
+    fs::remove_dir_all(root).unwrap();
+}
+#[cfg(unix)]
+#[test]
+fn direct_connect_repairs_mode_zero_password_config_before_discovery_retry() {
+    let (root, home) = canonical_fixture_root();
+    let config = home.join(".ssh/config");
+    write(
+        &config,
+        "Host selected\n  HostName selected.example\n  ##PASSWORD configured-secret\n",
+    );
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o000)).unwrap();
+    let bin = fake_ssh(&root);
+    fake_sshpass(&root);
+    let (status, output) = run_with_pty_header(
+        &home,
+        &["connect", "selected"],
+        &bin,
+        &root,
+        b"y\n",
+        b"Permission repair required",
+    );
+    assert!(status.success(), "status={status:?} output={output}");
+    assert_eq!(
+        output.matches("Permission repair required").count(),
+        1,
+        "output={output}"
+    );
     assert_eq!(mode_of(&config), 0o600);
     assert!(output.contains("direct-shell"), "output={output}");
     fs::remove_dir_all(root).unwrap();

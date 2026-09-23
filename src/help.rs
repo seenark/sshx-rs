@@ -10,99 +10,241 @@ pub const TUNNEL_USAGE: &str = "Usage: sshx tunnel COMMAND [OPTIONS]";
 pub const TUNNEL_DIRECT_USAGE: &str = "Usage: sshx tunnel direct COMMAND [OPTIONS]";
 pub const TUNNEL_PAIRED_USAGE: &str = "Usage: sshx tunnel paired COMMAND [OPTIONS]";
 
-pub fn render(path: &[String]) -> Result<String, String> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HelpPage {
+    Root,
+    Setup,
+    Doctor,
+    Connect,
+    Host,
+    HostList,
+    HostShow,
+    HostCreate,
+    HostUpdate,
+    HostRename,
+    HostDelete,
+    Pair,
+    PairSetup,
+    PairList,
+    PairValidate,
+    Tunnel,
+    TunnelDirect,
+    TunnelPaired,
+    TunnelStart,
+    TunnelDirectStart,
+    TunnelPairedStart,
+    TunnelLifecycle {
+        group: TunnelLifecycleGroup,
+        operation: LifecycleOperation,
+    },
+}
+
+impl HelpPage {
+    fn usage(self) -> &'static str {
+        match self {
+            Self::Root => ROOT_USAGE,
+            Self::Setup => SETUP_USAGE,
+            Self::Doctor => DOCTOR_USAGE,
+            Self::Connect => CONNECT_USAGE,
+            Self::Host
+            | Self::HostList
+            | Self::HostShow
+            | Self::HostCreate
+            | Self::HostUpdate
+            | Self::HostRename
+            | Self::HostDelete => HOST_USAGE,
+            Self::Pair | Self::PairSetup | Self::PairList | Self::PairValidate => PAIR_USAGE,
+            Self::Tunnel | Self::TunnelStart => TUNNEL_USAGE,
+            Self::TunnelDirect | Self::TunnelDirectStart => TUNNEL_DIRECT_USAGE,
+            Self::TunnelPaired | Self::TunnelPairedStart => TUNNEL_PAIRED_USAGE,
+            Self::TunnelLifecycle { group, .. } => match group {
+                TunnelLifecycleGroup::Root => TUNNEL_USAGE,
+                TunnelLifecycleGroup::Direct => TUNNEL_DIRECT_USAGE,
+                TunnelLifecycleGroup::Paired => TUNNEL_PAIRED_USAGE,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TunnelLifecycleGroup {
+    Root,
+    Direct,
+    Paired,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LifecycleOperation {
+    List,
+    Status,
+    Stop,
+    Restart,
+}
+
+struct LifecycleMetadata {
+    arguments: &'static str,
+    options: &'static str,
+    purpose: &'static str,
+    examples: &'static str,
+    exits: &'static str,
+    detail: &'static str,
+    is_list: bool,
+}
+
+impl LifecycleOperation {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "list" => Some(Self::List),
+            "status" => Some(Self::Status),
+            "stop" => Some(Self::Stop),
+            "restart" => Some(Self::Restart),
+            _ => None,
+        }
+    }
+
+    fn command(self) -> &'static str {
+        match self {
+            Self::List => "list",
+            Self::Status => "status",
+            Self::Stop => "stop",
+            Self::Restart => "restart",
+        }
+    }
+
+    fn metadata(self) -> LifecycleMetadata {
+        match self {
+            Self::List => LifecycleMetadata {
+                arguments: "None. The command lists every registered tunnel.",
+                options: "--config PATH    Accepted for common CLI compatibility; this lifecycle command reads the runtime registry under sshx home and does not select discovery roots.\n--format human|json|yaml    Render lifecycle output.",
+                purpose: "List every registered standalone tunnel.",
+                examples: "sshx tunnel list --format json\nsshx tunnel direct list",
+                exits: "Exit 0 after registry rendering. REGISTRY_UNSAFE and parse errors exit 2. Help exits 0.",
+                detail: "The locked registry is the source of truth. Human output includes tunnel ID, state, master responsive, and listener ready. JSON and YAML preserve stable fields including master_status and listener_status; no application status is inferred.",
+                is_list: true,
+            },
+            Self::Status => LifecycleMetadata {
+                arguments: "ID    Exact persisted tunnel ID returned by start or list; it is not a process ID.",
+                options: "--config PATH    Accepted for common CLI compatibility; this lifecycle command reads the runtime registry under sshx home and does not select discovery roots.\n--format human|json|yaml    Render lifecycle output.",
+                purpose: "Show one registered tunnel's master responsiveness and listener readiness.",
+                examples: "sshx tunnel status dt-1\nsshx tunnel paired status pt-1",
+                exits: "Exit 0 after status rendering. TUNNEL_NOT_FOUND, REGISTRY_UNSAFE, and parse errors exit 2. Help exits 0.",
+                detail: "The locked registry and control socket prove ownership. Output includes tunnel ID, state, kind, master responsive, listener ready, selected host, source, and forwards. No application status is inferred.",
+                is_list: false,
+            },
+            Self::Stop => LifecycleMetadata {
+                arguments: "ID    Exact persisted tunnel ID returned by start or list; it is not a process ID.",
+                options: "--config PATH    Accepted for common CLI compatibility; this lifecycle command reads the runtime registry under sshx home and does not select discovery roots.\n--format human|json|yaml    Render lifecycle output.",
+                purpose: "Stop one registered tunnel using its ownership controls.",
+                examples: "sshx tunnel stop dt-1",
+                exits: "Exit 0 after the owned tunnel stops. TUNNEL_NOT_FOUND, TUNNEL_STOP_FAILED, REGISTRY_UNSAFE, and parse errors exit 2. Help exits 0.",
+                detail: "The command validates the locked registry and control socket, then stops the owned runtime. Paired tunnels stop VM before gateway. It never treats an arbitrary PID as ownership.",
+                is_list: false,
+            },
+            Self::Restart => LifecycleMetadata {
+                arguments: "ID    Exact persisted tunnel ID returned by start or list; it is not a process ID.",
+                options: "--config PATH    Select the discovery root when restart re-resolves the current HostEntry or Pair identity.\n--format human|json|yaml    Render lifecycle output.\n--password-fd FD    Supply a direct or VM password through an inherited descriptor.\n--gateway-password-fd FD    Supply a Pair gateway password through an inherited descriptor.\n--vm-password-fd FD    Supply a Pair VM password through an inherited descriptor.",
+                purpose: "Restart one registered tunnel with its persisted forwarding request.",
+                examples: "sshx tunnel restart dt-1 --password-fd 3",
+                exits: "Exit 0 after the owned tunnel restarts. TUNNEL_NOT_FOUND, CONFIG_CHANGED, PAIR_BROKEN, REGISTRY_UNSAFE, and parse errors exit 2. Help exits 0.",
+                detail: "The command validates the locked registry and current HostEntry or Pair identity, then preserves forwarding configuration. CONFIG_CHANGED and PAIR_BROKEN prevent a stale restart.",
+                is_list: false,
+            },
+        }
+    }
+}
+
+pub(crate) fn resolve(path: &[String]) -> Result<HelpPage, String> {
     let path = path.iter().map(String::as_str).collect::<Vec<_>>();
-    match path.as_slice() {
-        [] => Ok(root()),
-        ["setup"] => Ok(setup()),
-        ["doctor"] => Ok(doctor()),
-        ["connect"] => Ok(connect()),
-        ["host"] => Ok(host()),
-        ["host", "list"] => Ok(host_list()),
-        ["host", "show"] => Ok(host_show()),
-        ["host", "create"] => Ok(host_create()),
-        ["host", "update"] => Ok(host_update()),
-        ["host", "rename"] => Ok(host_rename()),
-        ["host", "delete"] => Ok(host_delete()),
-        ["pair"] => Ok(pair()),
-        ["pair", "setup"] | ["pair", "create"] => Ok(pair_setup()),
-        ["pair", "list"] => Ok(pair_list()),
-        ["pair", "validate"] => Ok(pair_validate()),
-        ["tunnel"] => Ok(tunnel()),
-        ["tunnel", "direct"] => Ok(tunnel_direct()),
-        ["tunnel", "paired"] => Ok(tunnel_paired()),
-        ["tunnel", "start"] => Ok(tunnel_start()),
-        ["tunnel", "direct", "start"] => Ok(tunnel_direct_start()),
-        ["tunnel", "paired", "start"] => Ok(tunnel_paired_start()),
-        ["tunnel", "list"] => Ok(tunnel_lifecycle("tunnel list", "tunnel list", "List")),
-        ["tunnel", "direct", "list"] => Ok(tunnel_lifecycle(
-            "tunnel direct list (alias: tunnel list)",
-            "tunnel direct list",
-            "List",
-        )),
-        ["tunnel", "paired", "list"] => Ok(tunnel_lifecycle(
-            "tunnel paired list (alias: tunnel list)",
-            "tunnel paired list",
-            "List",
-        )),
-        ["tunnel", "status"] => Ok(tunnel_lifecycle("tunnel status", "tunnel status", "Status")),
-        ["tunnel", "direct", "status"] => Ok(tunnel_lifecycle(
-            "tunnel direct status (alias: tunnel status)",
-            "tunnel direct status",
-            "Status",
-        )),
-        ["tunnel", "paired", "status"] => Ok(tunnel_lifecycle(
-            "tunnel paired status (alias: tunnel status)",
-            "tunnel paired status",
-            "Status",
-        )),
-        ["tunnel", "stop"] => Ok(tunnel_lifecycle("tunnel stop", "tunnel stop", "Stop")),
-        ["tunnel", "direct", "stop"] => Ok(tunnel_lifecycle(
-            "tunnel direct stop (alias: tunnel stop)",
-            "tunnel direct stop",
-            "Stop",
-        )),
-        ["tunnel", "paired", "stop"] => Ok(tunnel_lifecycle(
-            "tunnel paired stop (alias: tunnel stop)",
-            "tunnel paired stop",
-            "Stop",
-        )),
-        ["tunnel", "restart"] => Ok(tunnel_lifecycle(
-            "tunnel restart",
-            "tunnel restart",
-            "Restart",
-        )),
-        ["tunnel", "direct", "restart"] => Ok(tunnel_lifecycle(
-            "tunnel direct restart (alias: tunnel restart)",
-            "tunnel direct restart",
-            "Restart",
-        )),
-        ["tunnel", "paired", "restart"] => Ok(tunnel_lifecycle(
-            "tunnel paired restart (alias: tunnel restart)",
-            "tunnel paired restart",
-            "Restart",
-        )),
-        _ => Err(format!(
+    resolve_refs(&path).ok_or_else(|| {
+        format!(
             "unknown help path `{}`\n{}",
             path.join(" "),
             usage(path.as_slice())
-        )),
+        )
+    })
+}
+
+fn resolve_refs(path: &[&str]) -> Option<HelpPage> {
+    match path {
+        [] => Some(HelpPage::Root),
+        ["setup", ..] => Some(HelpPage::Setup),
+        ["doctor", ..] => Some(HelpPage::Doctor),
+        ["connect", ..] => Some(HelpPage::Connect),
+        ["host"] => Some(HelpPage::Host),
+        ["host", "list", ..] => Some(HelpPage::HostList),
+        ["host", "show", ..] => Some(HelpPage::HostShow),
+        ["host", "create", ..] => Some(HelpPage::HostCreate),
+        ["host", "update", ..] => Some(HelpPage::HostUpdate),
+        ["host", "rename", ..] => Some(HelpPage::HostRename),
+        ["host", "delete", ..] => Some(HelpPage::HostDelete),
+        ["pair"] => Some(HelpPage::Pair),
+        ["pair", "setup", ..] | ["pair", "create", ..] => Some(HelpPage::PairSetup),
+        ["pair", "list", ..] => Some(HelpPage::PairList),
+        ["pair", "validate", ..] => Some(HelpPage::PairValidate),
+        ["tunnel"] => Some(HelpPage::Tunnel),
+        ["tunnel", "direct"] => Some(HelpPage::TunnelDirect),
+        ["tunnel", "direct", "start", ..] => Some(HelpPage::TunnelDirectStart),
+        ["tunnel", "direct", operation, ..] => {
+            LifecycleOperation::parse(operation).map(|operation| HelpPage::TunnelLifecycle {
+                group: TunnelLifecycleGroup::Direct,
+                operation,
+            })
+        }
+        ["tunnel", "paired"] => Some(HelpPage::TunnelPaired),
+        ["tunnel", "paired", "start", ..] => Some(HelpPage::TunnelPairedStart),
+        ["tunnel", "paired", operation, ..] => {
+            LifecycleOperation::parse(operation).map(|operation| HelpPage::TunnelLifecycle {
+                group: TunnelLifecycleGroup::Paired,
+                operation,
+            })
+        }
+        ["tunnel", "start", ..] => Some(HelpPage::TunnelStart),
+        ["tunnel", operation, ..] => {
+            LifecycleOperation::parse(operation).map(|operation| HelpPage::TunnelLifecycle {
+                group: TunnelLifecycleGroup::Root,
+                operation,
+            })
+        }
+        _ => None,
+    }
+}
+
+pub fn render(path: &[String]) -> Result<String, String> {
+    Ok(render_page(resolve(path)?))
+}
+
+pub(crate) fn render_page(page: HelpPage) -> String {
+    match page {
+        HelpPage::Root => root(),
+        HelpPage::Setup => setup(),
+        HelpPage::Doctor => doctor(),
+        HelpPage::Connect => connect(),
+        HelpPage::Host => host(),
+        HelpPage::HostList => host_list(),
+        HelpPage::HostShow => host_show(),
+        HelpPage::HostCreate => host_create(),
+        HelpPage::HostUpdate => host_update(),
+        HelpPage::HostRename => host_rename(),
+        HelpPage::HostDelete => host_delete(),
+        HelpPage::Pair => pair(),
+        HelpPage::PairSetup => pair_setup(),
+        HelpPage::PairList => pair_list(),
+        HelpPage::PairValidate => pair_validate(),
+        HelpPage::Tunnel => tunnel(),
+        HelpPage::TunnelDirect => tunnel_direct(),
+        HelpPage::TunnelPaired => tunnel_paired(),
+        HelpPage::TunnelStart => tunnel_start(),
+        HelpPage::TunnelDirectStart => tunnel_direct_start(),
+        HelpPage::TunnelPairedStart => tunnel_paired_start(),
+        HelpPage::TunnelLifecycle { group, operation } => tunnel_lifecycle(group, operation),
     }
 }
 
 pub fn usage(path: &[&str]) -> &'static str {
-    match path {
-        [] => ROOT_USAGE,
-        ["setup", ..] => SETUP_USAGE,
-        ["doctor", ..] => DOCTOR_USAGE,
-        ["connect", ..] => CONNECT_USAGE,
-        ["host", ..] => HOST_USAGE,
-        ["pair", ..] => PAIR_USAGE,
-        ["tunnel", "direct", ..] => TUNNEL_DIRECT_USAGE,
-        ["tunnel", "paired", ..] => TUNNEL_PAIRED_USAGE,
-        ["tunnel", ..] => TUNNEL_USAGE,
-        _ => ROOT_USAGE,
-    }
+    (0..=path.len())
+        .rev()
+        .find_map(|length| resolve_refs(&path[..length]).map(HelpPage::usage))
+        .unwrap_or(ROOT_USAGE)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -423,67 +565,32 @@ fn tunnel_paired_start() -> String {
     )
 }
 
-fn tunnel_lifecycle(name: &str, command_path: &str, operation: &str) -> String {
-    let is_list = operation == "List";
-    let arguments = if is_list {
-        "None. The command lists every registered tunnel."
-    } else {
-        "ID    Exact persisted tunnel ID returned by start or list; it is not a process ID."
-    };
-    let options = match operation {
-        "Restart" => {
-            "--config PATH    Select the discovery root when restart re-resolves the current HostEntry or Pair identity.\n--format human|json|yaml    Render lifecycle output.\n--password-fd FD    Supply a direct or VM password through an inherited descriptor.\n--gateway-password-fd FD    Supply a Pair gateway password through an inherited descriptor.\n--vm-password-fd FD    Supply a Pair VM password through an inherited descriptor."
+impl TunnelLifecycleGroup {
+    fn command_path(self, operation: LifecycleOperation) -> String {
+        let operation = operation.command();
+        match self {
+            Self::Root => format!("tunnel {operation}"),
+            Self::Direct => format!("tunnel direct {operation}"),
+            Self::Paired => format!("tunnel paired {operation}"),
         }
-        "List" | "Status" | "Stop" => {
-            "--config PATH    Accepted for common CLI compatibility; this lifecycle command reads the runtime registry under sshx home and does not select discovery roots.\n--format human|json|yaml    Render lifecycle output."
+    }
+
+    fn name(self, operation: LifecycleOperation) -> String {
+        let command_path = self.command_path(operation);
+        match self {
+            Self::Root => command_path,
+            Self::Direct | Self::Paired => {
+                format!("{command_path} (alias: tunnel {})", operation.command())
+            }
         }
-        _ => unreachable!(),
-    };
-    let purpose = match operation {
-        "List" => "List every registered standalone tunnel.",
-        "Status" => "Show one registered tunnel and its live health.",
-        "Stop" => "Stop one registered tunnel using its ownership controls.",
-        "Restart" => "Restart one registered tunnel with its persisted forwarding request.",
-        _ => unreachable!(),
-    };
-    let examples = match operation {
-        "List" => "sshx tunnel list --format json\nsshx tunnel direct list",
-        "Status" => "sshx tunnel status dt-1\nsshx tunnel paired status pt-1",
-        "Stop" => "sshx tunnel stop dt-1",
-        "Restart" => "sshx tunnel restart dt-1 --password-fd 3",
-        _ => unreachable!(),
-    };
-    let exits = match operation {
-        "List" => {
-            "Exit 0 after registry rendering. REGISTRY_UNSAFE and parse errors exit 2. Help exits 0."
-        }
-        "Status" => {
-            "Exit 0 after status rendering. TUNNEL_NOT_FOUND, REGISTRY_UNSAFE, and parse errors exit 2. Help exits 0."
-        }
-        "Stop" => {
-            "Exit 0 after the owned tunnel stops. TUNNEL_NOT_FOUND, TUNNEL_STOP_FAILED, REGISTRY_UNSAFE, and parse errors exit 2. Help exits 0."
-        }
-        "Restart" => {
-            "Exit 0 after the owned tunnel restarts. TUNNEL_NOT_FOUND, CONFIG_CHANGED, PAIR_BROKEN, REGISTRY_UNSAFE, and parse errors exit 2. Help exits 0."
-        }
-        _ => unreachable!(),
-    };
-    let detail = match operation {
-        "List" => {
-            "The locked registry is the source of truth. Human output includes tunnel ID, state, master, listener, and application health; JSON and YAML preserve stable fields including master_status, listener_status, and application_health."
-        }
-        "Status" => {
-            "The locked registry and control socket prove ownership. Output includes tunnel ID, state, kind, master status, listener status, application health, selected host, source, and forwards."
-        }
-        "Stop" => {
-            "The command validates the locked registry and control socket, then stops the owned runtime. Paired tunnels stop VM before gateway. It never treats an arbitrary PID as ownership."
-        }
-        "Restart" => {
-            "The command validates the locked registry and current HostEntry or Pair identity, then preserves forwarding configuration. CONFIG_CHANGED and PAIR_BROKEN prevent a stale restart."
-        }
-        _ => unreachable!(),
-    };
-    let usage = if is_list {
+    }
+}
+
+fn tunnel_lifecycle(group: TunnelLifecycleGroup, operation: LifecycleOperation) -> String {
+    let metadata = operation.metadata();
+    let command_path = group.command_path(operation);
+    let name = group.name(operation);
+    let usage = if metadata.is_list {
         format!(
             "sshx {command_path} [OPTIONS]\nsshx {command_path} --help\nsshx help {command_path}"
         )
@@ -493,14 +600,14 @@ fn tunnel_lifecycle(name: &str, command_path: &str, operation: &str) -> String {
         )
     };
     page(
-        name,
-        purpose,
+        &name,
+        metadata.purpose,
         &usage,
-        arguments,
-        &format!("{options}\n{detail}"),
+        metadata.arguments,
+        &format!("{}\n{}", metadata.options, metadata.detail),
         "",
-        examples,
-        exits,
+        metadata.examples,
+        metadata.exits,
         "sshx tunnel, sshx tunnel direct, sshx tunnel paired",
     )
 }

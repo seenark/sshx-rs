@@ -162,9 +162,8 @@ impl ReportBuilder {
         &mut self,
         kind: &str,
         path: &Path,
-        file: bool,
+        target: crate::permissions::PermissionTarget,
         current_mode: u32,
-        expected_mode: u32,
     ) {
         if !self.planned_repairs.insert(path.to_path_buf()) {
             return;
@@ -174,11 +173,12 @@ impl ReportBuilder {
             .push(crate::permissions::RepairCandidate {
                 kind: kind.to_string(),
                 path: path.to_path_buf(),
-                file,
+                target,
                 current_mode,
                 reason: format!(
                     "current mode {:o} requires {:o}",
-                    current_mode, expected_mode
+                    current_mode,
+                    target.private_mode()
                 ),
             });
     }
@@ -261,9 +261,21 @@ pub fn run(
                         "error",
                         "config",
                         format!("cannot read config root {}: {error}", path.display()),
-                        "Fix file ownership or permissions, then run doctor again.",
+                        "Review ownership manually; use --fix-permissions to chmod eligible paths after one confirmation.",
                         Some(&path),
                     );
+                    if let Ok(current_mode) = crate::permissions::assess(
+                        &path,
+                        crate::permissions::PermissionTarget::File,
+                    ) && current_mode != crate::permissions::PRIVATE_FILE_MODE
+                    {
+                        builder.repair(
+                            "config_root",
+                            &path,
+                            crate::permissions::PermissionTarget::File,
+                            current_mode,
+                        );
+                    }
                     "unreadable".to_string()
                 }
             },
@@ -736,9 +748,15 @@ fn check_password_permissions(path: &Path, builder: &mut ReportBuilder) {
             );
             if !unsafe_owner
                 && metadata.is_file()
-                && let Ok(current_mode) = crate::permissions::assess(path, true)
+                && let Ok(current_mode) =
+                    crate::permissions::assess(path, crate::permissions::PermissionTarget::File)
             {
-                builder.repair("password_file", path, true, current_mode, 0o600);
+                builder.repair(
+                    "password_file",
+                    path,
+                    crate::permissions::PermissionTarget::File,
+                    current_mode,
+                );
             }
         }
     }
@@ -748,23 +766,29 @@ fn check_state_locations(home: &Path, builder: &mut ReportBuilder) {
     let config_dir = home.join(".config/sshx");
     let tunnel_dir = config_dir.join("tunnels");
     let locations = [
-        ("app_config_dir", config_dir.clone(), false, 0o700),
+        (
+            "app_config_dir",
+            config_dir.clone(),
+            crate::permissions::PermissionTarget::Directory,
+        ),
         (
             "app_settings",
             crate::settings::settings_path(home),
-            true,
-            0o600,
+            crate::permissions::PermissionTarget::File,
         ),
-        ("tunnel_registry_dir", tunnel_dir.clone(), false, 0o700),
+        (
+            "tunnel_registry_dir",
+            tunnel_dir.clone(),
+            crate::permissions::PermissionTarget::Directory,
+        ),
         (
             "tunnel_registry",
             tunnel_dir.join("registry.json"),
-            true,
-            0o600,
+            crate::permissions::PermissionTarget::File,
         ),
     ];
-    for (kind, path, file, mode) in locations {
-        let status = inspect_location(kind, &path, file, mode, builder, "app_state");
+    for (kind, path, target) in locations {
+        let status = inspect_location(kind, &path, target, builder, "app_state");
         builder.report.state.push(StateReport {
             kind: kind.to_string(),
             path: display_path(&path),
@@ -777,7 +801,13 @@ fn check_state_locations(home: &Path, builder: &mut ReportBuilder) {
         ("personal", home.join(".ssh/known_hosts")),
         ("work", home.join(".config/sshx/known_hosts/work")),
     ] {
-        let status = inspect_location(scope, &path, true, 0o600, builder, "known_hosts");
+        let status = inspect_location(
+            scope,
+            &path,
+            crate::permissions::PermissionTarget::File,
+            builder,
+            "known_hosts",
+        );
         builder.report.known_hosts.push(KnownHostReport {
             scope: scope.to_string(),
             path: display_path(&path),
@@ -786,12 +816,10 @@ fn check_state_locations(home: &Path, builder: &mut ReportBuilder) {
         });
     }
 }
-
 fn inspect_location(
     kind: &str,
     path: &Path,
-    file: bool,
-    expected_mode: u32,
+    target: crate::permissions::PermissionTarget,
     builder: &mut ReportBuilder,
     stage: &str,
 ) -> String {
@@ -835,8 +863,8 @@ fn inspect_location(
         }
     };
     if metadata.file_type().is_symlink()
-        || (file && !metadata.is_file())
-        || (!file && !metadata.is_dir())
+        || (target.is_file() && !metadata.is_file())
+        || (!target.is_file() && !metadata.is_dir())
     {
         let code = if stage == "known_hosts" {
             "known_hosts_insecure"
@@ -850,7 +878,11 @@ fn inspect_location(
             format!(
                 "{} is not a trusted {}",
                 path.display(),
-                if file { "file" } else { "directory" }
+                if target.is_file() {
+                    "file"
+                } else {
+                    "directory"
+                }
             ),
             "Replace the path manually with a user-owned regular location; doctor never follows symlinks.",
             Some(path),
@@ -862,7 +894,7 @@ fn inspect_location(
         {
             use std::os::unix::fs::{MetadataExt, PermissionsExt};
             (
-                metadata.permissions().mode() & 0o7777 != expected_mode,
+                metadata.permissions().mode() & 0o7777 != target.private_mode(),
                 metadata.uid() != unsafe { libc::geteuid() } as u32,
             )
         }
@@ -887,9 +919,9 @@ fn inspect_location(
         );
         if unsafe_mode
             && !unsafe_owner
-            && let Ok(current_mode) = crate::permissions::assess(path, file)
+            && let Ok(current_mode) = crate::permissions::assess(path, target)
         {
-            builder.repair(kind, path, file, current_mode, expected_mode);
+            builder.repair(kind, path, target, current_mode);
         }
         "insecure".to_string()
     } else {

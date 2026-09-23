@@ -1570,6 +1570,72 @@ pub fn has_stored_password(entry: &HostEntry) -> Result<bool, String> {
     Ok(extract_password(&bytes, entry)?.is_some())
 }
 
+/// Repair an unreadable registered config root once before discovery retries.
+pub fn repair_discovery_permissions(path: &Path, no_input: bool) -> Result<bool, String> {
+    let current_mode = permissions::assess(path, permissions::PermissionTarget::File)
+        .map_err(|reason| format!("PERMISSION_REPAIR_UNSAFE: {} ({reason})", path.display()))?;
+    if current_mode == permissions::PRIVATE_FILE_MODE {
+        return Ok(false);
+    }
+    let candidate = permissions::RepairCandidate {
+        kind: "config_root".to_string(),
+        path: path.to_path_buf(),
+        target: permissions::PermissionTarget::File,
+        current_mode,
+        reason: format!(
+            "current mode {:o} requires {:o}",
+            current_mode,
+            permissions::PRIVATE_FILE_MODE
+        ),
+    };
+    repair_permission_candidate(&candidate, no_input)?;
+    Ok(true)
+}
+
+fn repair_permission_candidate(
+    candidate: &permissions::RepairCandidate,
+    no_input: bool,
+) -> Result<(), String> {
+    if no_input || !io::stdin().is_terminal() {
+        return Err(permission_manual_error(
+            "PERMISSION_REPAIR_REQUIRED",
+            candidate,
+            "interactive confirmation unavailable",
+        ));
+    }
+    eprint!(
+        "Permission repair required\n  path: {}\n  current mode: {:o}\n  required mode: {:o}\n  reason: {}\nApply permission repair? [y/N]: ",
+        candidate.path.display(),
+        candidate.current_mode,
+        candidate.target.private_mode(),
+        candidate.reason
+    );
+    io::stderr()
+        .flush()
+        .map_err(|error| format!("PERMISSION_REPAIR_PROMPT_FAILED: {error}"))?;
+    let mut answer = String::new();
+    io::stdin()
+        .read_line(&mut answer)
+        .map_err(|error| format!("PERMISSION_REPAIR_PROMPT_FAILED: {error}"))?;
+    if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        return Err(permission_manual_error(
+            "PERMISSION_REPAIR_DECLINED",
+            candidate,
+            "confirmation declined",
+        ));
+    }
+    let result = permissions::apply(candidate);
+    if result.outcome == permissions::RepairOutcome::Fixed {
+        Ok(())
+    } else {
+        Err(permission_manual_error(
+            "PERMISSION_REPAIR_FAILED",
+            candidate,
+            &format!("{}: {}", result.outcome, result.detail),
+        ))
+    }
+}
+
 fn selected_password(entry: &HostEntry, no_input: bool) -> Result<Option<String>, String> {
     let mut repaired = false;
     loop {
@@ -1582,7 +1648,10 @@ fn selected_password(entry: &HostEntry, no_input: bool) -> Result<Option<String>
         let Some(password) = extract_password(&bytes, entry)? else {
             return Ok(None);
         };
-        let current_mode = match permissions::assess(Path::new(&entry.source.path), true) {
+        let current_mode = match permissions::assess(
+            Path::new(&entry.source.path),
+            permissions::PermissionTarget::File,
+        ) {
             Ok(mode) => mode,
             Err(reason) => {
                 return Err(format!(
@@ -1598,7 +1667,7 @@ fn selected_password(entry: &HostEntry, no_input: bool) -> Result<Option<String>
             let candidate = permissions::RepairCandidate {
                 kind: "password_file".to_string(),
                 path: PathBuf::from(&entry.source.path),
-                file: true,
+                target: permissions::PermissionTarget::File,
                 current_mode,
                 reason: format!(
                     "current mode {:o} requires {:o}",
@@ -1615,7 +1684,7 @@ fn selected_password(entry: &HostEntry, no_input: bool) -> Result<Option<String>
         let candidate = permissions::RepairCandidate {
             kind: "password_file".to_string(),
             path: PathBuf::from(&entry.source.path),
-            file: true,
+            target: permissions::PermissionTarget::File,
             current_mode,
             reason: format!(
                 "current mode {:o} requires {:o}",
@@ -1623,44 +1692,8 @@ fn selected_password(entry: &HostEntry, no_input: bool) -> Result<Option<String>
                 permissions::PRIVATE_FILE_MODE
             ),
         };
-        if no_input || !io::stdin().is_terminal() {
-            return Err(permission_manual_error(
-                "PERMISSION_REPAIR_REQUIRED",
-                &candidate,
-                "interactive confirmation unavailable",
-            ));
-        }
-        eprint!(
-            "Permission repair required\n  path: {}\n  current mode: {:o}\n  required mode: {:o}\n  reason: {}\nApply permission repair? [y/N]: ",
-            candidate.path.display(),
-            candidate.current_mode,
-            permissions::PRIVATE_FILE_MODE,
-            candidate.reason
-        );
-        io::stderr()
-            .flush()
-            .map_err(|error| format!("PERMISSION_REPAIR_PROMPT_FAILED: {error}"))?;
-        let mut answer = String::new();
-        io::stdin()
-            .read_line(&mut answer)
-            .map_err(|error| format!("PERMISSION_REPAIR_PROMPT_FAILED: {error}"))?;
-        if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
-            return Err(permission_manual_error(
-                "PERMISSION_REPAIR_DECLINED",
-                &candidate,
-                "confirmation declined",
-            ));
-        }
-        let result = permissions::apply(&candidate);
-        if result.outcome == "fixed" {
-            repaired = true;
-        } else {
-            return Err(permission_manual_error(
-                "PERMISSION_REPAIR_FAILED",
-                &candidate,
-                &format!("{}: {}", result.outcome, result.detail),
-            ));
-        }
+        repair_permission_candidate(&candidate, no_input)?;
+        repaired = true;
     }
 }
 
@@ -1705,7 +1738,7 @@ fn permission_manual_error(
         "{prefix}: {} ({detail}; {}); manual repair: {}",
         candidate.path.display(),
         candidate.reason,
-        permissions::manual_chmod_command(&candidate.path, candidate.file)
+        permissions::manual_chmod_command(&candidate.path, candidate.target)
     )
 }
 
@@ -1975,11 +2008,15 @@ fn compile_config_with_transform(
     let mut host_key_alias_written = false;
     let mut gateway_forward_matches = 0usize;
     for raw in block.lines() {
-        let line = strip_inline_comment(raw).trim();
+        let raw_line = raw.trim();
+        let line = strip_inline_comment(raw_line).trim();
         if line.is_empty() {
             continue;
         }
-        let (keyword, argument) = split_directive(line)?;
+        let (keyword, mut argument) = split_directive(line)?;
+        if keyword.eq_ignore_ascii_case("proxycommand") {
+            argument = split_directive(raw_line)?.1;
+        }
         if keyword.eq_ignore_ascii_case("host") {
             if host_written {
                 return Err(

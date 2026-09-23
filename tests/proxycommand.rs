@@ -180,6 +180,47 @@ fn direct_session_copies_exact_block_proxycommand_verbatim_with_tokens() {
 }
 
 #[test]
+fn direct_session_preserves_proxycommand_hash_and_tokens_verbatim() {
+    let (root, home) = fixture("direct-session-hash");
+    let config = home.join(".ssh/config");
+    write(
+        &config,
+        concat!(
+            "##SSHX ID=55555555-5555-4555-8555-555555555555\n",
+            "Host direct\n",
+            "  HostName direct.example\n",
+            "  ProxyCommand /bin/echo foo#bar %h %p %r\n",
+        ),
+    );
+    let bin = session_ssh(&root);
+    let capture = root.join("runtime-config");
+    let output = run(
+        &home,
+        &bin,
+        &["connect", "direct", "--no-input"],
+        &[
+            ("SSHX_CAPTURE", capture.clone()),
+            ("SSHX_STARTED", root.join("master-started")),
+            ("SSHX_CLOSED", root.join("master-closed")),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "status={:?} stdout={} stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let runtime =
+        fs::read_to_string(&capture).expect("runtime config should reach the OpenSSH engine");
+    assert!(
+        runtime.contains("ProxyCommand /bin/echo foo#bar %h %p %r"),
+        "ProxyCommand must preserve hash and tokens: {runtime}"
+    );
+    fs::remove_dir_all(root).expect("fixture should be removed");
+}
+
+#[test]
 fn direct_standalone_tunnel_copies_exact_block_proxycommand_verbatim() {
     let (root, home) = fixture("direct-tunnel");
     let config = home.join(".ssh/config");
