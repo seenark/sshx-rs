@@ -1,6 +1,7 @@
 use crate::discovery::HostEntry;
 use crate::mutation::{self, UpdateRequest};
 use crate::pair::PairedRoute;
+use crate::permissions;
 use crate::session::{self, ServiceForward};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, IsTerminal, Read, Write};
@@ -232,13 +233,14 @@ impl Runtime {
         home: &Path,
         selected_alias: &str,
         forwards: &[ServiceForward],
+        no_input: bool,
     ) -> Result<Self, String> {
         let content = if forwards.is_empty() {
             compile_config(entry, selected_alias)?
         } else {
             compile_config_with_forwards(entry, selected_alias, forwards)?
         };
-        Self::create_with_content(entry, home, selected_alias, content, forwards)
+        Self::create_with_content(entry, home, selected_alias, content, forwards, no_input)
     }
 
     fn create_with_content(
@@ -247,11 +249,22 @@ impl Runtime {
         selected_alias: &str,
         content: String,
         forwards: &[ServiceForward],
+        no_input: bool,
     ) -> Result<Self, String> {
         let dir = temporary_directory()?;
-        Self::create_with_directory(entry, home, selected_alias, content, forwards, dir, false)
+        Self::create_with_directory(
+            entry,
+            home,
+            selected_alias,
+            content,
+            forwards,
+            dir,
+            false,
+            no_input,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn create_with_directory(
         entry: &HostEntry,
         home: &Path,
@@ -260,11 +273,20 @@ impl Runtime {
         forwards: &[ServiceForward],
         dir: PathBuf,
         preserve_dir: bool,
+        no_input: bool,
     ) -> Result<Self, String> {
         if !entry.aliases.iter().any(|alias| alias == selected_alias) {
             return Err("CONFIG_CHANGED: selected alias no longer exists".to_string());
         }
-        let configured_password = selected_password(entry)?;
+        let configured_password = match selected_password(entry, no_input) {
+            Ok(password) => password,
+            Err(error) => {
+                if !preserve_dir {
+                    let _ = fs::remove_dir_all(&dir);
+                }
+                return Err(error);
+            }
+        };
         let config = dir.join("config");
         let socket = dir.join("master.sock");
         let known_hosts = known_hosts_path(home, entry);
@@ -290,6 +312,7 @@ pub(crate) fn prepare_standalone_runtime(
     home: &Path,
     selected_alias: &str,
     control_dir: PathBuf,
+    no_input: bool,
 ) -> Result<StandaloneRuntime, String> {
     let content = compile_standalone_config(entry, selected_alias)?;
     Ok(StandaloneRuntime {
@@ -301,6 +324,7 @@ pub(crate) fn prepare_standalone_runtime(
             &[],
             control_dir,
             true,
+            no_input,
         )?,
     })
 }
@@ -311,6 +335,7 @@ pub(crate) fn prepare_paired_standalone_runtime(
     vm_alias: &str,
     forwards: &[ServiceForward],
     control_dir: PathBuf,
+    no_input: bool,
 ) -> Result<PairedStandaloneRuntime, String> {
     let transit_port = allocate_transit_port()?;
     let gateway_config = compile_gateway_config(
@@ -346,6 +371,7 @@ pub(crate) fn prepare_paired_standalone_runtime(
         &[],
         gateway_dir,
         true,
+        no_input,
     ) {
         Ok(runtime) => StandaloneRuntime { runtime },
         Err(error) => {
@@ -354,7 +380,7 @@ pub(crate) fn prepare_paired_standalone_runtime(
         }
     };
     let vm = match Runtime::create_with_directory(
-        &route.vm, home, vm_alias, vm_config, forwards, vm_dir, true,
+        &route.vm, home, vm_alias, vm_config, forwards, vm_dir, true, no_input,
     ) {
         Ok(runtime) => StandaloneRuntime { runtime },
         Err(error) => {
@@ -419,7 +445,7 @@ fn open_session(
     forwards: &[ServiceForward],
 ) -> Result<(), String> {
     session::preflight(forwards)?;
-    let runtime = Runtime::create(entry, home, selected_alias, forwards)?;
+    let runtime = Runtime::create(entry, home, selected_alias, forwards, no_input)?;
     let mut attempt = match password_fd {
         Some(fd) => Some(read_password_fd(fd)?),
         None => runtime
@@ -556,9 +582,16 @@ fn open_paired_session(
         &stable_vm_host_key_alias(&route.vm_id),
         forwards,
     )?;
-    let gateway_runtime =
-        Runtime::create_with_content(&route.gateway, home, gateway_alias, gateway_config, &[])?;
-    let vm_runtime = Runtime::create_with_content(&route.vm, home, vm_alias, vm_config, forwards)?;
+    let gateway_runtime = Runtime::create_with_content(
+        &route.gateway,
+        home,
+        gateway_alias,
+        gateway_config,
+        &[],
+        no_input,
+    )?;
+    let vm_runtime =
+        Runtime::create_with_content(&route.vm, home, vm_alias, vm_config, forwards, no_input)?;
     let mut gateway_attempt = password_attempt(&gateway_runtime, credentials.gateway_password_fd)
         .map_err(|error| paired_stage_error("gateway", error))?;
     let mut vm_attempt = password_attempt(&vm_runtime, credentials.vm_password_fd)
@@ -1523,13 +1556,101 @@ fn classify_master_failure(
         format!("SSH_AUTH_FAILED: {detail}")
     }
 }
-fn selected_password(entry: &HostEntry) -> Result<Option<String>, String> {
-    let bytes = fs::read(&entry.source.path).map_err(|error| {
-        format!(
-            "CONFIG_READ_FAILED: cannot read {}: {error}",
-            entry.source.path
-        )
-    })?;
+fn selected_password(entry: &HostEntry, no_input: bool) -> Result<Option<String>, String> {
+    let mut repaired = false;
+    loop {
+        let bytes = fs::read(&entry.source.path).map_err(|error| {
+            format!(
+                "CONFIG_READ_FAILED: cannot read {}: {error}",
+                entry.source.path
+            )
+        })?;
+        let Some(password) = extract_password(&bytes, entry)? else {
+            return Ok(None);
+        };
+        let current_mode = match permissions::assess(Path::new(&entry.source.path), true) {
+            Ok(mode) => mode,
+            Err(reason) => {
+                return Err(format!(
+                    "PERMISSION_REPAIR_UNSAFE: {} ({reason})",
+                    entry.source.path
+                ));
+            }
+        };
+        if current_mode == permissions::PRIVATE_FILE_MODE {
+            return Ok(Some(password));
+        }
+        if repaired {
+            let candidate = permissions::RepairCandidate {
+                kind: "password_file".to_string(),
+                path: PathBuf::from(&entry.source.path),
+                file: true,
+                current_mode,
+                reason: format!(
+                    "current mode {:o} requires {:o}",
+                    current_mode,
+                    permissions::PRIVATE_FILE_MODE
+                ),
+            };
+            return Err(permission_manual_error(
+                "PERMISSION_REPAIR_FAILED",
+                &candidate,
+                "retry still has unsafe permissions",
+            ));
+        }
+        let candidate = permissions::RepairCandidate {
+            kind: "password_file".to_string(),
+            path: PathBuf::from(&entry.source.path),
+            file: true,
+            current_mode,
+            reason: format!(
+                "current mode {:o} requires {:o}",
+                current_mode,
+                permissions::PRIVATE_FILE_MODE
+            ),
+        };
+        if no_input || !io::stdin().is_terminal() {
+            return Err(permission_manual_error(
+                "PERMISSION_REPAIR_REQUIRED",
+                &candidate,
+                "interactive confirmation unavailable",
+            ));
+        }
+        eprint!(
+            "Permission repair required\n  path: {}\n  current mode: {:o}\n  required mode: {:o}\n  reason: {}\nApply permission repair? [y/N]: ",
+            candidate.path.display(),
+            candidate.current_mode,
+            permissions::PRIVATE_FILE_MODE,
+            candidate.reason
+        );
+        io::stderr()
+            .flush()
+            .map_err(|error| format!("PERMISSION_REPAIR_PROMPT_FAILED: {error}"))?;
+        let mut answer = String::new();
+        io::stdin()
+            .read_line(&mut answer)
+            .map_err(|error| format!("PERMISSION_REPAIR_PROMPT_FAILED: {error}"))?;
+        if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+            return Err(permission_manual_error(
+                "PERMISSION_REPAIR_DECLINED",
+                &candidate,
+                "confirmation declined",
+            ));
+        }
+        let result = permissions::apply(&candidate);
+        if result.outcome == "fixed" {
+            repaired = true;
+        } else {
+            return Err(permission_manual_error(
+                "PERMISSION_REPAIR_FAILED",
+                &candidate,
+                &format!("{}: {}", result.outcome, result.detail),
+            ));
+        }
+    }
+}
+
+fn extract_password(bytes: &[u8], entry: &HostEntry) -> Result<Option<String>, String> {
     let end = entry.source.byte_end;
     if entry.source.byte_start >= end || end > bytes.len() {
         return Err("CONFIG_INVALID: selected Host span is outside source file".to_string());
@@ -1560,6 +1681,18 @@ fn selected_password(entry: &HostEntry) -> Result<Option<String>, String> {
         return Ok(Some(value.to_string()));
     }
     Ok(None)
+}
+fn permission_manual_error(
+    prefix: &str,
+    candidate: &permissions::RepairCandidate,
+    detail: &str,
+) -> String {
+    format!(
+        "{prefix}: {} ({detail}; {}); manual repair: {}",
+        candidate.path.display(),
+        candidate.reason,
+        permissions::manual_chmod_command(&candidate.path, candidate.file)
+    )
 }
 
 #[cfg(unix)]

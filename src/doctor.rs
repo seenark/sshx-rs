@@ -734,10 +734,11 @@ fn check_password_permissions(path: &Path, builder: &mut ReportBuilder) {
                 "Review ownership manually; use --fix-permissions to chmod eligible files after one confirmation.",
                 Some(path),
             );
-            if !unsafe_owner && metadata.is_file() {
-                if let Ok(current_mode) = crate::permissions::assess(path, true) {
-                    builder.repair("password_file", path, true, current_mode, 0o600);
-                }
+            if !unsafe_owner
+                && metadata.is_file()
+                && let Ok(current_mode) = crate::permissions::assess(path, true)
+            {
+                builder.repair("password_file", path, true, current_mode, 0o600);
             }
         }
     }
@@ -884,10 +885,11 @@ fn inspect_location(
             "Review ownership manually; use --fix-permissions to chmod eligible paths after one confirmation. Doctor never changes ownership, replaces paths, or modifies arbitrary parents.",
             Some(path),
         );
-        if unsafe_mode && !unsafe_owner {
-            if let Ok(current_mode) = crate::permissions::assess(path, file) {
-                builder.repair(kind, path, file, current_mode, expected_mode);
-            }
+        if unsafe_mode
+            && !unsafe_owner
+            && let Ok(current_mode) = crate::permissions::assess(path, file)
+        {
+            builder.repair(kind, path, file, current_mode, expected_mode);
         }
         "insecure".to_string()
     } else {

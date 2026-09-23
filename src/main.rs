@@ -1322,10 +1322,7 @@ fn select_connect_entry<'a>(
                 .or_else(|| entry.aliases.first())
                 .map(String::as_str)
                 .unwrap_or_default();
-            Ok(picker::Selection {
-                entry: *entry,
-                alias,
-            })
+            Ok(picker::Selection { entry, alias })
         }
         [] if cli.source.is_some() => Err(format!(
             "HOST_MISMATCH: selector `{selector}` does not match source and Host line"

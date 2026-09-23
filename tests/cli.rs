@@ -925,6 +925,7 @@ fn paired_connect_uses_isolated_route_and_reverse_cleanup() {
         "  ##PASSWORD vm-secret\n",
     );
     write(&config, original);
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
     let bin = paired_fake_ssh(&root);
     let output = run_paired_fake_ssh(
         &home,
@@ -1010,6 +1011,7 @@ fn paired_connect_attributes_gateway_auth_failure() {
             "  Port 22\n",
         ),
     );
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
     let bin = paired_fake_ssh(&root);
     let output = run_paired_fake_ssh_with_failure(
         &home,
@@ -1058,6 +1060,7 @@ fn paired_connect_attributes_vm_auth_failure_and_cleans_gateway() {
             "  ##PASSWORD vm-secret\n",
         ),
     );
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
     let bin = paired_fake_ssh(&root);
     let output = run_paired_fake_ssh_with_failure(
         &home,
@@ -1225,6 +1228,7 @@ fn direct_connect_compiles_exact_block_and_uses_owned_master() {
         &config,
         "##SSHX ID=direct-id\nHost direct\n  HostName direct.example # remove this\n  User alice\n  IdentityFile ~/.ssh/id_ed25519\n  ##PASSWORD never-copy-this\n",
     );
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
     let bin = fake_ssh(&root);
     fake_sshpass(&root);
     let output = run_fake_ssh(&home, &["connect", "direct", "--no-input"], &bin, &root);
@@ -1283,6 +1287,7 @@ fn direct_password_uses_selected_metadata_once_through_anonymous_fd() {
         &home.join(".ssh/config"),
         "Host sibling\n  HostName sibling.example\n  ##PASSWORD sibling-secret\nHost selected\n  HostName selected.example\n  ##PASSWORD selected-secret\n",
     );
+    fs::set_permissions(home.join(".ssh/config"), fs::Permissions::from_mode(0o600)).unwrap();
     let bin = fake_ssh(&root);
     fake_sshpass(&root);
     let output = run_fake_ssh(&home, &["connect", "selected", "--no-input"], &bin, &root);
@@ -1320,6 +1325,7 @@ fn wrong_configured_password_fails_without_retry_in_no_input_mode() {
         &home.join(".ssh/config"),
         "Host selected\n  HostName selected.example\n  ##PASSWORD configured-secret\n",
     );
+    fs::set_permissions(home.join(".ssh/config"), fs::Permissions::from_mode(0o600)).unwrap();
     let bin = fake_ssh(&root);
     fake_sshpass(&root);
     let path = format!(
@@ -2678,6 +2684,133 @@ fn doctor_fix_permissions_yes_still_requires_confirmation() {
     fs::remove_dir_all(root).unwrap();
 }
 
+#[cfg(unix)]
+#[test]
+fn direct_connect_repairs_password_config_before_retry() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(
+        &config,
+        "Host selected\n  HostName selected.example\n  ##PASSWORD configured-secret\n",
+    );
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o644)).unwrap();
+    let bin = fake_ssh(&root);
+    fake_sshpass(&root);
+    let (status, output) = run_with_pty_header(
+        &home,
+        &["connect", "selected"],
+        &bin,
+        &root,
+        b"y\n",
+        b"Permission repair required",
+    );
+    assert!(status.success(), "status={status:?} output={output}");
+    assert!(output.contains("current mode: 644"), "output={output}");
+    assert!(output.contains("required mode: 600"), "output={output}");
+    assert!(output.contains("reason:"), "output={output}");
+    assert_eq!(mode_of(&config), 0o600);
+    assert!(output.contains("direct-shell"), "output={output}");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn direct_connect_declined_permission_repair_keeps_password_config() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(
+        &config,
+        "Host selected\n  HostName selected.example\n  ##PASSWORD configured-secret\n",
+    );
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o644)).unwrap();
+    let bin = fake_ssh(&root);
+    fake_sshpass(&root);
+    let (status, output) = run_with_pty_header(
+        &home,
+        &["connect", "selected"],
+        &bin,
+        &root,
+        b"n\n",
+        b"Permission repair required",
+    );
+    assert_eq!(status.code(), Some(2), "status={status:?} output={output}");
+    assert!(
+        output.contains("PERMISSION_REPAIR_DECLINED"),
+        "output={output}"
+    );
+    assert!(output.contains("chmod 600 '"), "output={output}");
+    assert_eq!(mode_of(&config), 0o644);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn direct_connect_no_input_keeps_password_config_and_shows_manual_repair() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(
+        &config,
+        "Host selected\n  HostName selected.example\n  ##PASSWORD configured-secret\n",
+    );
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o644)).unwrap();
+    let bin = fake_ssh(&root);
+    fake_sshpass(&root);
+    let output = run_fake_ssh(&home, &["connect", "selected", "--no-input"], &bin, &root);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("chmod 600 '"));
+    assert_eq!(mode_of(&config), 0o644);
+    fs::remove_dir_all(root).unwrap();
+}
+#[cfg(unix)]
+#[test]
+
+fn direct_connect_no_tty_keeps_password_config_and_shows_manual_repair() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(
+        &config,
+        "Host selected\n  HostName selected.example\n  ##PASSWORD configured-secret\n",
+    );
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o644)).unwrap();
+    let bin = fake_ssh(&root);
+    fake_sshpass(&root);
+    let output = run_fake_ssh(&home, &["connect", "selected"], &bin, &root);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("chmod 600 '"));
+    assert_eq!(mode_of(&config), 0o644);
+    fs::remove_dir_all(root).unwrap();
+}
+#[cfg(unix)]
+#[test]
+fn direct_connect_repair_does_not_retry_real_auth_failure() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(
+        &config,
+        "Host selected\n  HostName selected.example\n  ##PASSWORD configured-secret\n",
+    );
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o644)).unwrap();
+    write(&root.join("auth-fail"), "");
+    let bin = fake_ssh(&root);
+    fake_sshpass(&root);
+    let (status, output) = run_with_pty_header(
+        &home,
+        &["connect", "selected"],
+        &bin,
+        &root,
+        b"y\nn\n",
+        b"Permission repair required",
+    );
+    assert_eq!(status.code(), Some(2), "status={status:?} output={output}");
+    assert!(output.contains("SSH_AUTH_FAILED"), "output={output}");
+    assert_eq!(
+        output.matches("Permission repair required").count(),
+        1,
+        "permission repair must prompt once: {output}"
+    );
+    assert_eq!(mode_of(&config), 0o600);
+    fs::remove_dir_all(root).unwrap();
+}
+
 fn mode_of(path: &Path) -> u32 {
     fs::metadata(path).unwrap().permissions().mode() & 0o7777
 }
@@ -2728,6 +2861,14 @@ fn run_with_pty_header(
         .env("SSHX_CAPTURE", root.join("runtime-config"))
         .env("SSHX_STARTED", root.join("master-started"))
         .env("SSHX_CLOSED", root.join("master-closed"))
+        .env(
+            "SSHX_AUTH_FAIL",
+            if root.join("auth-fail").exists() {
+                "1"
+            } else {
+                ""
+            },
+        )
         .args(args)
         .stdin(Stdio::from(stdin))
         .stdout(Stdio::from(stdout))

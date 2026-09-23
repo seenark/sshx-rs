@@ -211,15 +211,19 @@ pub fn start(
     fs::create_dir(&control_dir)
         .map_err(|error| format!("REGISTRY_FAILED: cannot create control directory: {error}"))?;
     set_mode(&control_dir, 0o700)?;
-    let runtime =
-        match connect::prepare_standalone_runtime(entry, home, selected_alias, control_dir.clone())
-        {
-            Ok(runtime) => runtime,
-            Err(error) => {
-                let _ = fs::remove_dir_all(&control_dir);
-                return Err(error);
-            }
-        };
+    let runtime = match connect::prepare_standalone_runtime(
+        entry,
+        home,
+        selected_alias,
+        control_dir.clone(),
+        no_input,
+    ) {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&control_dir);
+            return Err(error);
+        }
+    };
     let record = RegistryEntry {
         id,
         state: "starting".to_string(),
@@ -353,6 +357,7 @@ pub fn start_paired(
         vm_alias,
         forwards,
         control_dir.clone(),
+        no_input,
     ) {
         Ok(runtime) => runtime,
         Err(error) => {
