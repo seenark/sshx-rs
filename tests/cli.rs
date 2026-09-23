@@ -4404,6 +4404,40 @@ fn selectorless_connect_picker_preserves_secondary_alias() {
     );
     fs::remove_dir_all(root).unwrap();
 }
+#[cfg(unix)]
+#[test]
+fn selectorless_connect_picker_arrow_moves_selection() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(
+        &config,
+        concat!(
+            "Host first\n",
+            "  HostName first.example\n",
+            "Host second\n",
+            "  HostName second.example\n",
+        ),
+    );
+    let bin = fake_ssh(&root);
+    let (status, output) = run_with_pty(
+        &home,
+        &["--config", config.to_str().unwrap(), "connect"],
+        &bin,
+        &root,
+        b"\x1b[B\x1b[A\x1b[B\n\n",
+    );
+    assert!(status.success(), "status={status:?} output={output}");
+    assert!(output.contains("> second"), "picker output={output}");
+    assert!(
+        !output.contains("PICKER_CANCELLED"),
+        "picker output={output}"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("runtime-config")).unwrap(),
+        "Host second\n  HostName second.example\nInclude /etc/ssh/ssh_config\n"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
 
 #[cfg(unix)]
 #[test]

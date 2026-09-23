@@ -1,7 +1,8 @@
 use sshx::discovery::HostEntry;
 use std::cmp::Ordering;
+use std::fs::File;
 use std::io::{self, IsTerminal, Read, Write};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 
 pub const CANCELLED: &str = "PICKER_CANCELLED";
 
@@ -130,7 +131,7 @@ pub fn select_menu(options: &[&str], label: &str) -> Result<usize, String> {
 
 fn with_terminal<T>(
     not_terminal_error: String,
-    run: impl FnOnce(&mut io::Stdin, &mut io::Stderr, libc::c_int) -> Result<T, String>,
+    run: impl FnOnce(&mut File, &mut io::Stderr, libc::c_int) -> Result<T, String>,
 ) -> Result<T, String> {
     let input = io::stdin();
     if !input.is_terminal() {
@@ -139,7 +140,14 @@ fn with_terminal<T>(
 
     let fd = input.as_raw_fd();
     let _raw_mode = RawMode::enter(fd)?;
-    let mut input = input;
+    let input_fd = unsafe { libc::dup(fd) };
+    if input_fd < 0 {
+        return Err(format!(
+            "HOST_REQUIRED: cannot duplicate interactive terminal: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    let mut input = unsafe { File::from_raw_fd(input_fd) };
     let mut error = io::stderr();
     let result = run(&mut input, &mut error, fd);
     if result.is_ok() || matches!(&result, Err(error) if error == CANCELLED) {
