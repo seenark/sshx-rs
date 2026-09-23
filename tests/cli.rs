@@ -1,13 +1,14 @@
 use std::fs;
-use std::io::Write;
+use std::io::{self, Read, Write};
 use std::net::TcpListener;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static FIXTURE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 #[test]
@@ -2565,5 +2566,159 @@ fn pair_setup_enforces_gateway_cardinality_by_entry_identity() {
     );
     assert_eq!(reuse.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&reuse.stderr).contains("PAIR_GATEWAY_IN_USE"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+fn run_with_pty(
+    home: &Path,
+    args: &[&str],
+    bin: &Path,
+    root: &Path,
+    input: &[u8],
+) -> (std::process::ExitStatus, String) {
+    let mut master = -1;
+    let mut slave = -1;
+    let result = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    assert_eq!(result, 0, "openpty should succeed");
+    let slave = unsafe { std::fs::File::from_raw_fd(slave) };
+    let stdin = slave.try_clone().expect("pty stdin should clone");
+    let stdout = slave.try_clone().expect("pty stdout should clone");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sshx"))
+        .env("HOME", home)
+        .env("PATH", path)
+        .env("SSHX_CAPTURE", root.join("runtime-config"))
+        .env("SSHX_STARTED", root.join("master-started"))
+        .env("SSHX_CLOSED", root.join("master-closed"))
+        .args(args)
+        .stdin(Stdio::from(stdin))
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(slave))
+        .spawn()
+        .expect("sshx should start in pty");
+    let mut master = unsafe { std::fs::File::from_raw_fd(master) };
+    let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+    assert!(flags >= 0, "pty flags should be readable");
+    assert_eq!(
+        unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0,
+        "pty should become nonblocking"
+    );
+    let mut output = Vec::new();
+    let header = b"sshx connect host picker";
+    let startup_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut buffer = [0u8; 4096];
+        match master.read(&mut buffer) {
+            Ok(size) => output.extend_from_slice(&buffer[..size]),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => panic!("picker PTY read failed before startup: {error}"),
+        }
+        if output.windows(header.len()).any(|window| window == header) {
+            break;
+        }
+        assert!(
+            Instant::now() < startup_deadline,
+            "sshx picker should render before input"
+        );
+        assert!(
+            child
+                .try_wait()
+                .expect("sshx status should be readable")
+                .is_none(),
+            "sshx picker exited before rendering"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    master.write_all(input).expect("pty input should write");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        let mut buffer = [0u8; 4096];
+        match master.read(&mut buffer) {
+            Ok(size) => output.extend_from_slice(&buffer[..size]),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => break child.wait().expect("sshx should exit"),
+        }
+        if let Some(status) = child.try_wait().expect("sshx status should be readable") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            child.kill().expect("sshx picker should stop after timeout");
+            break child.wait().expect("sshx picker should exit after timeout");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    for _ in 0..10 {
+        let mut buffer = [0u8; 4096];
+        match master.read(&mut buffer) {
+            Ok(size) if size > 0 => output.extend_from_slice(&buffer[..size]),
+            _ => break,
+        }
+    }
+    (status, String::from_utf8_lossy(&output).into_owned())
+}
+
+#[cfg(unix)]
+#[test]
+fn selectorless_connect_picker_preserves_secondary_alias() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(
+        &config,
+        "Host first second\n  HostName destination.example\nHost other\n  HostName other.example\n",
+    );
+    let bin = fake_ssh(&root);
+    let (status, output) = run_with_pty(
+        &home,
+        &["--config", config.to_str().unwrap(), "connect"],
+        &bin,
+        &root,
+        b"second\n",
+    );
+    assert!(status.success(), "status={status:?} output={output}");
+    assert!(output.contains("second"), "picker output={output}");
+    assert_eq!(
+        fs::read_to_string(root.join("runtime-config")).unwrap(),
+        "Host second\n  HostName destination.example\nInclude /etc/ssh/ssh_config\n"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn selectorless_connect_picker_escape_cancels_without_side_effect() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(&config, "Host first\n  HostName destination.example\n");
+    let bin = fake_ssh(&root);
+    let (status, output) = run_with_pty(
+        &home,
+        &["--config", config.to_str().unwrap(), "connect"],
+        &bin,
+        &root,
+        b"\x1b",
+    );
+    assert_eq!(
+        status.code(),
+        Some(130),
+        "status={status:?} output={output}"
+    );
+    assert!(output.contains("Cancelled."), "picker output={output}");
+    assert!(!root.join("runtime-config").exists());
     fs::remove_dir_all(root).unwrap();
 }
