@@ -116,7 +116,8 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
             render_entries(&entries, &diagnostics, cli.format)
         }
         Command::Connect(selector) => {
-            let selected = select_connect_entry(&filtered, selector.as_deref(), &cli)?;
+            let selected =
+                select_connect_entry(&filtered, selector.as_deref(), &cli, "connect host")?;
             let entry = selected.entry;
             if cli.format.is_machine() {
                 render_entries(&[entry], &diagnostics, cli.format)
@@ -182,7 +183,7 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
                         .to_string(),
                 );
             }
-            let selected = select_connect_entry(&filtered, selector.as_deref(), &cli)?;
+            let selected = select_connect_entry(&filtered, selector.as_deref(), &cli, "tunnel")?;
             let entry = selected.entry;
             let route = sshx::pair::paired_route(&catalog.entries, entry)?.ok_or_else(|| {
                 "TUNNEL_PAIRED_REQUIRED: selected HostEntry has no valid Pair".to_string()
@@ -215,7 +216,8 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
                         .to_string(),
                 );
             }
-            let selected = select_connect_entry(&filtered, selector.as_deref(), &cli)?;
+            let selected =
+                select_connect_entry(&filtered, selector.as_deref(), &cli, "tunnel direct")?;
             let entry = selected.entry;
             if sshx::pair::paired_route(&catalog.entries, entry)?.is_some() {
                 return Err(
@@ -352,32 +354,30 @@ fn run_pair(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), String> {
             Ok(())
         }
         Command::PairSetup { gateway, vm } => {
-            let gateway_selector = gateway
-                .as_deref()
-                .ok_or_else(|| "GATEWAY_REQUIRED: provide a gateway selector".to_string())?;
-            let vm_selector = vm
-                .as_deref()
-                .ok_or_else(|| "VM_REQUIRED: provide a VM selector".to_string())?;
             let gateway = select_pair_entry(
                 &catalog.entries,
-                gateway_selector,
+                gateway.as_deref(),
                 cli.gateway_source.as_ref().or(cli.source.as_ref()),
                 cli.gateway_line.or(cli.line),
                 "gateway",
+                cli.no_input,
             )?;
             let vm = select_pair_entry(
                 &catalog.entries,
-                vm_selector,
+                vm.as_deref(),
                 cli.vm_source.as_ref(),
                 cli.vm_line,
                 "VM",
+                cli.no_input,
             )?;
-            mutation::validate_entry_paths(gateway)?;
-            mutation::validate_entry_paths(vm)?;
+            mutation::validate_entry_paths(gateway.entry)?;
+            mutation::validate_entry_paths(vm.entry)?;
             let plan = sshx::pair::plan_setup(
                 &catalog.entries,
-                gateway,
-                vm,
+                gateway.entry,
+                vm.entry,
+                gateway.alias,
+                vm.alias,
                 cli.transit_host.as_deref(),
                 cli.transit_port,
             )?;
@@ -407,17 +407,19 @@ fn run_pair(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), String> {
 
 fn select_pair_entry<'a>(
     entries: &'a [HostEntry],
-    selector: &str,
+    selector: Option<&str>,
     source: Option<&PathBuf>,
     line: Option<usize>,
     role: &str,
-) -> Result<&'a HostEntry, String> {
+    no_input: bool,
+) -> Result<picker::Selection<'a>, String> {
     if source.is_some() != line.is_some() {
         return Err(format!(
             "SELECTOR_INCOMPLETE: {role} source and line must be provided together"
         ));
     }
-    let id_match = entries.iter().any(|entry| entry.id == selector);
+    let id_match =
+        selector.is_some_and(|selector| entries.iter().any(|entry| entry.id == selector));
     let home = home_dir().unwrap_or_else(|_| PathBuf::from("."));
     let source = source.map(|path| {
         let path = settings::normalize_path(path, &home);
@@ -429,11 +431,13 @@ fn select_pair_entry<'a>(
     let matches = entries
         .iter()
         .filter(|entry| {
-            if id_match {
-                entry.id == selector
-            } else {
-                entry.aliases.iter().any(|alias| alias == selector)
-            }
+            selector.is_none_or(|selector| {
+                if id_match {
+                    entry.id == selector
+                } else {
+                    entry.aliases.iter().any(|alias| alias == selector)
+                }
+            })
         })
         .filter(|entry| {
             source
@@ -442,16 +446,46 @@ fn select_pair_entry<'a>(
         })
         .filter(|entry| line.is_none_or(|line| entry.source.line_start == line))
         .collect::<Vec<_>>();
+    let role_label = role.to_ascii_lowercase();
+    let role_code = role.to_ascii_uppercase();
+    if selector.is_none() {
+        if matches.is_empty() {
+            return Err("HOST_NOT_FOUND: no hosts match current filters".to_string());
+        }
+        if no_input {
+            return Err(format!(
+                "{role_code}_REQUIRED: provide a {role_label} selector in --no-input mode"
+            ));
+        }
+        if !io::stdin().is_terminal() {
+            return Err(format!(
+                "{role_code}_REQUIRED: provide a {role_label} selector outside interactive mode"
+            ));
+        }
+        return interactive_select(&matches, &format!("pair {role_label}"));
+    }
     match matches.as_slice() {
-        [entry] => Ok(*entry),
+        [entry] => {
+            let selector = selector.unwrap();
+            let alias = (!id_match)
+                .then(|| entry.aliases.iter().find(|alias| alias == &selector))
+                .flatten()
+                .or_else(|| entry.aliases.first())
+                .map(String::as_str)
+                .unwrap_or_default();
+            Ok(picker::Selection { entry, alias })
+        }
         [] if source.is_some() => Err(format!(
-            "HOST_MISMATCH: {role} selector `{selector}` does not match source and Host line"
+            "HOST_MISMATCH: {role} selector `{}` does not match source and Host line",
+            selector.unwrap()
         )),
         [] => Err(format!(
-            "HOST_NOT_FOUND: {role} selector `{selector}` matched no entries"
+            "HOST_NOT_FOUND: {role} selector `{}` matched no entries",
+            selector.unwrap()
         )),
         many => Err(format!(
-            "HOST_AMBIGUOUS: {role} selector `{selector}` matched {} entries",
+            "HOST_AMBIGUOUS: {role} selector `{}` matched {} entries",
+            selector.unwrap(),
             many.len()
         )),
     }
@@ -631,14 +665,15 @@ fn run_host_edit(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), String> {
     {
         return Err("MUTATION_FIELDS: rename accepts only --alias".to_string());
     }
-    let entry = select_mutation_entry(&filtered, positional, cli)?;
+    let picker_label = match operation {
+        MutationKind::Update => "host update",
+        MutationKind::Rename => "host rename",
+        MutationKind::Delete => "host delete",
+    };
+    let selected = select_mutation_entry(&filtered, positional, cli, picker_label)?;
+    let entry = selected.entry;
     mutation::validate_entry_paths(entry)?;
-    let selected_alias = positional
-        .and_then(|selector| entry.aliases.iter().find(|alias| alias == &selector))
-        .or_else(|| entry.aliases.first())
-        .map(String::as_str)
-        .unwrap_or_default()
-        .to_string();
+    let selected_alias = selected.alias.to_string();
     let home = home_dir()?;
     let plan = match operation {
         MutationKind::Delete => {
@@ -700,16 +735,26 @@ fn run_host_edit(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), String> {
     print!("{}", render_edit(&plan, cli.format, true)?);
     Ok(())
 }
-
 fn select_mutation_entry<'a>(
     entries: &[&'a HostEntry],
     positional: Option<&str>,
     cli: &Cli,
-) -> Result<&'a HostEntry, String> {
+    picker_label: &str,
+) -> Result<picker::Selection<'a>, String> {
     if positional.is_none() && cli.id.is_none() {
-        return Err("HOST_REQUIRED: host mutation requires a selector".to_string());
+        if cli.no_input {
+            return Err(
+                "HOST_REQUIRED: host mutation requires a host in --no-input mode".to_string(),
+            );
+        }
+        if !io::stdin().is_terminal() {
+            return Err(
+                "HOST_REQUIRED: host mutation requires a host outside interactive mode".to_string(),
+            );
+        }
+        return interactive_select(entries, picker_label);
     }
-    select_connect_entry(entries, positional, cli).map(|selected| selected.entry)
+    select_connect_entry(entries, positional, cli, picker_label)
 }
 
 fn ensure_delete_allowed(home: &std::path::Path, entry: &HostEntry) -> Result<(), String> {
@@ -1261,6 +1306,7 @@ fn select_connect_entry<'a>(
     entries: &[&'a HostEntry],
     positional: Option<&str>,
     cli: &Cli,
+    picker_label: &str,
 ) -> Result<picker::Selection<'a>, String> {
     if cli.id.is_some() && positional.is_some() {
         return Err("SELECTOR_CONFLICT: use either --id or a positional selector".to_string());
@@ -1282,14 +1328,16 @@ fn select_connect_entry<'a>(
     }
     let Some(selector) = selector else {
         if cli.no_input {
-            return Err("HOST_REQUIRED: connect requires a host in --no-input mode".to_string());
+            return Err(format!(
+                "HOST_REQUIRED: {picker_label} requires a host in --no-input mode"
+            ));
         }
         if !io::stdin().is_terminal() {
-            return Err(
-                "HOST_REQUIRED: connect requires a host outside interactive mode".to_string(),
-            );
+            return Err(format!(
+                "HOST_REQUIRED: {picker_label} requires a host outside interactive mode"
+            ));
         }
-        return interactive_select(entries);
+        return interactive_select(entries, picker_label);
     };
 
     let by_id = cli.id.is_some()
@@ -1334,8 +1382,11 @@ fn select_connect_entry<'a>(
     }
 }
 
-fn interactive_select<'a>(entries: &[&'a HostEntry]) -> Result<picker::Selection<'a>, String> {
-    picker::select(entries)
+fn interactive_select<'a>(
+    entries: &[&'a HostEntry],
+    label: &str,
+) -> Result<picker::Selection<'a>, String> {
+    picker::select(entries, label)
 }
 
 fn format_ambiguous(selector: &str, entries: &[&HostEntry]) -> String {
@@ -1795,6 +1846,14 @@ impl Cli {
                 Command::PairSetup {
                     gateway: Some(gateway.clone()),
                     vm: Some(vm.clone()),
+                }
+            }
+            [pair, setup, gateway]
+                if pair == "pair" && matches!(setup.as_str(), "setup" | "create") =>
+            {
+                Command::PairSetup {
+                    gateway: Some(gateway.clone()),
+                    vm: None,
                 }
             }
             [pair, setup] if pair == "pair" && matches!(setup.as_str(), "setup" | "create") => {

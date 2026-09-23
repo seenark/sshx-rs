@@ -52,14 +52,14 @@ impl Drop for RawMode {
     }
 }
 
-pub fn select<'a>(entries: &[&'a HostEntry]) -> Result<Selection<'a>, String> {
+pub fn select<'a>(entries: &[&'a HostEntry], label: &str) -> Result<Selection<'a>, String> {
     if entries.is_empty() {
         return Err("HOST_NOT_FOUND: no hosts match current filters".to_string());
     }
     if !io::stdin().is_terminal() {
-        return Err(
-            "HOST_REQUIRED: connect requires a host with a usable interactive terminal".to_string(),
-        );
+        return Err(format!(
+            "HOST_REQUIRED: {label} requires a HostEntry selector with a usable interactive terminal"
+        ));
     }
 
     let input = io::stdin();
@@ -77,7 +77,7 @@ pub fn select<'a>(entries: &[&'a HostEntry]) -> Result<Selection<'a>, String> {
         } else {
             selected = selected.min(rows.len() - 1);
         }
-        render(&mut error, &rows, &query, selected)?;
+        render(&mut error, &rows, &query, selected, label)?;
 
         let mut byte = [0u8; 1];
         input
@@ -236,10 +236,11 @@ fn render(
     rows: &[Row<'_>],
     query: &str,
     selected: usize,
+    label: &str,
 ) -> Result<(), String> {
     write!(
         error,
-        "\x1b[2J\x1b[Hsshx connect host picker\nSearch: {query}\n\n"
+        "\x1b[2J\x1b[Hsshx {label} picker\nSearch: {query}\n\n"
     )
     .map_err(|error| format!("HOST_REQUIRED: cannot render picker: {error}"))?;
     if rows.is_empty() {

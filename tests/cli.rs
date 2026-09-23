@@ -2811,6 +2811,193 @@ fn direct_connect_repair_does_not_retry_real_auth_failure() {
     fs::remove_dir_all(root).unwrap();
 }
 
+#[cfg(unix)]
+#[test]
+fn host_rename_picker_preserves_selected_alias_and_identity() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(
+        &config,
+        concat!(
+            "##SSHX ID=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\n",
+            "Host first common\n",
+            "  HostName first.example\n",
+            "##SSHX ID=bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb\n",
+            "Host second common\n",
+            "  HostName second.example\n",
+        ),
+    );
+    let bin = fake_ssh(&root);
+    let (status, output) = run_with_pty_header(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "host",
+            "rename",
+            "--alias",
+            "renamed",
+        ],
+        &bin,
+        &root,
+        b"second\ny\n",
+        b"sshx host rename picker",
+    );
+    assert!(status.success(), "status={status:?} output={output}");
+    assert!(output.contains("Apply changes?"), "output={output}");
+    assert!(
+        !output.contains("sshx connect host picker"),
+        "output={output}"
+    );
+    let updated = fs::read_to_string(&config).unwrap();
+    assert!(updated.contains("Host first common\n"));
+    assert!(updated.contains("Host renamed common\n"));
+    assert!(updated.contains("##SSHX ID=bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb\n"));
+    assert!(!updated.contains("Host second common\n"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn pair_setup_picker_selects_gateway_and_vm_alias_rows() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(
+        &config,
+        concat!(
+            "Host gateway gw\n",
+            "  HostName gateway.example\n",
+            "  LocalForward 2200 vm.internal:22\n",
+            "Host vm machine\n",
+            "  HostName vm.internal\n",
+            "  Port 22\n",
+        ),
+    );
+    let bin = fake_ssh(&root);
+    let (status, output) = run_with_pty_header(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "pair",
+            "setup",
+            "--format",
+            "json",
+        ],
+        &bin,
+        &root,
+        b"gw\nmachine\ny\n",
+        b"sshx pair gateway picker",
+    );
+    assert!(status.success(), "status={status:?} output={output}");
+    assert!(output.contains("sshx pair vm picker"), "output={output}");
+    let document_start = output.find('{').expect("pair JSON should be rendered");
+    let document: serde_json::Value =
+        serde_json::from_str(&output[document_start..]).expect("pair JSON should parse");
+    let gateway_id = document["gateway_id"].as_str().unwrap();
+    let vm_id = document["vm_id"].as_str().unwrap();
+    let updated = fs::read_to_string(&config).unwrap();
+    assert!(updated.contains("Host gateway gw\n"));
+    assert!(updated.contains("Host vm machine\n"));
+    assert!(updated.contains(&format!("##SSHX ID={gateway_id}\n")));
+    assert!(updated.contains(&format!("##SSHX ID={vm_id}\n")));
+    assert!(updated.contains(&format!("##SSHX GATEWAY={gateway_id}\n")));
+    assert!(updated.contains(&format!("##SSHX VM={vm_id}\n")));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn noninteractive_picker_errors_name_requested_action() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(&config, "Host selected\n  HostName selected.example\n");
+    let bin = fake_ssh(&root);
+    let mutation = run_fake_ssh(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "host",
+            "rename",
+            "--alias",
+            "renamed",
+        ],
+        &bin,
+        &root,
+    );
+    let mutation_error = String::from_utf8_lossy(&mutation.stderr);
+    assert_eq!(mutation.status.code(), Some(2));
+    assert!(
+        mutation_error.contains("host mutation requires"),
+        "{mutation_error}"
+    );
+    assert!(!mutation_error.contains("connect"), "{mutation_error}");
+    let tunnel = run_fake_ssh(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "tunnel",
+            "direct",
+            "start",
+            "-L",
+            "127.0.0.1:1234:127.0.0.1:22",
+        ],
+        &bin,
+        &root,
+    );
+    let tunnel_error = String::from_utf8_lossy(&tunnel.stderr);
+    assert_eq!(tunnel.status.code(), Some(2));
+    assert!(
+        tunnel_error.contains("tunnel direct requires"),
+        "{tunnel_error}"
+    );
+    assert!(!tunnel_error.contains("connect"), "{tunnel_error}");
+    assert_eq!(
+        fs::read_to_string(&config).unwrap(),
+        "Host selected\n  HostName selected.example\n"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn tunnel_picker_escape_cancels_before_start() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(&config, "Host direct alias\n  HostName direct.example\n");
+    let bin = fake_ssh(&root);
+    let (status, output) = run_with_pty_header(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "tunnel",
+            "direct",
+            "start",
+            "-R",
+            "127.0.0.1:2222:127.0.0.1:22",
+        ],
+        &bin,
+        &root,
+        b"\x1b",
+        b"sshx tunnel direct picker",
+    );
+    assert_eq!(
+        status.code(),
+        Some(130),
+        "status={status:?} output={output}"
+    );
+    assert!(output.contains("Cancelled."), "output={output}");
+    assert!(!root.join("master-started").exists());
+    assert!(!home.join(".config/sshx/tunnels").exists());
+    assert_eq!(
+        fs::read_to_string(&config).unwrap(),
+        "Host direct alias\n  HostName direct.example\n"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
 fn mode_of(path: &Path) -> u32 {
     fs::metadata(path).unwrap().permissions().mode() & 0o7777
 }
