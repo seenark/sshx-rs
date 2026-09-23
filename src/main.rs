@@ -1,3 +1,4 @@
+mod help;
 mod picker;
 use serde::Serialize;
 use sshx::discovery::{HostEntry, discover_roots, scope_for_path};
@@ -12,9 +13,6 @@ use std::ffi::OsString;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{self, Stdio};
-const USAGE: &str = "Usage: sshx [--version]";
-const HOST_USAGE: &str = "Usage: sshx [--config PATH] host list [--format human|json|yaml]\n       sshx [--config PATH] host show SELECTOR [--format human|json|yaml]\n       sshx [--config PATH] host create --scope SCOPE --file PATH --alias ALIAS --hostname HOSTNAME [options]\n       sshx [--config PATH] host update SELECTOR [options]\n       sshx [--config PATH] host rename SELECTOR --alias ALIAS [options]\n       sshx [--config PATH] host delete SELECTOR [options]";
-const SETUP_USAGE: &str = "Usage: sshx setup [--personal PATH] [--work PATH] [--project NAME]\n       sshx doctor [--fix-permissions] [--format human|json|yaml]\n       sshx connect [SELECTOR] [--id ID] [--action connect|copy-ssh|copy-sshx|copy-password] [--source PATH --line NUMBER] [--password-fd FD] [--gateway-password-fd FD --vm-password-fd FD] [--bind] [--forward REMOTE[=LOCAL]] [--no-input]\n       sshx tunnel direct start [SELECTOR] [-L SPEC] [-R SPEC] [-D SPEC] [--allow-bind]\n       sshx tunnel paired start [SELECTOR] [--bind] [--forward REMOTE[=LOCAL]] [--no-input]\n       sshx tunnel direct list|status ID|stop ID|restart ID\n       sshx tunnel paired list|status ID|stop ID|restart ID\n       sshx pair setup [GATEWAY] [VM] [--gateway ID] [--vm ID] [--transit-host HOST --transit-port PORT]";
 
 fn main() {
     match run(env::args_os().skip(1).collect()) {
@@ -30,23 +28,149 @@ fn main() {
     }
 }
 
-fn run(args: Vec<OsString>) -> Result<(), String> {
-    if args.is_empty() {
-        println!("{USAGE}");
-        return Ok(());
-    }
-    if let Some(first) = args.first().and_then(|argument| argument.to_str()) {
-        if first == "--version" || first == "-V" {
-            println!("{}", sshx::VERSION);
-            return Ok(());
+fn help_path(args: &[OsString]) -> Option<Vec<String>> {
+    let mut tokens = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let text = args[index].to_str()?;
+        if text == "--format" {
+            index += 2;
+            continue;
         }
-        if first == "--help" || first == "-h" {
-            println!("{USAGE}");
-            return Ok(());
+        if text.starts_with("--format=") {
+            index += 1;
+            continue;
         }
+        tokens.push(text.to_string());
+        index += 1;
     }
 
-    let cli = Cli::parse(args)?;
+    let command_tokens = command_path(&tokens);
+    if command_tokens.first().map(String::as_str) == Some("help") {
+        return Some(canonical_help_path(command_tokens[1..].to_vec()));
+    }
+    tokens
+        .iter()
+        .position(|token| matches!(token.as_str(), "-h" | "--help"))
+        .map(|position| canonical_help_path(command_path(&tokens[..position])))
+}
+
+fn canonical_help_path(path: Vec<String>) -> Vec<String> {
+    if matches!(
+        path.first().map(String::as_str),
+        Some("setup" | "doctor" | "connect")
+    ) {
+        path.into_iter().take(1).collect()
+    } else {
+        path
+    }
+}
+
+fn command_path(tokens: &[String]) -> Vec<String> {
+    let mut path = Vec::new();
+    let mut index = 0;
+    while index < tokens.len() {
+        let token = &tokens[index];
+        if token.starts_with('-') {
+            if option_takes_value(token) {
+                index += 2;
+            } else {
+                index += 1;
+            }
+        } else {
+            path.push(token.clone());
+            index += 1;
+        }
+    }
+    path
+}
+
+fn option_takes_value(token: &str) -> bool {
+    matches!(
+        token,
+        "--config"
+            | "--format"
+            | "--action"
+            | "--scope"
+            | "--project"
+            | "--personal"
+            | "--work"
+            | "--personal-root"
+            | "--work-root"
+            | "--source"
+            | "--source-file"
+            | "--line"
+            | "--host-line"
+            | "--gateway"
+            | "--gateway-id"
+            | "--gateway-selector"
+            | "--vm"
+            | "--vm-id"
+            | "--vm-selector"
+            | "--gateway-source"
+            | "--gateway-line"
+            | "--vm-source"
+            | "--vm-line"
+            | "--transit-host"
+            | "--transit-port"
+            | "--alias"
+            | "--hostname"
+            | "--user"
+            | "--port"
+            | "--password-fd"
+            | "--gateway-password-fd"
+            | "--vm-password-fd"
+            | "--folder"
+            | "--file"
+            | "--target-file"
+            | "--id"
+            | "--host-id"
+            | "-L"
+            | "-R"
+            | "-D"
+            | "--forward"
+    )
+}
+
+fn nearest_usage_for_args(args: &[OsString]) -> &'static str {
+    let Some(tokens) = args
+        .iter()
+        .map(|argument| argument.to_str().map(str::to_owned))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return help::ROOT_USAGE;
+    };
+    nearest_usage(&command_path(&tokens))
+}
+
+fn nearest_usage(positional: &[String]) -> &'static str {
+    let path = positional.iter().map(String::as_str).collect::<Vec<_>>();
+    help::usage(&path)
+}
+
+fn run(args: Vec<OsString>) -> Result<(), String> {
+    if args.is_empty() {
+        println!("{}", help::render(&[])?);
+        return Ok(());
+    }
+    if let Some(first) = args.first().and_then(|argument| argument.to_str())
+        && (first == "--version" || first == "-V")
+    {
+        println!("{}", sshx::VERSION);
+        return Ok(());
+    }
+    if let Some(path) = help_path(&args) {
+        println!("{}", help::render(&path)?);
+        return Ok(());
+    }
+
+    let cli = Cli::parse(args.clone()).map_err(|error| {
+        if error.contains("Usage:") {
+            error
+        } else {
+            format!("{error}\n{}", nearest_usage_for_args(&args))
+        }
+    })?;
     if cli.action.is_some() && cli.format.is_machine() {
         return Err(
             "ACTION_FORMAT_CONFLICT: --action cannot be combined with JSON or YAML output"
@@ -2156,7 +2280,10 @@ impl Cli {
                     project: projects.last().cloned(),
                 });
             } else if text.starts_with('-') {
-                return Err(format!("unexpected argument `{text}`\n{USAGE}"));
+                return Err(format!(
+                    "unexpected argument `{text}`\n{}",
+                    nearest_usage(&positional)
+                ));
             } else {
                 positional.push(text.to_string());
             }
@@ -2287,11 +2414,16 @@ impl Cli {
             [connect, selector] if connect == "connect" => Command::Connect(Some(selector.clone())),
             [setup] if setup == "setup" => Command::Setup,
             _ if positional.len() == 1 => {
-                return Err(format!("unexpected argument `{}`\n{USAGE}", positional[0]));
+                return Err(format!(
+                    "unexpected argument `{}`\n{}",
+                    positional[0],
+                    nearest_usage(&positional)
+                ));
             }
             _ => {
                 return Err(format!(
-                    "expected `host list`, `host show SELECTOR`, `host create`, `connect`, or `setup`\n{HOST_USAGE}\n{SETUP_USAGE}"
+                    "expected a valid command path\n{}",
+                    nearest_usage(&positional)
                 ));
             }
         };

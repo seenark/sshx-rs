@@ -12,6 +12,140 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static FIXTURE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 #[test]
+fn help_root_forms_are_complete_and_deterministic() {
+    let first = Command::new(env!("CARGO_BIN_EXE_sshx")).output().unwrap();
+    let second = Command::new(env!("CARGO_BIN_EXE_sshx"))
+        .args(["help"])
+        .output()
+        .unwrap();
+    assert!(first.status.success(), "{first:?}");
+    assert!(second.status.success(), "{second:?}");
+    assert_eq!(first.stdout, second.stdout);
+    let help = String::from_utf8_lossy(&first.stdout);
+    assert!(help.contains("Name: sshx"), "{help}");
+    assert!(help.contains("Usage forms:"), "{help}");
+    assert!(help.contains("Subcommands:"), "{help}");
+    assert!(help.contains("setup"), "{help}");
+    assert!(help.contains("doctor"), "{help}");
+    assert!(help.contains("connect"), "{help}");
+    assert!(!help.contains("\x1b["), "{help}");
+    assert!(first.stderr.is_empty());
+}
+
+#[test]
+fn help_flags_route_by_position_and_ignore_format() {
+    let cases: &[(&[&str], &str)] = &[
+        (&["-h"], "Name: sshx"),
+        (&["--help"], "Name: sshx"),
+        (&["setup", "-h"], "Name: setup"),
+        (&["doctor", "--help"], "Name: doctor"),
+        (&["connect", "-h"], "Name: connect"),
+        (&["connect", "prod", "--help"], "Name: connect"),
+        (&["help", "setup"], "Name: setup"),
+        (&["help", "doctor"], "Name: doctor"),
+        (&["help", "connect"], "Name: connect"),
+    ];
+    for (args, marker) in cases {
+        let output = Command::new(env!("CARGO_BIN_EXE_sshx"))
+            .args(*args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{args:?}: {output:?}");
+        let help = String::from_utf8_lossy(&output.stdout);
+        assert!(help.contains(marker), "{args:?}: {help}");
+        assert!(output.stderr.is_empty(), "{args:?}: {output:?}");
+    }
+
+    let root_before_path = Command::new(env!("CARGO_BIN_EXE_sshx"))
+        .args(["--help", "connect"])
+        .output()
+        .unwrap();
+    assert!(root_before_path.status.success());
+    assert!(String::from_utf8_lossy(&root_before_path.stdout).contains("Name: sshx"));
+
+    let connect_before_selector = Command::new(env!("CARGO_BIN_EXE_sshx"))
+        .args(["connect", "--help", "prod"])
+        .output()
+        .unwrap();
+    assert!(connect_before_selector.status.success());
+    assert!(String::from_utf8_lossy(&connect_before_selector.stdout).contains("Name: connect"));
+
+    let plain = Command::new(env!("CARGO_BIN_EXE_sshx"))
+        .args(["connect", "--help"])
+        .output()
+        .unwrap();
+    let with_format = Command::new(env!("CARGO_BIN_EXE_sshx"))
+        .args(["connect", "--format", "json", "--help"])
+        .output()
+        .unwrap();
+    assert_eq!(plain.stdout, with_format.stdout);
+    assert!(with_format.stderr.is_empty());
+}
+
+#[test]
+fn every_documented_help_path_has_ordered_sections() {
+    let paths = ["setup", "doctor", "connect"];
+    for path in paths {
+        let output = Command::new(env!("CARGO_BIN_EXE_sshx"))
+            .args(["help", path])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{path}: {output:?}");
+        let help = String::from_utf8_lossy(&output.stdout);
+        for section in [
+            "Usage forms:",
+            "Positional arguments:",
+            "Options:",
+            "Exit behavior:",
+        ] {
+            assert!(help.contains(section), "{path}: missing {section}\n{help}");
+        }
+        assert!(!help.contains("\x1b["), "{path}: {help}");
+    }
+    for path in paths {
+        for flag in ["-h", "--help"] {
+            let output = Command::new(env!("CARGO_BIN_EXE_sshx"))
+                .args([path, flag])
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{path} {flag}: {output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("Name: "),
+                "{path} {flag}: {:?}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            assert!(output.stderr.is_empty(), "{path} {flag}: {output:?}");
+        }
+    }
+}
+
+#[test]
+fn help_parse_errors_use_nearest_usage_on_stderr() {
+    let connect = Command::new(env!("CARGO_BIN_EXE_sshx"))
+        .args(["connect", "--unknown"])
+        .output()
+        .unwrap();
+    assert_eq!(connect.status.code(), Some(2));
+    assert!(connect.stdout.is_empty());
+    let connect_error = String::from_utf8_lossy(&connect.stderr);
+    assert!(
+        connect_error.contains("Usage: sshx connect"),
+        "{connect_error}"
+    );
+
+    let doctor = Command::new(env!("CARGO_BIN_EXE_sshx"))
+        .args(["doctor", "unknown"])
+        .output()
+        .unwrap();
+    assert_eq!(doctor.status.code(), Some(2));
+    let doctor_error = String::from_utf8_lossy(&doctor.stderr);
+    assert!(
+        doctor_error.contains("Usage: sshx doctor"),
+        "{doctor_error}"
+    );
+}
+
+#[test]
 fn version_flag_prints_name_and_package_version() {
     let output = Command::new(env!("CARGO_BIN_EXE_sshx"))
         .arg("--version")
@@ -25,31 +159,28 @@ fn version_flag_prints_name_and_package_version() {
 }
 
 #[test]
-fn no_arguments_preserve_bootstrap_usage() {
+fn no_arguments_print_complete_root_help() {
     let output = Command::new(env!("CARGO_BIN_EXE_sshx"))
         .output()
         .expect("sshx binary should run");
 
     assert!(output.status.success());
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout),
-        "Usage: sshx [--version]\n"
-    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Name: sshx"));
     assert!(output.stderr.is_empty());
 }
 
 #[test]
-fn unknown_argument_preserves_bootstrap_error() {
+fn unknown_argument_reports_root_usage() {
     let output = Command::new(env!("CARGO_BIN_EXE_sshx"))
         .arg("unknown")
         .output()
         .expect("sshx binary should run");
 
     assert_eq!(output.status.code(), Some(2));
-    assert_eq!(
-        String::from_utf8_lossy(&output.stderr),
-        "sshx: unexpected argument `unknown`\nUsage: sshx [--version]\n"
-    );
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("unexpected argument `unknown`"));
+    assert!(error.contains("Usage: sshx [GLOBAL OPTIONS] [COMMAND]"));
+    assert!(output.stdout.is_empty());
 }
 
 fn fixture_root() -> (PathBuf, PathBuf) {

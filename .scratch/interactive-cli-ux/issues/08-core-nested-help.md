@@ -4,15 +4,19 @@
 
 **Blocked by:** 01: Repair private permissions through doctor; 07: Choose host actions interactively and copy stored passwords safely.
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] Root, `setup`, `doctor`, and `connect` support `-h`, `--help`, and `sshx help <command-path>`.
-- [ ] No arguments and `sshx help` display complete root help.
-- [ ] Help flags obey position-sensitive semantics: flags before a command path describe the current path, while flags after it describe that path.
-- [ ] Each page contains applicable purpose, usage, arguments, options, prompt behavior, conflicts, examples, exit behavior, and related commands in the confirmed order.
-- [ ] Doctor help accurately documents report-only default behavior and `--fix-permissions`.
-- [ ] Connect help accurately documents exact selectors, interactive selection, every `--action` value, action availability, secret confirmation, and the JSON/YAML conflict.
-- [ ] Help is plain deterministic text with no color or pager, writes to stdout, and exits `0`.
-- [ ] `--format` does not alter help rendering.
-- [ ] Parse errors remain on stderr, exit `2`, and show the nearest relevant usage summary.
-- [ ] Examples contain no real passwords and use canonical glossary terms.
+- [x] Root, `setup`, `doctor`, and `connect` support `-h`, `--help`, and `sshx help <command-path>`.
+- [x] No arguments and `sshx help` display complete root help.
+- [x] Help flags obey position-sensitive semantics: flags before a command path describe the current path, while flags after it describe that path.
+- [x] Each page contains applicable purpose, usage, arguments, options, prompt behavior, conflicts, examples, exit behavior, and related commands in the confirmed order.
+- [x] Doctor help accurately documents report-only default behavior and `--fix-permissions`.
+- [x] Connect help accurately documents exact selectors, interactive selection, every `--action` value, action availability, secret confirmation, and the JSON/YAML conflict.
+- [x] Help is plain deterministic text with no color or pager, writes to stdout, and exits `0`.
+- [x] `--format` does not alter help rendering.
+- [x] Parse errors remain on stderr, exit `2`, and show the nearest relevant usage summary.
+- [x] Examples contain no real passwords and use canonical glossary terms.
+
+**Answer:** Added static plain-text help pages for root, setup, doctor, and connect. Added shared position-sensitive routing, selector-aware connect help, `--format` ignoring, and nearest-command usage on parser errors. Host, Pair, and tunnel leaf help remains deferred to tickets 09/10.
+
+**Evidence:** `cargo test --test cli` (78 passed); `cargo test --test tunnel` (3 passed); `cargo test --lib` (15 passed); direct `cargo fmt --all -- --check`; direct `cargo check --all-targets`; direct `cargo clippy --all-targets --all-features -- -D warnings`.
