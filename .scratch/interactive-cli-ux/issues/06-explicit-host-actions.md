@@ -13,7 +13,7 @@
 - [x] `copy-sshx` produces a correctly quoted command that resolves the exact selected HostEntry, using stable identity plus config-root or source disambiguation when needed.
 - [x] `copy-sshx` works for both direct and Pair-routed HostEntries; `copy-ssh` rejects Pair-routed HostEntries without fallback.
 - [x] macOS uses `pbcopy`; Linux selects a compatible available backend from `wl-copy`, `xclip`, and `xsel`.
-- [x] Clipboard tools are spawned without a shell and receive copied content through stdin, never argv; Linux `xclip` and `xsel` receive clipboard-selection arguments.
+- [x] Clipboard tools are spawned without a shell and receive copied content through stdin, never argv.
 - [x] Missing clipboard support writes only non-secret commands to stdout and returns an actionable result.
 - [x] Unavailable actions fail without silently choosing another action.
 - [x] `--action` combined with JSON or YAML output fails clearly and performs no action; existing machine-format inspection remains unchanged.
