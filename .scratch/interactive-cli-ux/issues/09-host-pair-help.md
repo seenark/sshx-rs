@@ -4,7 +4,7 @@
 
 **Blocked by:** 04: Use the fuzzy picker for every interactive HostEntry selection; 08: Provide nested help for root and top-level workflows.
 
-**Status:** ready-for-agent
+**Status:** claimed
 
 - [ ] Help exists for `host`, `host list`, `host show`, `host create`, `host update`, `host rename`, and `host delete` through all three accepted help forms.
 - [ ] Help exists for `pair`, `pair setup`, `pair create`, `pair list`, and `pair validate` through all three accepted help forms.

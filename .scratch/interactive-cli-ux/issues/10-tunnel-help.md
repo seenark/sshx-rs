@@ -4,7 +4,7 @@
 
 **Blocked by:** 04: Use the fuzzy picker for every interactive HostEntry selection; 08: Provide nested help for root and top-level workflows.
 
-**Status:** ready-for-agent
+**Status:** claimed
 
 - [ ] Help exists for the `tunnel`, `tunnel direct`, and `tunnel paired` groups through all three accepted help forms.
 - [ ] Help exists for every accepted `start`, `list`, `status`, `stop`, and `restart` spelling under the root tunnel group and its direct or paired groups.
