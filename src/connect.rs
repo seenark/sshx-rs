@@ -1863,7 +1863,19 @@ fn compile_config_with_transform(
                 "UNSUPPORTED_MATCH: Match cannot be preserved in exact Host config".to_string(),
             );
         }
-        if argument.contains('%') {
+        let proxy_command = keyword.eq_ignore_ascii_case("proxycommand");
+        if proxy_command
+            && matches!(
+                transform,
+                RuntimeTransform::Gateway { .. } | RuntimeTransform::Vm { .. }
+            )
+        {
+            return Err(
+                "PAIR_ROUTE_UNSAFE: ProxyCommand and ProxyJump are not allowed for paired routes"
+                    .to_string(),
+            );
+        }
+        if argument.contains('%') && !proxy_command {
             return Err(format!(
                 "UNSUPPORTED_TOKEN_SEMANTICS: {keyword} contains token expansion"
             ));
@@ -1872,14 +1884,6 @@ fn compile_config_with_transform(
             return Err(format!(
                 "UNSUPPORTED_DIRECTIVE: {keyword} cannot be preserved in direct runtime config"
             ));
-        }
-        if matches!(transform, RuntimeTransform::Standalone)
-            && (keyword.eq_ignore_ascii_case("proxycommand")
-                || keyword.eq_ignore_ascii_case("proxyjump"))
-        {
-            return Err(
-                "UNSUPPORTED_PROXY: standalone direct tunnel rejects proxy routing".to_string(),
-            );
         }
         if matches!(transform, RuntimeTransform::Standalone)
             && (keyword.eq_ignore_ascii_case("localforward")
@@ -2445,6 +2449,24 @@ mod tests {
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).expect("fixture directory should be created");
         path
+    }
+
+    #[test]
+    fn pair_transform_compilation_rejects_proxycommand() {
+        let directory = tempfile_directory();
+        let path = directory.join("config");
+        let text = "Host hop\n  HostName hop.example\n  ProxyCommand nc %h 22\n";
+        fs::write(&path, text).expect("fixture should be written");
+        let mut selected = entry(path.clone(), &["hop"]);
+        selected.source.byte_start = text.find("Host hop").expect("Host should exist");
+        selected.source.byte_end = text.len();
+        let gateway = super::compile_gateway_config(&selected, "hop", "vm.internal", 22, 2200)
+            .expect_err("gateway compilation should reject ProxyCommand");
+        assert!(gateway.contains("PAIR_ROUTE_UNSAFE"), "{gateway}");
+        let vm = super::compile_vm_config(&selected, "hop", 2200, "sshx-vm-test", &[])
+            .expect_err("VM compilation should reject ProxyCommand");
+        assert!(vm.contains("PAIR_ROUTE_UNSAFE"), "{vm}");
+        fs::remove_dir_all(directory).expect("fixture should be removed");
     }
 
     use std::path::Path;
