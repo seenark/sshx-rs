@@ -11,10 +11,10 @@ use std::env;
 use std::ffi::OsString;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process;
+use std::process::{self, Stdio};
 const USAGE: &str = "Usage: sshx [--version]";
 const HOST_USAGE: &str = "Usage: sshx [--config PATH] host list [--format human|json|yaml]\n       sshx [--config PATH] host show SELECTOR [--format human|json|yaml]\n       sshx [--config PATH] host create --scope SCOPE --file PATH --alias ALIAS --hostname HOSTNAME [options]\n       sshx [--config PATH] host update SELECTOR [options]\n       sshx [--config PATH] host rename SELECTOR --alias ALIAS [options]\n       sshx [--config PATH] host delete SELECTOR [options]";
-const SETUP_USAGE: &str = "Usage: sshx setup [--personal PATH] [--work PATH] [--project NAME]\n       sshx doctor [--fix-permissions] [--format human|json|yaml]\n       sshx connect [SELECTOR] [--id ID] [--source PATH --line NUMBER] [--password-fd FD] [--gateway-password-fd FD --vm-password-fd FD] [--bind] [--forward REMOTE[=LOCAL]] [--no-input]\n       sshx tunnel direct start [SELECTOR] [-L SPEC] [-R SPEC] [-D SPEC] [--allow-bind]\n       sshx tunnel paired start [SELECTOR] [--bind] [--forward REMOTE[=LOCAL]] [--no-input]\n       sshx tunnel direct list|status ID|stop ID|restart ID\n       sshx tunnel paired list|status ID|stop ID|restart ID\n       sshx pair setup [GATEWAY] [VM] [--gateway ID] [--vm ID] [--transit-host HOST --transit-port PORT]";
+const SETUP_USAGE: &str = "Usage: sshx setup [--personal PATH] [--work PATH] [--project NAME]\n       sshx doctor [--fix-permissions] [--format human|json|yaml]\n       sshx connect [SELECTOR] [--id ID] [--action connect|copy-ssh|copy-sshx] [--source PATH --line NUMBER] [--password-fd FD] [--gateway-password-fd FD --vm-password-fd FD] [--bind] [--forward REMOTE[=LOCAL]] [--no-input]\n       sshx tunnel direct start [SELECTOR] [-L SPEC] [-R SPEC] [-D SPEC] [--allow-bind]\n       sshx tunnel paired start [SELECTOR] [--bind] [--forward REMOTE[=LOCAL]] [--no-input]\n       sshx tunnel direct list|status ID|stop ID|restart ID\n       sshx tunnel paired list|status ID|stop ID|restart ID\n       sshx pair setup [GATEWAY] [VM] [--gateway ID] [--vm ID] [--transit-host HOST --transit-port PORT]";
 
 fn main() {
     match run(env::args_os().skip(1).collect()) {
@@ -47,6 +47,12 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
     }
 
     let cli = Cli::parse(args)?;
+    if cli.action.is_some() && cli.format.is_machine() {
+        return Err(
+            "ACTION_FORMAT_CONFLICT: --action cannot be combined with JSON or YAML output"
+                .to_string(),
+        );
+    }
     validate_connect_without_catalog(&cli)?;
     if matches!(cli.command, Command::Setup) {
         return run_setup(&cli);
@@ -116,9 +122,18 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
             render_entries(&entries, &diagnostics, cli.format)
         }
         Command::Connect(selector) => {
+            if cli.action.is_some() && selector.is_none() && cli.id.is_none() {
+                return Err(
+                    "ACTION_SELECTOR_REQUIRED: --action requires an explicit HostEntry selector"
+                        .to_string(),
+                );
+            }
             let selected =
                 select_connect_entry(&filtered, selector.as_deref(), &cli, "connect host")?;
             let entry = selected.entry;
+            if let Some(action @ (HostAction::CopySsh | HostAction::CopySshx)) = cli.action {
+                return run_host_action(action, &selected, &catalog.entries, &cli);
+            }
             if cli.format.is_machine() {
                 render_entries(&[entry], &diagnostics, cli.format)
             } else {
@@ -1308,15 +1323,6 @@ fn select_connect_entry<'a>(
     cli: &Cli,
     picker_label: &str,
 ) -> Result<picker::Selection<'a>, String> {
-    if cli.id.is_some() && positional.is_some() {
-        return Err("SELECTOR_CONFLICT: use either --id or a positional selector".to_string());
-    }
-    if cli.id.is_some() && (cli.source.is_some() || cli.line.is_some()) {
-        return Err(
-            "SELECTOR_CONFLICT: use either --id or an alias with complete source location"
-                .to_string(),
-        );
-    }
     let selector = cli.id.as_deref().or(positional);
     if cli.source.is_some() != cli.line.is_some() {
         return Err(
@@ -1355,6 +1361,9 @@ fn select_connect_entry<'a>(
             }
         })
         .filter(|entry| {
+            positional.is_none_or(|alias| entry.aliases.iter().any(|candidate| candidate == alias))
+        })
+        .filter(|entry| {
             cli.source.as_ref().is_none_or(|source| {
                 let home = home_dir().unwrap_or_else(|_| PathBuf::from("."));
                 entry.source.path == settings::normalize_path(source, &home).to_string_lossy()
@@ -1388,6 +1397,290 @@ fn interactive_select<'a>(
 ) -> Result<picker::Selection<'a>, String> {
     picker::select(entries, label)
 }
+fn run_host_action(
+    action: HostAction,
+    selected: &picker::Selection<'_>,
+    entries: &[HostEntry],
+    cli: &Cli,
+) -> Result<(), String> {
+    let route = sshx::pair::paired_route(entries, selected.entry)?;
+    if action == HostAction::CopySsh && route.is_some() {
+        return Err(
+            "ACTION_UNAVAILABLE: copy-ssh cannot represent a Pair route; use --action copy-sshx"
+                .to_string(),
+        );
+    }
+    let root = match (action, route.as_ref()) {
+        (HostAction::CopySsh, _) => Some(select_config_root(selected.entry, cli)?),
+        (HostAction::CopySshx, None) => select_copy_sshx_root(selected.entry, cli)?,
+        (HostAction::CopySshx, Some(route)) => {
+            select_pair_config_root(&route.vm, &route.gateway, cli)?
+        }
+        (HostAction::Connect, _) => None,
+    };
+    let source_needed = action == HostAction::CopySshx
+        && (root.is_none()
+            || source_disambiguation_needed(
+                selected.entry,
+                selected.alias,
+                entries,
+                root.as_ref(),
+            ));
+    let command = match action {
+        HostAction::CopySsh => format!(
+            "ssh -F {} {}",
+            shell_quote(&root.expect("copy-ssh root").path.to_string_lossy()),
+            shell_quote(selected.alias)
+        ),
+        HostAction::CopySshx => {
+            let mut command = format!(
+                "sshx connect {} --id {}",
+                shell_quote(selected.alias),
+                shell_quote(&selected.entry.id)
+            );
+            if let Some(root) = root {
+                command.push_str(&format!(
+                    " --config {}",
+                    shell_quote(&root.path.to_string_lossy())
+                ));
+            }
+            if source_needed {
+                command.push_str(&format!(
+                    " --source {} --line {}",
+                    shell_quote(&selected.entry.source.path),
+                    selected.entry.source.line_start
+                ));
+            }
+            command
+        }
+        HostAction::Connect => {
+            return Err(
+                "ACTION_INVALID: connect action must use normal connection flow".to_string(),
+            );
+        }
+    };
+    publish_action_command(&command)
+}
+
+fn source_disambiguation_needed(
+    entry: &HostEntry,
+    alias: &str,
+    entries: &[HostEntry],
+    root: Option<&ConfigRootChoice>,
+) -> bool {
+    let home = home_dir().unwrap_or_else(|_| PathBuf::from("."));
+    entries
+        .iter()
+        .filter(|candidate| {
+            candidate.id == entry.id
+                && candidate
+                    .aliases
+                    .iter()
+                    .any(|candidate_alias| candidate_alias == alias)
+        })
+        .filter(|candidate| {
+            root.is_none_or(|root| {
+                candidate.provenance.iter().any(|provenance| {
+                    provenance.paths.first().is_some_and(|path| {
+                        settings::normalize_path(Path::new(path), &home) == root.path
+                    })
+                })
+            })
+        })
+        .count()
+        > 1
+}
+
+fn select_config_root(entry: &HostEntry, cli: &Cli) -> Result<ConfigRootChoice, String> {
+    let roots = config_roots_for_entries(std::slice::from_ref(&entry), cli)?;
+    choose_config_root(roots, &format!("HostEntry `{}`", entry.id), cli)
+}
+
+fn select_copy_sshx_root(entry: &HostEntry, cli: &Cli) -> Result<Option<ConfigRootChoice>, String> {
+    let roots = config_roots_for_entries(std::slice::from_ref(&entry), cli)?;
+    Ok(match roots.as_slice() {
+        [root] => Some(root.clone()),
+        _ => None,
+    })
+}
+
+fn select_pair_config_root(
+    vm: &HostEntry,
+    gateway: &HostEntry,
+    cli: &Cli,
+) -> Result<Option<ConfigRootChoice>, String> {
+    let vm_roots = config_roots_for_entries(std::slice::from_ref(&vm), cli)?;
+    let gateway_roots = config_roots_for_entries(std::slice::from_ref(&gateway), cli)?;
+    let shared = vm_roots
+        .into_iter()
+        .filter(|root| {
+            gateway_roots
+                .iter()
+                .any(|candidate| candidate.path == root.path)
+        })
+        .collect::<Vec<_>>();
+    match shared.as_slice() {
+        [root] => Ok(Some(root.clone())),
+        _ => Ok(None),
+    }
+}
+
+fn config_roots_for_entries(
+    entries: &[&HostEntry],
+    cli: &Cli,
+) -> Result<Vec<ConfigRootChoice>, String> {
+    let home = home_dir()?;
+    let mut roots = Vec::new();
+    for entry in entries {
+        for provenance in &entry.provenance {
+            if !cli.scopes.is_empty() && !cli.scopes.iter().any(|scope| scope == &provenance.scope)
+            {
+                continue;
+            }
+            if !cli.projects.is_empty()
+                && !cli
+                    .projects
+                    .iter()
+                    .any(|project| provenance.project.as_deref() == Some(project.as_str()))
+            {
+                continue;
+            }
+            let Some(path) = provenance.paths.first() else {
+                continue;
+            };
+            let path = settings::normalize_path(Path::new(path), &home);
+            if roots
+                .iter()
+                .any(|root: &ConfigRootChoice| root.path == path)
+            {
+                continue;
+            }
+            roots.push(ConfigRootChoice {
+                path,
+                scope: provenance.scope.clone(),
+                project: provenance.project.clone(),
+            });
+        }
+    }
+    Ok(roots)
+}
+
+fn choose_config_root(
+    roots: Vec<ConfigRootChoice>,
+    subject: &str,
+    cli: &Cli,
+) -> Result<ConfigRootChoice, String> {
+    match roots.as_slice() {
+        [root] => Ok(root.clone()),
+        [] => Err(format!("ACTION_ROOT_REQUIRED: no config root reaches {subject}")),
+        _ if cli.no_input || !io::stdin().is_terminal() => {
+            Err(
+                "ACTION_ROOT_REQUIRED: multiple config roots reach this HostEntry; use --config, --scope, or --project"
+                    .to_string(),
+            )
+        }
+        _ => {
+            eprintln!("Config roots:");
+            for (index, root) in roots.iter().enumerate() {
+                eprintln!(
+                    "  {}. scope={} project={} path={}",
+                    index + 1,
+                    root.scope,
+                    root.project.as_deref().unwrap_or("-"),
+                    root.path.display()
+                );
+            }
+            let choice = prompt_value("Root number: ", None)?
+                .ok_or_else(|| "ACTION_ROOT_REQUIRED: select one config root".to_string())?
+                .parse::<usize>()
+                .map_err(|_| "ACTION_ROOT_REQUIRED: root choice must be a number".to_string())?;
+            roots
+                .get(choice.saturating_sub(1))
+                .cloned()
+                .ok_or_else(|| "ACTION_ROOT_REQUIRED: root choice is out of range".to_string())
+        }
+    }
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+#[derive(Clone, Copy)]
+struct ClipboardBackend {
+    program: &'static str,
+    args: &'static [&'static str],
+}
+
+#[cfg(target_os = "macos")]
+const CLIPBOARD_BACKENDS: &[ClipboardBackend] = &[ClipboardBackend {
+    program: "pbcopy",
+    args: &[],
+}];
+#[cfg(target_os = "linux")]
+const CLIPBOARD_BACKENDS: &[ClipboardBackend] = &[
+    ClipboardBackend {
+        program: "wl-copy",
+        args: &[],
+    },
+    ClipboardBackend {
+        program: "xclip",
+        args: &["-selection", "clipboard"],
+    },
+    ClipboardBackend {
+        program: "xsel",
+        args: &["--clipboard", "--input"],
+    },
+];
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+const CLIPBOARD_BACKENDS: &[ClipboardBackend] = &[];
+
+fn clipboard_backend() -> Option<ClipboardBackend> {
+    let path = env::var_os("PATH")?;
+    CLIPBOARD_BACKENDS.iter().copied().find(|backend| {
+        env::split_paths(&path).any(|directory| directory.join(backend.program).is_file())
+    })
+}
+
+fn publish_action_command(command: &str) -> Result<(), String> {
+    let Some(backend) = clipboard_backend() else {
+        println!("{command}");
+        eprintln!(
+            "CLIPBOARD_UNAVAILABLE: no supported clipboard backend; command printed to stdout"
+        );
+        return Ok(());
+    };
+    let mut child = process::Command::new(backend.program)
+        .args(backend.args)
+        .stdin(Stdio::piped())
+        .spawn()
+        .map_err(|error| {
+            format!(
+                "CLIPBOARD_FAILED: cannot start {}: {error}",
+                backend.program
+            )
+        })?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| "CLIPBOARD_FAILED: clipboard stdin is unavailable".to_string())?
+        .write_all(command.as_bytes())
+        .map_err(|error| format!("CLIPBOARD_FAILED: cannot write clipboard content: {error}"))?;
+    let status = child.wait().map_err(|error| {
+        format!(
+            "CLIPBOARD_FAILED: cannot wait for {}: {error}",
+            backend.program
+        )
+    })?;
+    if !status.success() {
+        return Err(format!(
+            "CLIPBOARD_FAILED: {} exited with {status}",
+            backend.program
+        ));
+    }
+    eprintln!("Copied command to {}.", backend.program);
+    Ok(())
+}
 
 fn format_ambiguous(selector: &str, entries: &[&HostEntry]) -> String {
     let candidates = entries
@@ -1409,6 +1702,38 @@ fn home_dir() -> Result<PathBuf, String> {
     env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or_else(|| "HOME is not set; pass --config PATH".to_string())
+}
+fn parse_host_action(value: &str) -> Result<HostAction, String> {
+    match value {
+        "connect" => Ok(HostAction::Connect),
+        "copy-ssh" => Ok(HostAction::CopySsh),
+        "copy-sshx" => Ok(HostAction::CopySshx),
+        _ => Err(format!(
+            "ACTION_INVALID: unsupported action `{value}`; use connect, copy-ssh, or copy-sshx"
+        )),
+    }
+}
+
+fn set_host_action(action: &mut Option<HostAction>, value: &str) -> Result<(), String> {
+    if action.is_some() {
+        return Err("ACTION_CONFLICT: provide --action once".to_string());
+    }
+    *action = Some(parse_host_action(value)?);
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HostAction {
+    Connect,
+    CopySsh,
+    CopySshx,
+}
+
+#[derive(Clone, Debug)]
+struct ConfigRootChoice {
+    path: PathBuf,
+    scope: String,
+    project: Option<String>,
 }
 
 #[derive(Debug)]
@@ -1448,6 +1773,7 @@ struct RootRequest {
 struct Cli {
     config: Option<PathBuf>,
     format: OutputFormat,
+    action: Option<HostAction>,
     command: Command,
     scopes: Vec<String>,
     projects: Vec<String>,
@@ -1490,6 +1816,7 @@ impl Cli {
     fn parse(args: Vec<OsString>) -> Result<Self, String> {
         let mut config = None;
         let mut format = OutputFormat::Human;
+        let mut action = None;
         let mut scopes = Vec::new();
         let mut projects = Vec::new();
         let mut source = None;
@@ -1551,6 +1878,10 @@ impl Cli {
                 format = OutputFormat::parse(&next(text)?)?;
             } else if let Some(value) = text.strip_prefix("--format=") {
                 format = OutputFormat::parse(value)?;
+            } else if text == "--action" {
+                set_host_action(&mut action, &next(text)?)?;
+            } else if let Some(value) = text.strip_prefix("--action=") {
+                set_host_action(&mut action, value)?;
             } else if text == "--scope" {
                 scopes.push(next(text)?);
             } else if text == "--project" {
@@ -1955,6 +2286,9 @@ impl Cli {
                 command
             }
         };
+        if action.is_some() && !matches!(&command, Command::Connect(_)) {
+            return Err("--action is only valid with connect".to_string());
+        }
         if fix_permissions && !matches!(&command, Command::Doctor) {
             return Err("--fix-permissions is only valid with doctor".to_string());
         }
@@ -1962,6 +2296,7 @@ impl Cli {
         Ok(Self {
             config,
             format,
+            action,
             command,
             scopes,
             projects,
@@ -2005,4 +2340,24 @@ impl Cli {
 #[allow(dead_code)]
 fn default_config() -> Result<PathBuf, String> {
     Ok(home_dir()?.join(".ssh/config"))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::CLIPBOARD_BACKENDS;
+
+    #[test]
+    fn linux_clipboard_backends_target_clipboard_selection() {
+        let xclip = CLIPBOARD_BACKENDS
+            .iter()
+            .find(|backend| backend.program == "xclip")
+            .expect("xclip backend should exist");
+        assert_eq!(xclip.args, &["-selection", "clipboard"]);
+
+        let xsel = CLIPBOARD_BACKENDS
+            .iter()
+            .find(|backend| backend.program == "xsel")
+            .expect("xsel backend should exist");
+        assert_eq!(xsel.args, &["--clipboard", "--input"]);
+    }
 }

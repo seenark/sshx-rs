@@ -2998,6 +2998,292 @@ fn tunnel_picker_escape_cancels_before_start() {
     fs::remove_dir_all(root).unwrap();
 }
 
+#[test]
+fn copy_ssh_without_clipboard_prints_quoted_command() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    let empty_path = root.join("empty-bin");
+    fs::create_dir(&empty_path).unwrap();
+    write(
+        &config,
+        "Host weird-alias\n  HostName selected.example\n  ##PASSWORD never-copy-this\n",
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_sshx"))
+        .env("HOME", &home)
+        .env("PATH", &empty_path)
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "connect",
+            "weird-alias",
+            "--action",
+            "copy-ssh",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let expected = format!("ssh -F '{}' 'weird-alias'\n", config.display());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("CLIPBOARD_UNAVAILABLE"));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("never-copy-this"));
+    fs::remove_dir_all(root).unwrap();
+}
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn copy_ssh_sends_command_to_native_clipboard_stdin() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    let bin = root.join("clipboard-bin");
+    fs::create_dir(&bin).unwrap();
+    write(
+        &config,
+        "##SSHX ID=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\nHost direct\n  HostName direct.example\n",
+    );
+    #[cfg(target_os = "macos")]
+    let backend = "pbcopy";
+    #[cfg(target_os = "linux")]
+    let backend = "wl-copy";
+    let script = bin.join(backend);
+    write(
+        &script,
+        "#!/bin/sh\nprintf '%s' \"$*\" > \"$SSHX_CLIPBOARD_ARGS\"\ncat > \"$SSHX_CLIPBOARD_CAPTURE\"\n",
+    );
+    let mut permissions = fs::metadata(&script).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&script, permissions).unwrap();
+    let path = format!("{}:/usr/bin:/bin", bin.display());
+    let output = Command::new(env!("CARGO_BIN_EXE_sshx"))
+        .env("HOME", &home)
+        .env("PATH", path)
+        .env("SSHX_CLIPBOARD_ARGS", root.join("clipboard-args"))
+        .env("SSHX_CLIPBOARD_CAPTURE", root.join("clipboard-content"))
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "connect",
+            "direct",
+            "--action",
+            "copy-ssh",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Copied command"));
+    assert_eq!(
+        fs::read_to_string(root.join("clipboard-content")).unwrap(),
+        format!("ssh -F '{}' 'direct'", config.display())
+    );
+    assert!(
+        fs::read_to_string(root.join("clipboard-args"))
+            .unwrap()
+            .is_empty()
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn action_conflicts_with_machine_output_before_action() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(&config, "Host direct\n  HostName direct.example\n");
+    let empty_path = root.join("empty-bin");
+    fs::create_dir(&empty_path).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sshx"))
+        .env("HOME", &home)
+        .env("PATH", &empty_path)
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "connect",
+            "direct",
+            "--action",
+            "copy-ssh",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("ACTION_FORMAT_CONFLICT"));
+    assert!(output.stdout.is_empty());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn copy_sshx_preserves_selected_secondary_alias() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    let empty_path = root.join("empty-bin");
+    fs::create_dir(&empty_path).unwrap();
+    write(
+        &config,
+        "##SSHX ID=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\nHost primary secondary\n  HostName direct.example\n",
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_sshx"))
+        .env("HOME", &home)
+        .env("PATH", &empty_path)
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "connect",
+            "secondary",
+            "--action",
+            "copy-sshx",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let expected = format!(
+        "sshx connect 'secondary' --id 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' --config '{}'\n",
+        config.display()
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn copy_sshx_multiple_roots_uses_source_without_prompt() {
+    let (root, home) = fixture_root();
+    let shared = home.join(".ssh/shared.conf");
+    let root_a = home.join(".ssh/root-a.conf");
+    let root_b = home.join(".ssh/root-b.conf");
+    write(
+        &shared,
+        "##SSHX ID=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\nHost shared\n  HostName shared.example\n",
+    );
+    write(&root_a, &format!("Include {}\n", shared.display()));
+    write(&root_b, &format!("Include {}\n", shared.display()));
+    write(
+        &home.join(".config/sshx/config.json"),
+        &format!(
+            "{{\"version\":1,\"roots\":[{{\"scope\":\"personal\",\"path\":\"{}\",\"project\":null}},{{\"scope\":\"work\",\"path\":\"{}\",\"project\":null}}]}}\n",
+            root_a.display(),
+            root_b.display()
+        ),
+    );
+    let empty_path = root.join("empty-bin");
+    fs::create_dir(&empty_path).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sshx"))
+        .env("HOME", &home)
+        .env("PATH", &empty_path)
+        .args(["connect", "shared", "--action", "copy-sshx", "--no-input"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let command = String::from_utf8_lossy(&output.stdout);
+    assert!(command.contains("'shared' --id 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'"));
+    let source = fs::canonicalize(&shared).unwrap();
+    assert!(command.contains(&format!("--source '{}' --line 2", source.display())));
+    assert!(!command.contains("--config"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn copy_sshx_disambiguates_duplicate_identity_by_source() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    let empty_path = root.join("empty-bin");
+    fs::create_dir(&empty_path).unwrap();
+    write(
+        &config,
+        concat!(
+            "##SSHX ID=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\n",
+            "Host same\n",
+            "  HostName first.example\n",
+            "##SSHX ID=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\n",
+            "Host same\n",
+            "  HostName second.example\n",
+        ),
+    );
+    let source = fs::canonicalize(&config).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sshx"))
+        .env("HOME", &home)
+        .env("PATH", &empty_path)
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "connect",
+            "same",
+            "--id",
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "--source",
+            source.to_str().unwrap(),
+            "--line",
+            "5",
+            "--action",
+            "copy-sshx",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let command = String::from_utf8_lossy(&output.stdout);
+    assert!(command.contains("'same' --id 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'"));
+    assert!(command.contains(&format!("--source '{}' --line 5", source.display())));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn copy_sshx_cross_root_pair_uses_source_disambiguation() {
+    let (root, home) = fixture_root();
+    let gateway = home.join(".ssh/gateway.conf");
+    let vm = home.join(".ssh/vm.conf");
+    write(
+        &gateway,
+        concat!(
+            "##SSHX ID=11111111-1111-4111-8111-111111111111\n",
+            "##SSHX VM=22222222-2222-4222-8222-222222222222\n",
+            "Host gateway\n",
+            "  HostName gateway.example\n",
+            "  LocalForward 2200 vm.internal:22\n",
+        ),
+    );
+    write(
+        &vm,
+        concat!(
+            "##SSHX ID=22222222-2222-4222-8222-222222222222\n",
+            "##SSHX GATEWAY=11111111-1111-4111-8111-111111111111\n",
+            "##SSHX TRANSIT=vm.internal:22\n",
+            "Host vm secondary\n",
+            "  HostName vm.internal\n",
+            "  Port 22\n",
+        ),
+    );
+    write(
+        &home.join(".config/sshx/config.json"),
+        &format!(
+            "{{\"version\":1,\"roots\":[{{\"scope\":\"personal\",\"path\":\"{}\",\"project\":null}},{{\"scope\":\"work\",\"path\":\"{}\",\"project\":null}}]}}\n",
+            gateway.display(),
+            vm.display()
+        ),
+    );
+    let empty_path = root.join("empty-bin");
+    fs::create_dir(&empty_path).unwrap();
+    let unavailable = Command::new(env!("CARGO_BIN_EXE_sshx"))
+        .env("HOME", &home)
+        .env("PATH", &empty_path)
+        .args(["connect", "secondary", "--action", "copy-ssh"])
+        .output()
+        .unwrap();
+    assert_eq!(unavailable.status.code(), Some(2), "{unavailable:?}");
+    assert!(String::from_utf8_lossy(&unavailable.stderr).contains("ACTION_UNAVAILABLE"));
+    assert!(unavailable.stdout.is_empty());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_sshx"))
+        .env("HOME", &home)
+        .env("PATH", &empty_path)
+        .args(["connect", "secondary", "--action", "copy-sshx"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let command = String::from_utf8_lossy(&output.stdout);
+    assert!(command.contains("'secondary' --id '22222222-2222-4222-8222-222222222222'"));
+    let source = fs::canonicalize(&vm).unwrap();
+    assert!(command.contains(&format!("--source '{}' --line 4", source.display())));
+    assert!(!command.contains("--config"));
+    fs::remove_dir_all(root).unwrap();
+}
+
 fn mode_of(path: &Path) -> u32 {
     fs::metadata(path).unwrap().permissions().mode() & 0o7777
 }
