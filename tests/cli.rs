@@ -64,6 +64,13 @@ fn fixture_root() -> (PathBuf, PathBuf) {
     (root, home)
 }
 
+fn canonical_fixture_root() -> (PathBuf, PathBuf) {
+    let (root, _) = fixture_root();
+    let root = fs::canonicalize(root).expect("fixture root should resolve");
+    let home = root.join("home");
+    (root, home)
+}
+
 fn write(path: &Path, contents: &str) {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).expect("fixture parent should be created");
@@ -2569,6 +2576,112 @@ fn pair_setup_enforces_gateway_cardinality_by_entry_identity() {
     fs::remove_dir_all(root).unwrap();
 }
 
+#[test]
+fn doctor_fix_permissions_skips_without_tty_and_keeps_modes() {
+    let (root, home) = canonical_fixture_root();
+    let config = home.join(".ssh/config");
+    write(
+        &config,
+        "Host password\n  HostName password.example\n  ##PASSWORD stored-secret\n",
+    );
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o644)).unwrap();
+    let output = run_with_stdin(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "doctor",
+            "--fix-permissions",
+            "--no-input",
+            "--format",
+            "json",
+        ],
+        b"y\n",
+    );
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let document: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("doctor JSON should parse");
+    assert!(
+        document["repair_results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|result| result["outcome"] == "skipped"),
+        "repair should be skipped: {document}"
+    );
+    assert_eq!(mode_of(&config), 0o644);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_fix_permissions_applies_after_one_tty_confirmation() {
+    let (root, home) = canonical_fixture_root();
+    let config = home.join(".ssh/config");
+    write(
+        &config,
+        "Host password\n  HostName password.example\n  ##PASSWORD stored-secret\n",
+    );
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o644)).unwrap();
+    let bin = fake_ssh(&root);
+    let (status, output) = run_with_pty_header(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "doctor",
+            "--fix-permissions",
+        ],
+        &bin,
+        &root,
+        b"y\n",
+        b"Repair plan:",
+    );
+    assert!(status.success(), "status={status:?} output={output}");
+    assert_eq!(output.matches("Repair plan:").count(), 1, "output={output}");
+    assert!(output.contains("fixed:"), "doctor output={output}");
+    assert_eq!(mode_of(&config), 0o600);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_fix_permissions_yes_still_requires_confirmation() {
+    let (root, home) = canonical_fixture_root();
+    let config = home.join(".ssh/config");
+    write(
+        &config,
+        "Host password\n  HostName password.example\n  ##PASSWORD stored-secret\n",
+    );
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o644)).unwrap();
+    let bin = fake_ssh(&root);
+    let (status, output) = run_with_pty_header(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "doctor",
+            "--fix-permissions",
+            "--yes",
+        ],
+        &bin,
+        &root,
+        b"n\n",
+        b"Repair plan:",
+    );
+    assert_eq!(status.code(), Some(2), "status={status:?} output={output}");
+    assert!(
+        output.contains("Apply permission repairs?"),
+        "output={output}"
+    );
+    assert_eq!(mode_of(&config), 0o644);
+    fs::remove_dir_all(root).unwrap();
+}
+
+fn mode_of(path: &Path) -> u32 {
+    fs::metadata(path).unwrap().permissions().mode() & 0o7777
+}
+
 #[cfg(unix)]
 fn run_with_pty(
     home: &Path,
@@ -2576,6 +2689,18 @@ fn run_with_pty(
     bin: &Path,
     root: &Path,
     input: &[u8],
+) -> (std::process::ExitStatus, String) {
+    run_with_pty_header(home, args, bin, root, input, b"sshx connect host picker")
+}
+
+#[cfg(unix)]
+fn run_with_pty_header(
+    home: &Path,
+    args: &[&str],
+    bin: &Path,
+    root: &Path,
+    input: &[u8],
+    header: &[u8],
 ) -> (std::process::ExitStatus, String) {
     let mut master = -1;
     let mut slave = -1;
@@ -2618,7 +2743,6 @@ fn run_with_pty(
         "pty should become nonblocking"
     );
     let mut output = Vec::new();
-    let header = b"sshx connect host picker";
     let startup_deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let mut buffer = [0u8; 4096];

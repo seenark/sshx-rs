@@ -4,17 +4,17 @@ use sshx::discovery::{HostEntry, discover_roots, scope_for_path};
 use sshx::mutation::{self, CreateRequest, MutationKind, UpdateRequest};
 use sshx::output::{
     OutputFormat, render_create, render_diagnostic, render_doctor, render_edit, render_human,
-    render_machine, render_pair, render_pairs, render_tunnels,
+    render_machine, render_pair, render_pairs, render_repairs, render_tunnels,
 };
 use sshx::settings::{self, RegisteredRoot};
 use std::env;
 use std::ffi::OsString;
 use std::io::{self, IsTerminal, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 const USAGE: &str = "Usage: sshx [--version]";
 const HOST_USAGE: &str = "Usage: sshx [--config PATH] host list [--format human|json|yaml]\n       sshx [--config PATH] host show SELECTOR [--format human|json|yaml]\n       sshx [--config PATH] host create --scope SCOPE --file PATH --alias ALIAS --hostname HOSTNAME [options]\n       sshx [--config PATH] host update SELECTOR [options]\n       sshx [--config PATH] host rename SELECTOR --alias ALIAS [options]\n       sshx [--config PATH] host delete SELECTOR [options]";
-const SETUP_USAGE: &str = "Usage: sshx setup [--personal PATH] [--work PATH] [--project NAME]\n       sshx doctor [--format human|json|yaml]\n       sshx connect [SELECTOR] [--id ID] [--source PATH --line NUMBER] [--password-fd FD] [--gateway-password-fd FD --vm-password-fd FD] [--bind] [--forward REMOTE[=LOCAL]] [--no-input]\n       sshx tunnel direct start [SELECTOR] [-L SPEC] [-R SPEC] [-D SPEC] [--allow-bind]\n       sshx tunnel paired start [SELECTOR] [--bind] [--forward REMOTE[=LOCAL]] [--no-input]\n       sshx tunnel direct list|status ID|stop ID|restart ID\n       sshx tunnel paired list|status ID|stop ID|restart ID\n       sshx pair setup [GATEWAY] [VM] [--gateway ID] [--vm ID] [--transit-host HOST --transit-port PORT]";
+const SETUP_USAGE: &str = "Usage: sshx setup [--personal PATH] [--work PATH] [--project NAME]\n       sshx doctor [--fix-permissions] [--format human|json|yaml]\n       sshx connect [SELECTOR] [--id ID] [--source PATH --line NUMBER] [--password-fd FD] [--gateway-password-fd FD --vm-password-fd FD] [--bind] [--forward REMOTE[=LOCAL]] [--no-input]\n       sshx tunnel direct start [SELECTOR] [-L SPEC] [-R SPEC] [-D SPEC] [--allow-bind]\n       sshx tunnel paired start [SELECTOR] [--bind] [--forward REMOTE[=LOCAL]] [--no-input]\n       sshx tunnel direct list|status ID|stop ID|restart ID\n       sshx tunnel paired list|status ID|stop ID|restart ID\n       sshx pair setup [GATEWAY] [VM] [--gateway ID] [--vm ID] [--transit-host HOST --transit-port PORT]";
 
 fn main() {
     match run(env::args_os().skip(1).collect()) {
@@ -54,22 +54,16 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
     let home = home_dir()?;
     if matches!(&cli.command, Command::Doctor) {
         let (roots, settings_error) = doctor_roots(&cli, &home);
-        let report = sshx::doctor::run(
-            &home,
-            &roots,
-            settings_error.as_deref(),
-            cli.password_stdin
-                || cli.password_fd.is_some()
-                || cli.gateway_password_fd.is_some()
-                || cli.vm_password_fd.is_some(),
-            sshx::doctor::Selection {
-                id: cli.id.clone(),
-                source: cli.source.clone(),
-                line: cli.line,
-                alias: cli.alias.clone(),
-            },
-        );
+        let report = doctor_report(&cli, &home, &roots, settings_error.as_deref());
+        if cli.fix_permissions {
+            return run_doctor_fix(&cli, &home, report);
+        }
         print!("{}", render_doctor(&report, cli.format)?);
+        if !sshx::doctor::unsafe_permission_findings(&report).is_empty() {
+            return Err(
+                "PERMISSION_REPAIR_INCOMPLETE: unsafe permission findings remain".to_string(),
+            );
+        }
         return Ok(());
     }
     match &cli.command {
@@ -1014,6 +1008,135 @@ fn render_roots(roots: &[RegisteredRoot], format: OutputFormat) -> Result<(), St
     Ok(())
 }
 
+fn doctor_report(
+    cli: &Cli,
+    home: &Path,
+    roots: &[RegisteredRoot],
+    settings_error: Option<&str>,
+) -> sshx::doctor::DoctorReport {
+    sshx::doctor::run(
+        home,
+        roots,
+        settings_error,
+        cli.password_stdin
+            || cli.password_fd.is_some()
+            || cli.gateway_password_fd.is_some()
+            || cli.vm_password_fd.is_some(),
+        sshx::doctor::Selection {
+            id: cli.id.clone(),
+            source: cli.source.clone(),
+            line: cli.line,
+            alias: cli.alias.clone(),
+        },
+    )
+}
+
+fn run_doctor_fix(
+    cli: &Cli,
+    home: &Path,
+    report: sshx::doctor::DoctorReport,
+) -> Result<(), String> {
+    let candidates = report.repairs.clone();
+    let interactive = !cli.no_input && io::stdin().is_terminal();
+    let results = if candidates.is_empty() {
+        Vec::new()
+    } else if !interactive {
+        skipped_repairs(&candidates, "non-interactive execution; no changes applied")
+    } else {
+        eprint!("{}", render_doctor(&report, OutputFormat::Human)?);
+        let confirmed = prompt_yes("Apply permission repairs? [y/N]: ")?;
+        if confirmed {
+            sshx::permissions::apply_all(&candidates)
+        } else {
+            skipped_repairs(&candidates, "confirmation declined; no changes applied")
+        }
+    };
+
+    let (roots, settings_error) = doctor_roots(cli, home);
+    let final_report = doctor_report(cli, home, &roots, settings_error.as_deref());
+    let mut output_report = if interactive {
+        final_report.clone()
+    } else {
+        report.clone()
+    };
+    if interactive {
+        output_report.repairs.clear();
+    }
+    print!(
+        "{}",
+        render_doctor_with_repairs(&output_report, &results, cli.format)?
+    );
+    if results.iter().any(|result| result.outcome == "failed") {
+        return Err("PERMISSION_REPAIR_FAILED: one or more repairs failed".to_string());
+    }
+    if !sshx::doctor::unsafe_permission_findings(&final_report).is_empty() {
+        return Err("PERMISSION_REPAIR_INCOMPLETE: unsafe permission findings remain".to_string());
+    }
+    Ok(())
+}
+
+fn skipped_repairs(
+    candidates: &[sshx::permissions::RepairCandidate],
+    detail: &str,
+) -> Vec<sshx::permissions::RepairResult> {
+    candidates
+        .iter()
+        .cloned()
+        .map(|candidate| sshx::permissions::RepairResult {
+            candidate,
+            outcome: "skipped".to_string(),
+            detail: detail.to_string(),
+        })
+        .collect()
+}
+
+fn render_doctor_with_repairs(
+    report: &sshx::doctor::DoctorReport,
+    results: &[sshx::permissions::RepairResult],
+    format: OutputFormat,
+) -> Result<String, String> {
+    if !format.is_machine() {
+        let mut rendered = render_doctor(report, format)?;
+        rendered.push_str(&render_repairs(results, format)?);
+        return Ok(rendered);
+    }
+    match format {
+        OutputFormat::Json => {
+            let mut value: serde_json::Value =
+                serde_json::from_str(&render_doctor(report, format)?)
+                    .map_err(|error| format!("cannot parse doctor JSON: {error}"))?;
+            let object = value
+                .as_object_mut()
+                .ok_or_else(|| "doctor JSON output is not an object".to_string())?;
+            object.insert(
+                "repair_results".to_string(),
+                serde_json::to_value(results)
+                    .map_err(|error| format!("cannot render repair results: {error}"))?,
+            );
+            let mut rendered = serde_json::to_string_pretty(&value)
+                .map_err(|error| format!("cannot render JSON output: {error}"))?;
+            rendered.push('\n');
+            Ok(rendered)
+        }
+        OutputFormat::Yaml => {
+            let mut value: serde_yaml::Value =
+                serde_yaml::from_str(&render_doctor(report, format)?)
+                    .map_err(|error| format!("cannot parse doctor YAML: {error}"))?;
+            let mapping = value
+                .as_mapping_mut()
+                .ok_or_else(|| "doctor YAML output is not a mapping".to_string())?;
+            mapping.insert(
+                serde_yaml::Value::String("repair_results".to_string()),
+                serde_yaml::to_value(results)
+                    .map_err(|error| format!("cannot render repair results: {error}"))?,
+            );
+            serde_yaml::to_string(&value)
+                .map_err(|error| format!("cannot render YAML output: {error}"))
+        }
+        OutputFormat::Human => unreachable!(),
+    }
+}
+
 fn doctor_roots(cli: &Cli, home: &std::path::Path) -> (Vec<RegisteredRoot>, Option<String>) {
     if !cli.roots.is_empty() {
         return (
@@ -1301,6 +1424,7 @@ struct Cli {
     dynamic_forwards: Vec<String>,
     allow_bind: bool,
     yes: bool,
+    fix_permissions: bool,
     preview: bool,
     no_input: bool,
     bind: bool,
@@ -1337,6 +1461,7 @@ impl Cli {
         let mut folder = None;
         let mut file = None;
         let mut yes = false;
+        let mut fix_permissions = false;
         let mut local_forwards = Vec::new();
         let mut remote_forwards = Vec::new();
         let mut dynamic_forwards = Vec::new();
@@ -1481,6 +1606,8 @@ impl Cli {
                 file = Some(PathBuf::from(next(text)?));
             } else if text == "--yes" {
                 yes = true;
+            } else if text == "--fix-permissions" {
+                fix_permissions = true;
             } else if text == "--preview" || text == "--dry-run" {
                 preview = true;
             } else if text == "--id" || text == "--host-id" {
@@ -1772,6 +1899,9 @@ impl Cli {
                 command
             }
         };
+        if fix_permissions && !matches!(&command, Command::Doctor) {
+            return Err("--fix-permissions is only valid with doctor".to_string());
+        }
 
         Ok(Self {
             config,
@@ -1800,6 +1930,7 @@ impl Cli {
             dynamic_forwards,
             allow_bind: allow_bind || bind,
             yes,
+            fix_permissions,
             preview,
             no_input,
             bind,

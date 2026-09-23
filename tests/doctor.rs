@@ -85,7 +85,7 @@ fn doctor_reports_config_stages_without_secret_or_repair() {
             "json",
         ],
     );
-    assert!(json.status.success(), "{json:?}");
+    assert_eq!(json.status.code(), Some(2), "{json:?}");
     let json_value: serde_json::Value = serde_json::from_slice(&json.stdout).expect("JSON output");
     let findings = json_value["findings"].as_array().expect("findings array");
     for code in [
@@ -120,7 +120,7 @@ fn doctor_reports_config_stages_without_secret_or_repair() {
             "yaml",
         ],
     );
-    assert!(yaml.status.success(), "{yaml:?}");
+    assert_eq!(yaml.status.code(), Some(2), "{yaml:?}");
     let yaml_value: serde_yaml::Value = serde_yaml::from_slice(&yaml.stdout).expect("YAML output");
     let yaml_findings = yaml_value["findings"].as_sequence().expect("YAML findings");
     for code in [
@@ -147,7 +147,7 @@ fn doctor_reports_config_stages_without_secret_or_repair() {
             "doctor",
         ],
     );
-    assert!(human.status.success(), "{human:?}");
+    assert_eq!(human.status.code(), Some(2), "{human:?}");
     let human_text = String::from_utf8_lossy(&human.stdout);
     assert!(human_text.contains("Next:"));
     assert!(human_text.contains("remote server validation: not run"));
@@ -228,6 +228,8 @@ fn doctor_reports_stale_runtime_without_repairing_registry() {
     write(&config, "Host current\n  HostName current.example\n");
     let tunnel_root = home.join(".config/sshx/tunnels");
     fs::create_dir_all(&tunnel_root).expect("tunnel state should be created");
+    fs::set_permissions(home.join(".config/sshx"), fs::Permissions::from_mode(0o700))
+        .expect("app state should be private");
     fs::set_permissions(&tunnel_root, fs::Permissions::from_mode(0o700))
         .expect("tunnel state should be private");
     let control_dir = tunnel_root.join("stale");
