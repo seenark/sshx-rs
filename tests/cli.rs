@@ -118,6 +118,320 @@ fn every_documented_help_path_has_ordered_sections() {
         }
     }
 }
+#[test]
+fn host_and_pair_help_cover_every_path_and_form() {
+    let paths = [
+        ("host", "Name: host", true),
+        ("host list", "Name: host list", false),
+        ("host show", "Name: host show", false),
+        ("host create", "Name: host create", false),
+        ("host update", "Name: host update", false),
+        ("host rename", "Name: host rename", false),
+        ("host delete", "Name: host delete", false),
+        ("pair", "Name: pair", true),
+        ("pair setup", "Name: pair setup (alias: pair create)", false),
+        (
+            "pair create",
+            "Name: pair setup (alias: pair create)",
+            false,
+        ),
+        ("pair list", "Name: pair list", false),
+        ("pair validate", "Name: pair validate", false),
+    ];
+
+    for (path, marker, group) in paths {
+        let path_args = path.split_whitespace().collect::<Vec<_>>();
+        let mut forms = Vec::new();
+        let mut short = path_args.clone();
+        short.push("-h");
+        forms.push(short);
+        let mut long = path_args.clone();
+        long.push("--help");
+        forms.push(long);
+        let mut help = vec!["help"];
+        help.extend(path_args.iter().copied());
+        forms.push(help);
+
+        for args in forms {
+            let output = Command::new(env!("CARGO_BIN_EXE_sshx"))
+                .args(&args)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{path} {args:?}: {output:?}");
+            assert!(output.stderr.is_empty(), "{path} {args:?}: {output:?}");
+            let text = String::from_utf8_lossy(&output.stdout);
+            assert!(text.contains(marker), "{path} {args:?}: {text}");
+            for section in [
+                "Purpose:",
+                "Usage forms:",
+                "Positional arguments:",
+                "Options:",
+                "Examples:",
+                "Exit behavior:",
+                "Related commands:",
+            ] {
+                assert!(text.contains(section), "{path}: missing {section}\n{text}");
+            }
+            if group {
+                assert!(text.contains("Subcommands:"), "{path}: {text}");
+            }
+            assert!(!text.contains("\x1b["), "{path}: {text}");
+        }
+    }
+}
+
+#[test]
+fn host_and_pair_help_preserves_position_and_alias_behavior() {
+    let cases: &[(&[&str], &str)] = &[
+        (&["--help", "host", "list"], "Name: sshx"),
+        (&["host", "--help", "list"], "Name: host"),
+        (&["host", "list", "--help"], "Name: host list"),
+        (&["help", "host", "list"], "Name: host list"),
+        (&["host", "show", "prod", "--help"], "Name: host show"),
+        (&["--help", "pair", "setup"], "Name: sshx"),
+        (&["pair", "--help", "setup"], "Name: pair"),
+        (&["pair", "setup", "--help"], "Name: pair setup"),
+        (&["help", "pair", "create"], "Name: pair setup"),
+        (
+            &["pair", "create", "gateway", "vm", "--help"],
+            "Name: pair setup",
+        ),
+    ];
+    for (args, marker) in cases {
+        let output = Command::new(env!("CARGO_BIN_EXE_sshx"))
+            .args(*args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{args:?}: {output:?}");
+        assert!(output.stderr.is_empty(), "{args:?}: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains(marker),
+            "{args:?}: {:?}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    let setup = Command::new(env!("CARGO_BIN_EXE_sshx"))
+        .args(["pair", "setup", "--help"])
+        .output()
+        .unwrap();
+    let create = Command::new(env!("CARGO_BIN_EXE_sshx"))
+        .args(["pair", "create", "--help"])
+        .output()
+        .unwrap();
+    assert_eq!(setup.stdout, create.stdout);
+
+    let plain = Command::new(env!("CARGO_BIN_EXE_sshx"))
+        .args(["host", "update", "--help"])
+        .output()
+        .unwrap();
+    let formatted = Command::new(env!("CARGO_BIN_EXE_sshx"))
+        .args(["host", "update", "--format", "json", "--help"])
+        .output()
+        .unwrap();
+    assert_eq!(plain.stdout, formatted.stdout);
+}
+
+#[test]
+fn host_and_pair_help_documents_selection_prompts_conflicts_and_outcomes() {
+    let pages: &[(&[&str], &[&str])] = &[
+        (
+            &["help", "host", "list"],
+            &[
+                "HostEntry",
+                "--config PATH",
+                "--scope SCOPE",
+                "--project NAME",
+                "--source PATH",
+                "--line NUMBER",
+                "--id ID",
+                "--format human|json|yaml",
+                "No prompt supplies missing values",
+                "Discovery diagnostics",
+            ],
+        ),
+        (
+            &["help", "host", "show"],
+            &[
+                "Exact alias or stable HostEntry ID",
+                "--source PATH --line NUMBER",
+                "--id ID",
+                "No fuzzy fallback",
+                "sshx host show prod",
+                "Missing or ambiguous selectors",
+            ],
+        ),
+        (
+            &["help", "host", "create"],
+            &[
+                "--config PATH",
+                "--scope SCOPE",
+                "--project NAME",
+                "--folder PATH",
+                "--file PATH",
+                "--target-file PATH",
+                "--alias ALIAS",
+                "--hostname HOSTNAME",
+                "--password-stdin",
+                "--preview",
+                "--yes",
+                "--no-input",
+                "prompts only with a usable TTY",
+                "Conflicts",
+            ],
+        ),
+        (
+            &["help", "host", "update"],
+            &[
+                "Exact alias or stable HostEntry ID",
+                "--source PATH --line NUMBER",
+                "--id ID",
+                "live fuzzy picker",
+                "--clear-password",
+                "--password-stdin",
+                "--preview",
+                "--yes",
+                "--no-input",
+                "Escape or Ctrl-C",
+                "Selector errors",
+            ],
+        ),
+        (
+            &["help", "host", "rename"],
+            &[
+                "Exact alias or stable HostEntry ID",
+                "--source PATH --line NUMBER",
+                "--id ID",
+                "live fuzzy picker",
+                "--alias ALIAS",
+                "--preview",
+                "--yes",
+                "--no-input",
+                "Missing values",
+                "rename accepts only --alias",
+            ],
+        ),
+        (
+            &["help", "host", "delete"],
+            &[
+                "Exact alias or stable HostEntry ID",
+                "--source PATH --line NUMBER",
+                "--id ID",
+                "live fuzzy picker",
+                "--preview",
+                "--yes",
+                "--no-input",
+                "declined confirmation",
+                "Delete does not accept host fields",
+            ],
+        ),
+        (
+            &["help", "pair"],
+            &["Pair routes", "ProxyCommand", "native Copy SSH"],
+        ),
+        (
+            &["help", "pair", "setup"],
+            &[
+                "Exact alias or stable HostEntry ID",
+                "gateway",
+                "VM",
+                "interactive picker",
+                "--gateway SELECTOR",
+                "--gateway-id ID",
+                "--vm SELECTOR",
+                "--vm-id ID",
+                "--gateway-source PATH",
+                "--gateway-line NUMBER",
+                "--vm-source PATH",
+                "--vm-line NUMBER",
+                "--source PATH --line NUMBER",
+                "--id ID",
+                "--transit-host HOST",
+                "--transit-port PORT",
+                "--no-input",
+                "--preview",
+                "--yes",
+                "Conflicting positional and option selectors",
+                "source and line must be paired",
+            ],
+        ),
+        (
+            &["help", "pair", "list"],
+            &[
+                "Pair routes",
+                "--config PATH",
+                "--format human|json|yaml",
+                "Invalid Pair records",
+            ],
+        ),
+        (
+            &["help", "pair", "validate"],
+            &[
+                "report-only",
+                "--config PATH",
+                "--format human|json|yaml",
+                "never repairs permissions or route data",
+                "Invalid routes",
+            ],
+        ),
+    ];
+    for (args, fragments) in pages {
+        let output = Command::new(env!("CARGO_BIN_EXE_sshx"))
+            .args(*args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{args:?}: {output:?}");
+        let text = String::from_utf8_lossy(&output.stdout);
+        for fragment in *fragments {
+            assert!(
+                text.contains(fragment),
+                "{args:?}: missing {fragment}\n{text}"
+            );
+        }
+    }
+    let pair = Command::new(env!("CARGO_BIN_EXE_sshx"))
+        .args(["help", "pair"])
+        .output()
+        .unwrap();
+    assert!(pair.status.success());
+    let pair_text = String::from_utf8_lossy(&pair.stdout);
+    assert!(!pair_text.contains("--gateway-password-fd"));
+    assert!(!pair_text.contains("--vm-password-fd"));
+
+    let connect = Command::new(env!("CARGO_BIN_EXE_sshx"))
+        .args(["help", "connect"])
+        .output()
+        .unwrap();
+    assert!(connect.status.success());
+    let connect_text = String::from_utf8_lossy(&connect.stdout);
+    for fragment in [
+        "--password-fd FD",
+        "--gateway-password-fd FD",
+        "--vm-password-fd FD",
+    ] {
+        assert!(
+            connect_text.contains(fragment),
+            "missing {fragment}\n{connect_text}"
+        );
+    }
+
+    for (args, usage) in [
+        (&["host", "unknown"][..], "Usage: sshx [--config PATH] host"),
+        (&["pair", "unknown"][..], "Usage: sshx pair"),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_sshx"))
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+        assert!(output.stdout.is_empty(), "{args:?}: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(usage),
+            "{args:?}: {:?}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
 
 #[test]
 fn help_parse_errors_use_nearest_usage_on_stderr() {

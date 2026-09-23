@@ -60,9 +60,30 @@ fn canonical_help_path(path: Vec<String>) -> Vec<String> {
         path.first().map(String::as_str),
         Some("setup" | "doctor" | "connect")
     ) {
-        path.into_iter().take(1).collect()
-    } else {
-        path
+        return path.into_iter().take(1).collect();
+    }
+    match path.as_slice() {
+        [host, command, ..]
+            if host == "host"
+                && matches!(
+                    command.as_str(),
+                    "list" | "show" | "create" | "update" | "rename" | "delete"
+                ) =>
+        {
+            vec![host.clone(), command.clone()]
+        }
+        [pair, command, ..]
+            if pair == "pair"
+                && matches!(command.as_str(), "setup" | "create" | "list" | "validate") =>
+        {
+            let command = if command == "create" {
+                "setup"
+            } else {
+                command.as_str()
+            };
+            vec![pair.clone(), command.to_string()]
+        }
+        _ => path,
     }
 }
 
