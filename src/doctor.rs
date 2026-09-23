@@ -711,7 +711,7 @@ fn check_password_permissions(path: &Path, builder: &mut ReportBuilder) {
             "warning",
             "config",
             format!("password-bearing config file {} is a symlink", path.display()),
-            "Replace the path manually with a user-owned regular file; doctor never follows symlinks.",
+            "Replace the path manually with a user-owned regular file; doctor never follows or replaces symlinks.",
             Some(path),
         );
         return;
@@ -731,11 +731,13 @@ fn check_password_permissions(path: &Path, builder: &mut ReportBuilder) {
                     "password-bearing config file {} has unsafe ownership or permissions",
                     path.display()
                 ),
-                "Review ownership and chmod the file manually to owner-only permissions; doctor never changes modes.",
+                "Review ownership manually; use --fix-permissions to chmod eligible files after one confirmation.",
                 Some(path),
             );
             if !unsafe_owner && metadata.is_file() {
-                builder.repair("password_file", path, true, mode, 0o600);
+                if let Ok(current_mode) = crate::permissions::assess(path, true) {
+                    builder.repair("password_file", path, true, current_mode, 0o600);
+                }
             }
         }
     }
@@ -808,7 +810,7 @@ fn inspect_location(
                 if stage == "known_hosts" {
                     "Create this store only after explicit host-key trust; doctor never accepts keys automatically."
                 } else {
-                    "The location will be created by an explicit management operation; doctor never repairs state."
+                    "The location will be created by an explicit management operation; doctor never creates state."
                 },
                 Some(path),
             );
@@ -879,22 +881,13 @@ fn inspect_location(
             "warning",
             stage,
             format!("{} has unsafe ownership or permissions", path.display()),
-            "Review ownership and chmod the path manually; doctor never changes permissions.",
+            "Review ownership manually; use --fix-permissions to chmod eligible paths after one confirmation. Doctor never changes ownership, replaces paths, or modifies arbitrary parents.",
             Some(path),
         );
         if unsafe_mode && !unsafe_owner {
-            let current_mode = {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    metadata.permissions().mode() & 0o7777
-                }
-                #[cfg(not(unix))]
-                {
-                    expected_mode
-                }
-            };
-            builder.repair(kind, path, file, current_mode, expected_mode);
+            if let Ok(current_mode) = crate::permissions::assess(path, file) {
+                builder.repair(kind, path, file, current_mode, expected_mode);
+            }
         }
         "insecure".to_string()
     } else {

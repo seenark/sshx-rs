@@ -34,6 +34,13 @@ pub struct RepairResult {
 /// type, is not a symlink, and is owned by the current effective user.
 /// Returns the current mode when eligible; otherwise the disqualifying reason.
 pub fn assess(path: &Path, file: bool) -> Result<u32, String> {
+    if let Some(component) = symlink_component(path) {
+        return Err(format!(
+            "{} contains symlink component {}",
+            path.display(),
+            component.display()
+        ));
+    }
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
     if metadata.file_type().is_symlink() {
@@ -51,6 +58,9 @@ pub fn assess(path: &Path, file: bool) -> Result<u32, String> {
         if metadata.uid() != unsafe { libc::geteuid() } as u32 {
             return Err(format!("{} is owned by another user", path.display()));
         }
+        if file && metadata.nlink() > 1 {
+            return Err(format!("{} is a shared file", path.display()));
+        }
         Ok(metadata.permissions().mode() & 0o7777)
     }
     #[cfg(not(unix))]
@@ -58,6 +68,15 @@ pub fn assess(path: &Path, file: bool) -> Result<u32, String> {
         let _ = metadata;
         Ok(0)
     }
+}
+
+fn symlink_component(path: &Path) -> Option<PathBuf> {
+    path.ancestors().find_map(|ancestor| {
+        fs::symlink_metadata(ancestor)
+            .ok()
+            .filter(|metadata| metadata.file_type().is_symlink())
+            .map(|_| ancestor.to_path_buf())
+    })
 }
 
 /// Apply one planned repair: re-check eligibility at apply time, set the exact

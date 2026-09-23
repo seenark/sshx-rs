@@ -14,7 +14,10 @@ fn fixture() -> (PathBuf, PathBuf) {
         .expect("clock should be after unix epoch")
         .as_nanos();
     let ordinal = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let root = std::env::temp_dir().join(format!("sshx-ticket-13-{timestamp}-{ordinal}"));
+    let root = std::env::temp_dir()
+        .canonicalize()
+        .expect("temporary directory should resolve")
+        .join(format!("sshx-ticket-13-{timestamp}-{ordinal}"));
     let home = root.join("home");
     fs::create_dir_all(home.join(".ssh")).expect("fixture home should be created");
     (root, home)
@@ -590,4 +593,64 @@ fn settings_save_creates_private_modes_regardless_of_umask() {
 fn manual_chmod_hint_is_shell_quoted() {
     let hint = permissions::manual_chmod_command(&PathBuf::from("/tmp/my config's/id_rsa"), true);
     assert_eq!(hint, "chmod 600 '/tmp/my config'\\''s/id_rsa'");
+}
+#[test]
+fn permission_contract_rejects_shared_files_and_symlink_components() {
+    let (root, home) = fixture();
+    let shared = home.join("shared");
+    write(&shared, "secret");
+    let hard_link = home.join("shared-copy");
+    fs::hard_link(&shared, &hard_link).expect("hard link should be created");
+    assert!(
+        permissions::assess(&shared, true).is_err(),
+        "shared file must not be eligible"
+    );
+
+    let real_dir = home.join("real");
+    fs::create_dir_all(&real_dir).expect("real directory should be created");
+    let target = real_dir.join("target");
+    write(&target, "secret");
+    let symlink_dir = home.join("link");
+    std::os::unix::fs::symlink(&real_dir, &symlink_dir).expect("symlink should be created");
+    let through_symlink = symlink_dir.join("target");
+    assert!(
+        permissions::assess(&through_symlink, true).is_err(),
+        "path through symlink must not be eligible"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn doctor_never_plans_shared_files_or_paths_through_symlink_parents() {
+    let (root, home) = fixture();
+    write(
+        &home.join(".ssh/config"),
+        "Host plain\n  HostName plain.example\n",
+    );
+
+    let app_dir = home.join(".config/sshx");
+    fs::create_dir_all(&app_dir).unwrap();
+    let settings_path = app_dir.join("config.json");
+    write(&settings_path, "{}");
+    fs::set_permissions(&settings_path, fs::Permissions::from_mode(0o644)).unwrap();
+    fs::hard_link(&settings_path, app_dir.join("settings-copy")).unwrap();
+
+    let outside = root.join("outside-known-hosts");
+    fs::create_dir_all(&outside).unwrap();
+    let outside_file = outside.join("work");
+    write(&outside_file, "");
+    fs::set_permissions(&outside_file, fs::Permissions::from_mode(0o644)).unwrap();
+    let known_hosts_parent = app_dir.join("known_hosts");
+    std::os::unix::fs::symlink(&outside, &known_hosts_parent).unwrap();
+
+    let report = report_for(&home);
+    assert!(
+        report
+            .repairs
+            .iter()
+            .all(|candidate| candidate.path != settings_path && candidate.path != outside_file),
+        "unsafe paths must remain diagnostics: {:?}",
+        report.repairs
+    );
+    fs::remove_dir_all(root).unwrap();
 }

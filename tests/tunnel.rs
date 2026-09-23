@@ -113,6 +113,14 @@ fn standalone_direct_tunnel_survives_launcher_and_stops_by_id() {
     assert_eq!(tunnel["application_health"], "unknown");
     let id = tunnel["id"].as_str().unwrap();
     assert!(marker.exists());
+    for path in [home.join(".config/sshx"), home.join(".config/sshx/tunnels")] {
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+            0o700,
+            "new private directory must be 0700: {}",
+            path.display()
+        );
+    }
     let duplicate = run(
         &home,
         &bin,

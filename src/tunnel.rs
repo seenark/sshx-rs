@@ -1178,34 +1178,57 @@ fn ensure_private_tree(root: &Path) -> Result<(), String> {
     let app_dir = config_dir
         .parent()
         .ok_or_else(|| "REGISTRY_FAILED: tunnel registry has no app parent".to_string())?;
-    for directory in [app_dir, config_dir] {
-        if directory.exists() {
-            if fs::symlink_metadata(directory)
-                .map(|metadata| metadata.file_type().is_symlink())
-                .unwrap_or(true)
-            {
-                return Err(format!(
-                    "REGISTRY_UNSAFE: {} is a symlink",
-                    directory.display()
-                ));
-            }
-        } else {
-            fs::create_dir(directory).map_err(|error| {
+
+    match fs::symlink_metadata(app_dir) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(format!(
+                "REGISTRY_UNSAFE: {} is not a directory",
+                app_dir.display()
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(app_dir).map_err(|error| {
                 format!(
                     "REGISTRY_FAILED: cannot create {}: {error}",
-                    directory.display()
+                    app_dir.display()
                 )
             })?;
         }
+        Err(error) => {
+            return Err(format!(
+                "REGISTRY_FAILED: cannot inspect {}: {error}",
+                app_dir.display()
+            ));
+        }
     }
-    if root.exists() {
-        ensure_private_dir(root, false)
-    } else {
-        fs::create_dir(root).map_err(|error| {
-            format!("REGISTRY_FAILED: cannot create {}: {error}", root.display())
-        })?;
-        set_mode(root, 0o700)
+
+    match fs::symlink_metadata(config_dir) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(format!(
+                "REGISTRY_UNSAFE: {} is not a private directory",
+                config_dir.display()
+            ));
+        }
+        Ok(_) => ensure_private_dir(config_dir, false)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(config_dir).map_err(|error| {
+                format!(
+                    "REGISTRY_FAILED: cannot create {}: {error}",
+                    config_dir.display()
+                )
+            })?;
+            set_mode(config_dir, 0o700)?;
+        }
+        Err(error) => {
+            return Err(format!(
+                "REGISTRY_FAILED: cannot inspect {}: {error}",
+                config_dir.display()
+            ));
+        }
     }
+
+    ensure_private_dir(root, true)
 }
 fn ensure_private_dir(path: &Path, create: bool) -> Result<(), String> {
     let metadata = match fs::symlink_metadata(path) {
@@ -1214,6 +1237,7 @@ fn ensure_private_dir(path: &Path, create: bool) -> Result<(), String> {
             fs::create_dir(path).map_err(|error| {
                 format!("REGISTRY_FAILED: cannot create {}: {error}", path.display())
             })?;
+            set_mode(path, 0o700)?;
             fs::symlink_metadata(path).map_err(|error| {
                 format!(
                     "REGISTRY_FAILED: cannot inspect {}: {error}",
