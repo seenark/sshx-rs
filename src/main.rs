@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::{self, Stdio};
 const USAGE: &str = "Usage: sshx [--version]";
 const HOST_USAGE: &str = "Usage: sshx [--config PATH] host list [--format human|json|yaml]\n       sshx [--config PATH] host show SELECTOR [--format human|json|yaml]\n       sshx [--config PATH] host create --scope SCOPE --file PATH --alias ALIAS --hostname HOSTNAME [options]\n       sshx [--config PATH] host update SELECTOR [options]\n       sshx [--config PATH] host rename SELECTOR --alias ALIAS [options]\n       sshx [--config PATH] host delete SELECTOR [options]";
-const SETUP_USAGE: &str = "Usage: sshx setup [--personal PATH] [--work PATH] [--project NAME]\n       sshx doctor [--fix-permissions] [--format human|json|yaml]\n       sshx connect [SELECTOR] [--id ID] [--action connect|copy-ssh|copy-sshx] [--source PATH --line NUMBER] [--password-fd FD] [--gateway-password-fd FD --vm-password-fd FD] [--bind] [--forward REMOTE[=LOCAL]] [--no-input]\n       sshx tunnel direct start [SELECTOR] [-L SPEC] [-R SPEC] [-D SPEC] [--allow-bind]\n       sshx tunnel paired start [SELECTOR] [--bind] [--forward REMOTE[=LOCAL]] [--no-input]\n       sshx tunnel direct list|status ID|stop ID|restart ID\n       sshx tunnel paired list|status ID|stop ID|restart ID\n       sshx pair setup [GATEWAY] [VM] [--gateway ID] [--vm ID] [--transit-host HOST --transit-port PORT]";
+const SETUP_USAGE: &str = "Usage: sshx setup [--personal PATH] [--work PATH] [--project NAME]\n       sshx doctor [--fix-permissions] [--format human|json|yaml]\n       sshx connect [SELECTOR] [--id ID] [--action connect|copy-ssh|copy-sshx|copy-password] [--source PATH --line NUMBER] [--password-fd FD] [--gateway-password-fd FD --vm-password-fd FD] [--bind] [--forward REMOTE[=LOCAL]] [--no-input]\n       sshx tunnel direct start [SELECTOR] [-L SPEC] [-R SPEC] [-D SPEC] [--allow-bind]\n       sshx tunnel paired start [SELECTOR] [--bind] [--forward REMOTE[=LOCAL]] [--no-input]\n       sshx tunnel direct list|status ID|stop ID|restart ID\n       sshx tunnel paired list|status ID|stop ID|restart ID\n       sshx pair setup [GATEWAY] [VM] [--gateway ID] [--vm ID] [--transit-host HOST --transit-port PORT]";
 
 fn main() {
     match run(env::args_os().skip(1).collect()) {
@@ -122,16 +122,20 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
             render_entries(&entries, &diagnostics, cli.format)
         }
         Command::Connect(selector) => {
-            if cli.action.is_some() && selector.is_none() && cli.id.is_none() {
-                return Err(
-                    "ACTION_SELECTOR_REQUIRED: --action requires an explicit HostEntry selector"
-                        .to_string(),
-                );
-            }
             let selected =
                 select_connect_entry(&filtered, selector.as_deref(), &cli, "connect host")?;
             let entry = selected.entry;
-            if let Some(action @ (HostAction::CopySsh | HostAction::CopySshx)) = cli.action {
+            let action = match cli.action {
+                Some(action) => action,
+                None if selector.is_none() && cli.id.is_none() && !cli.format.is_machine() => {
+                    choose_host_action(entry, &catalog.entries)?
+                }
+                None => HostAction::Connect,
+            };
+            if matches!(
+                action,
+                HostAction::CopySsh | HostAction::CopySshx | HostAction::CopyPassword
+            ) {
                 return run_host_action(action, &selected, &catalog.entries, &cli);
             }
             if cli.format.is_machine() {
@@ -1397,6 +1401,34 @@ fn interactive_select<'a>(
 ) -> Result<picker::Selection<'a>, String> {
     picker::select(entries, label)
 }
+
+fn choose_host_action(entry: &HostEntry, entries: &[HostEntry]) -> Result<HostAction, String> {
+    let paired = sshx::pair::paired_route(entries, entry)?.is_some();
+    let mut actions = vec![HostAction::Connect];
+    if paired {
+        actions.push(HostAction::CopySshx);
+    } else {
+        actions.push(HostAction::CopySsh);
+        actions.push(HostAction::CopySshx);
+        if sshx::connect::has_stored_password(entry)? {
+            actions.push(HostAction::CopyPassword);
+        }
+    }
+    let labels = actions
+        .iter()
+        .map(|action| match action {
+            HostAction::Connect => "Connect",
+            HostAction::CopySsh => "Copy SSH",
+            HostAction::CopySshx => "Copy sshx",
+            HostAction::CopyPassword => "Copy password",
+        })
+        .collect::<Vec<_>>();
+    let choice = picker::select_menu(&labels, "host action menu")?;
+    actions
+        .get(choice)
+        .copied()
+        .ok_or_else(|| "ACTION_INVALID: selected host action is unavailable".to_string())
+}
 fn run_host_action(
     action: HostAction,
     selected: &picker::Selection<'_>,
@@ -1404,11 +1436,25 @@ fn run_host_action(
     cli: &Cli,
 ) -> Result<(), String> {
     let route = sshx::pair::paired_route(entries, selected.entry)?;
-    if action == HostAction::CopySsh && route.is_some() {
-        return Err(
-            "ACTION_UNAVAILABLE: copy-ssh cannot represent a Pair route; use --action copy-sshx"
-                .to_string(),
-        );
+    if route.is_some() {
+        match action {
+            HostAction::CopySsh => {
+                return Err(
+                    "ACTION_UNAVAILABLE: copy-ssh cannot represent a Pair route; use --action copy-sshx"
+                        .to_string(),
+                );
+            }
+            HostAction::CopyPassword => {
+                return Err(
+                    "ACTION_UNAVAILABLE: copy-password is unavailable for Pair routes; use --action copy-sshx"
+                        .to_string(),
+                );
+            }
+            HostAction::Connect | HostAction::CopySshx => {}
+        }
+    }
+    if action == HostAction::CopyPassword {
+        return run_password_action(selected.entry, cli);
     }
     let root = match (action, route.as_ref()) {
         (HostAction::CopySsh, _) => Some(select_config_root(selected.entry, cli)?),
@@ -1417,6 +1463,7 @@ fn run_host_action(
             select_pair_config_root(&route.vm, &route.gateway, cli)?
         }
         (HostAction::Connect, _) => None,
+        (HostAction::CopyPassword, _) => None,
     };
     let source_needed = action == HostAction::CopySshx
         && (root.is_none()
@@ -1453,13 +1500,30 @@ fn run_host_action(
             }
             command
         }
-        HostAction::Connect => {
-            return Err(
-                "ACTION_INVALID: connect action must use normal connection flow".to_string(),
-            );
+        HostAction::Connect | HostAction::CopyPassword => {
+            return Err("ACTION_INVALID: action must use normal connection flow".to_string());
         }
     };
     publish_action_command(&command)
+}
+
+fn run_password_action(entry: &HostEntry, cli: &Cli) -> Result<(), String> {
+    if cli.no_input || !io::stdin().is_terminal() {
+        return Err(
+            "PASSWORD_COPY_TTY_REQUIRED: copy-password requires an interactive terminal"
+                .to_string(),
+        );
+    }
+    let password = sshx::connect::stored_password(entry, false)?.ok_or_else(|| {
+        "PASSWORD_UNAVAILABLE: selected HostEntry has no non-empty stored password".to_string()
+    })?;
+    eprintln!(
+        "Warning: clipboard manager history may retain this password; sshx does not automatically clear the clipboard."
+    );
+    if !prompt_yes("Copy stored password now? [y/N]: ")? {
+        return Err("PASSWORD_COPY_DECLINED: password was not copied".to_string());
+    }
+    publish_password(&password)
 }
 
 fn source_disambiguation_needed(
@@ -1650,6 +1714,20 @@ fn publish_action_command(command: &str) -> Result<(), String> {
         );
         return Ok(());
     };
+    send_clipboard(backend, command, "command")
+}
+
+fn publish_password(password: &str) -> Result<(), String> {
+    let Some(backend) = clipboard_backend() else {
+        return Err(
+            "CLIPBOARD_UNAVAILABLE: no supported clipboard backend; password not copied"
+                .to_string(),
+        );
+    };
+    send_clipboard(backend, password, "password")
+}
+
+fn send_clipboard(backend: ClipboardBackend, content: &str, label: &str) -> Result<(), String> {
     let mut child = process::Command::new(backend.program)
         .args(backend.args)
         .stdin(Stdio::piped())
@@ -1664,7 +1742,7 @@ fn publish_action_command(command: &str) -> Result<(), String> {
         .stdin
         .take()
         .ok_or_else(|| "CLIPBOARD_FAILED: clipboard stdin is unavailable".to_string())?
-        .write_all(command.as_bytes())
+        .write_all(content.as_bytes())
         .map_err(|error| format!("CLIPBOARD_FAILED: cannot write clipboard content: {error}"))?;
     let status = child.wait().map_err(|error| {
         format!(
@@ -1678,7 +1756,14 @@ fn publish_action_command(command: &str) -> Result<(), String> {
             backend.program
         ));
     }
-    eprintln!("Copied command to {}.", backend.program);
+    if label == "password" {
+        eprintln!(
+            "Copied password to {}; clipboard manager history may retain it.",
+            backend.program
+        );
+    } else {
+        eprintln!("Copied command to {}.", backend.program);
+    }
     Ok(())
 }
 
@@ -1708,8 +1793,9 @@ fn parse_host_action(value: &str) -> Result<HostAction, String> {
         "connect" => Ok(HostAction::Connect),
         "copy-ssh" => Ok(HostAction::CopySsh),
         "copy-sshx" => Ok(HostAction::CopySshx),
+        "copy-password" => Ok(HostAction::CopyPassword),
         _ => Err(format!(
-            "ACTION_INVALID: unsupported action `{value}`; use connect, copy-ssh, or copy-sshx"
+            "ACTION_INVALID: unsupported action `{value}`; use connect, copy-ssh, copy-sshx, or copy-password"
         )),
     }
 }
@@ -1727,6 +1813,7 @@ enum HostAction {
     Connect,
     CopySsh,
     CopySshx,
+    CopyPassword,
 }
 
 #[derive(Clone, Debug)]

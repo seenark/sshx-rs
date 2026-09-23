@@ -3289,6 +3289,25 @@ fn mode_of(path: &Path) -> u32 {
 }
 
 #[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn fake_clipboard(bin: &Path, root: &Path) -> &'static str {
+    #[cfg(target_os = "macos")]
+    let backend = "pbcopy";
+    #[cfg(target_os = "linux")]
+    let backend = "wl-copy";
+    let script = bin.join(backend);
+    write(
+        &script,
+        "#!/bin/sh\nprintf '%s' \"$*\" > \"$SSHX_CLIPBOARD_ARGS\"\ncat > \"$SSHX_CLIPBOARD_CAPTURE\"\nenv > \"$SSHX_CLIPBOARD_ENV\"\n",
+    );
+    let mut permissions = fs::metadata(&script).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&script, permissions).unwrap();
+    let _ = root;
+    backend
+}
+
+#[cfg(unix)]
 fn run_with_pty(
     home: &Path,
     args: &[&str],
@@ -3308,6 +3327,19 @@ fn run_with_pty_header(
     input: &[u8],
     header: &[u8],
 ) -> (std::process::ExitStatus, String) {
+    run_with_pty_header_path(home, args, bin, root, input, header, None)
+}
+
+#[cfg(unix)]
+fn run_with_pty_header_path(
+    home: &Path,
+    args: &[&str],
+    bin: &Path,
+    root: &Path,
+    input: &[u8],
+    header: &[u8],
+    inherited_path: Option<&str>,
+) -> (std::process::ExitStatus, String) {
     let mut master = -1;
     let mut slave = -1;
     let result = unsafe {
@@ -3323,16 +3355,22 @@ fn run_with_pty_header(
     let slave = unsafe { std::fs::File::from_raw_fd(slave) };
     let stdin = slave.try_clone().expect("pty stdin should clone");
     let stdout = slave.try_clone().expect("pty stdout should clone");
-    let path = format!(
-        "{}:{}",
-        bin.display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
+    let inherited_path = inherited_path
+        .map(str::to_owned)
+        .unwrap_or_else(|| std::env::var("PATH").unwrap_or_default());
+    let path = if inherited_path.is_empty() {
+        bin.display().to_string()
+    } else {
+        format!("{}:{inherited_path}", bin.display())
+    };
     let mut child = Command::new(env!("CARGO_BIN_EXE_sshx"))
         .env("HOME", home)
         .env("PATH", path)
         .env("SSHX_CAPTURE", root.join("runtime-config"))
         .env("SSHX_STARTED", root.join("master-started"))
+        .env("SSHX_CLIPBOARD_CAPTURE", root.join("clipboard-content"))
+        .env("SSHX_CLIPBOARD_ARGS", root.join("clipboard-args"))
+        .env("SSHX_CLIPBOARD_ENV", root.join("clipboard-env"))
         .env("SSHX_CLOSED", root.join("master-closed"))
         .env(
             "SSHX_AUTH_FAIL",
@@ -3426,7 +3464,7 @@ fn selectorless_connect_picker_preserves_secondary_alias() {
         &["--config", config.to_str().unwrap(), "connect"],
         &bin,
         &root,
-        b"second\n",
+        b"second\n\n",
     );
     assert!(status.success(), "status={status:?} output={output}");
     assert!(output.contains("second"), "picker output={output}");
@@ -3458,5 +3496,353 @@ fn selectorless_connect_picker_escape_cancels_without_side_effect() {
     );
     assert!(output.contains("Cancelled."), "picker output={output}");
     assert!(!root.join("runtime-config").exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn selectorless_connect_shows_action_menu_with_connect_default() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(&config, "Host direct\n  HostName direct.example\n");
+    let bin = fake_ssh(&root);
+    let (status, output) = run_with_pty(
+        &home,
+        &["--config", config.to_str().unwrap(), "connect"],
+        &bin,
+        &root,
+        b"\n\n",
+    );
+    assert!(status.success(), "status={status:?} output={output}");
+    assert!(output.contains("sshx host action menu"), "output={output}");
+    assert!(output.contains("Connect"), "output={output}");
+    assert!(output.contains("Copy SSH"), "output={output}");
+    assert!(output.contains("Copy sshx"), "output={output}");
+    assert!(!output.contains("Copy password"), "output={output}");
+    assert!(root.join("runtime-config").exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(all(unix, any(target_os = "macos", target_os = "linux")))]
+#[test]
+fn selectorless_explicit_action_picks_host_without_action_menu() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(&config, "Host direct\n  HostName direct.example\n");
+    let bin = fake_ssh(&root);
+    fake_clipboard(&bin, &root);
+    let (status, output) = run_with_pty(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "connect",
+            "--action",
+            "copy-ssh",
+        ],
+        &bin,
+        &root,
+        b"\n",
+    );
+    assert!(status.success(), "status={status:?} output={output}");
+    assert!(!output.contains("sshx host action menu"), "output={output}");
+    assert_eq!(
+        fs::read_to_string(root.join("clipboard-content")).unwrap(),
+        format!("ssh -F '{}' 'direct'", config.display())
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn explicit_copy_password_without_stored_password_errors() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(&config, "Host direct\n  HostName direct.example\n");
+    let bin = fake_ssh(&root);
+    let (status, output) = run_with_pty(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "connect",
+            "--action",
+            "copy-password",
+        ],
+        &bin,
+        &root,
+        b"\n",
+    );
+    assert_eq!(status.code(), Some(2), "status={status:?} output={output}");
+    assert!(output.contains("PASSWORD_UNAVAILABLE"), "output={output}");
+    assert!(!root.join("clipboard-content").exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(all(unix, any(target_os = "macos", target_os = "linux")))]
+#[test]
+fn action_menu_shows_copy_password_for_nonempty_stored_password() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(
+        &config,
+        "Host direct\n  HostName direct.example\n  ##PASSWORD secret-value\n",
+    );
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+    let bin = fake_ssh(&root);
+    fake_clipboard(&bin, &root);
+    let (status, output) = run_with_pty(
+        &home,
+        &["--config", config.to_str().unwrap(), "connect"],
+        &bin,
+        &root,
+        b"\n\x1b",
+    );
+    assert_eq!(
+        status.code(),
+        Some(130),
+        "status={status:?} output={output}"
+    );
+    assert!(output.contains("Copy password"), "output={output}");
+    assert!(!output.contains("secret-value"), "output={output}");
+    assert!(!root.join("clipboard-content").exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(all(unix, any(target_os = "macos", target_os = "linux")))]
+#[test]
+fn action_menu_escape_cancels_before_side_effects() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(&config, "Host direct\n  HostName direct.example\n");
+    let bin = fake_ssh(&root);
+    fake_clipboard(&bin, &root);
+    let (status, output) = run_with_pty(
+        &home,
+        &["--config", config.to_str().unwrap(), "connect"],
+        &bin,
+        &root,
+        b"\n\x1b",
+    );
+    assert_eq!(
+        status.code(),
+        Some(130),
+        "status={status:?} output={output}"
+    );
+    assert!(output.contains("Cancelled."), "output={output}");
+    assert!(!root.join("runtime-config").exists());
+    assert!(!root.join("clipboard-content").exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(all(unix, any(target_os = "macos", target_os = "linux")))]
+#[test]
+fn explicit_copy_password_confirms_and_copies_only_stdin() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(
+        &config,
+        "Host direct\n  HostName direct.example\n  ##PASSWORD secret-value\n",
+    );
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+    let bin = fake_ssh(&root);
+    fake_clipboard(&bin, &root);
+    let (status, output) = run_with_pty(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "connect",
+            "--action",
+            "copy-password",
+        ],
+        &bin,
+        &root,
+        b"\ny\n",
+    );
+    assert!(status.success(), "status={status:?} output={output}");
+    assert_eq!(
+        fs::read_to_string(root.join("clipboard-content")).unwrap(),
+        "secret-value"
+    );
+    assert!(
+        fs::read_to_string(root.join("clipboard-args"))
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        !fs::read_to_string(root.join("clipboard-env"))
+            .unwrap()
+            .contains("secret-value")
+    );
+    assert!(
+        output.contains("clipboard manager history"),
+        "output={output}"
+    );
+    assert!(
+        output.contains("does not automatically clear"),
+        "output={output}"
+    );
+    assert!(!output.contains("secret-value"), "output={output}");
+    fs::remove_dir_all(root).unwrap();
+}
+#[cfg(unix)]
+#[test]
+fn copy_password_without_clipboard_never_falls_back_to_stdout() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    let empty_path = root.join("empty-bin");
+    fs::create_dir(&empty_path).unwrap();
+    write(
+        &config,
+        "Host direct\n  HostName direct.example\n  ##PASSWORD secret-value\n",
+    );
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+    let (status, output) = run_with_pty_header_path(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "connect",
+            "--action",
+            "copy-password",
+        ],
+        &empty_path,
+        &root,
+        b"\ny\n",
+        b"sshx connect host picker",
+        Some(""),
+    );
+    assert_eq!(status.code(), Some(2), "status={status:?} output={output}");
+    assert!(output.contains("CLIPBOARD_UNAVAILABLE"), "output={output}");
+    assert!(!output.contains("secret-value"), "output={output}");
+    assert!(!root.join("clipboard-content").exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn copy_password_without_tty_rejects_without_secret_output() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    let empty_path = root.join("empty-bin");
+    fs::create_dir(&empty_path).unwrap();
+    write(
+        &config,
+        "Host direct\n  HostName direct.example\n  ##PASSWORD secret-value\n",
+    );
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_sshx"))
+        .env("HOME", &home)
+        .env("PATH", &empty_path)
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "connect",
+            "direct",
+            "--action",
+            "copy-password",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("PASSWORD_COPY_TTY_REQUIRED"),
+        "{combined}"
+    );
+    assert!(!combined.contains("secret-value"), "{combined}");
+    assert!(output.stdout.is_empty());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(all(unix, any(target_os = "macos", target_os = "linux")))]
+#[test]
+fn action_menu_copy_password_is_hidden_without_stored_password() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(&config, "Host direct\n  HostName direct.example\n");
+    let bin = fake_ssh(&root);
+    fake_clipboard(&bin, &root);
+    let (status, output) = run_with_pty(
+        &home,
+        &["--config", config.to_str().unwrap(), "connect"],
+        &bin,
+        &root,
+        b"\n\x1b",
+    );
+    assert_eq!(
+        status.code(),
+        Some(130),
+        "status={status:?} output={output}"
+    );
+    assert!(!output.contains("Copy password"), "output={output}");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn pair_action_menu_limits_actions_and_copy_password_rejects() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(
+        &config,
+        concat!(
+            "##SSHX ID=11111111-1111-4111-8111-111111111111\n",
+            "##SSHX VM=22222222-2222-4222-8222-222222222222\n",
+            "Host gateway\n",
+            "  HostName gateway.example\n",
+            "  LocalForward 2200 vm.internal:22\n",
+            "##SSHX ID=22222222-2222-4222-8222-222222222222\n",
+            "##SSHX GATEWAY=11111111-1111-4111-8111-111111111111\n",
+            "##SSHX TRANSIT=vm.internal:22\n",
+            "Host vm\n",
+            "  HostName vm.internal\n",
+            "  Port 22\n",
+        ),
+    );
+    let bin = fake_ssh(&root);
+    let (status, output) = run_with_pty(
+        &home,
+        &["--config", config.to_str().unwrap(), "connect"],
+        &bin,
+        &root,
+        b"vm\n\x1b",
+    );
+    assert_eq!(
+        status.code(),
+        Some(130),
+        "status={status:?} output={output}"
+    );
+    assert!(output.contains("sshx host action menu"), "output={output}");
+    assert!(output.contains("Connect"), "output={output}");
+    assert!(output.contains("Copy sshx"), "output={output}");
+    assert!(!output.contains("Copy SSH"), "output={output}");
+    assert!(!output.contains("Copy password"), "output={output}");
+    assert!(!root.join("runtime-config").exists());
+
+    let empty_path = root.join("empty-bin");
+    fs::create_dir(&empty_path).unwrap();
+    let unavailable = Command::new(env!("CARGO_BIN_EXE_sshx"))
+        .env("HOME", &home)
+        .env("PATH", &empty_path)
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "connect",
+            "vm",
+            "--action",
+            "copy-password",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(unavailable.status.code(), Some(2), "{unavailable:?}");
+    assert!(String::from_utf8_lossy(&unavailable.stderr).contains("ACTION_UNAVAILABLE"));
+    assert!(unavailable.stdout.is_empty());
+    assert!(!root.join("runtime-config").exists());
+    assert!(!root.join("clipboard-content").exists());
     fs::remove_dir_all(root).unwrap();
 }

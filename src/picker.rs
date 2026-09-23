@@ -117,6 +117,51 @@ pub fn select<'a>(entries: &[&'a HostEntry], label: &str) -> Result<Selection<'a
     }
 }
 
+pub fn select_menu(options: &[&str], label: &str) -> Result<usize, String> {
+    if options.is_empty() {
+        return Err("ACTION_UNAVAILABLE: no host actions are available".to_string());
+    }
+    if !io::stdin().is_terminal() {
+        return Err(format!(
+            "ACTION_REQUIRED: {label} requires a usable interactive terminal"
+        ));
+    }
+
+    let input = io::stdin();
+    let fd = input.as_raw_fd();
+    let _raw_mode = RawMode::enter(fd)?;
+    let mut input = input;
+    let mut error = io::stderr();
+    let mut selected = 0usize;
+
+    loop {
+        render_menu(&mut error, options, selected, label)?;
+        let mut byte = [0u8; 1];
+        input
+            .read_exact(&mut byte)
+            .map_err(|error| format!("ACTION_REQUIRED: cannot read menu input: {error}"))?;
+        match byte[0] {
+            b'\r' | b'\n' => {
+                clear(&mut error)?;
+                return Ok(selected);
+            }
+            0x03 | 0x1b => {
+                if byte[0] == 0x1b && arrow_key(&mut input)? {
+                    match read_arrow(&mut input)? {
+                        Some(b'A') if selected > 0 => selected -= 1,
+                        Some(b'B') if selected + 1 < options.len() => selected += 1,
+                        _ => {}
+                    }
+                } else {
+                    clear(&mut error)?;
+                    return Err(CANCELLED.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 fn arrow_key(input: &mut impl Read) -> Result<bool, String> {
     let fd = io::stdin().as_raw_fd();
     let mut poll = libc::pollfd {
@@ -278,6 +323,26 @@ fn render(
     error
         .flush()
         .map_err(|error| format!("HOST_REQUIRED: cannot render picker: {error}"))
+}
+
+fn render_menu(
+    error: &mut impl Write,
+    options: &[&str],
+    selected: usize,
+    label: &str,
+) -> Result<(), String> {
+    write!(error, "\x1b[2J\x1b[Hsshx {label}\n\n")
+        .map_err(|error| format!("ACTION_REQUIRED: cannot render menu: {error}"))?;
+    for (index, option) in options.iter().enumerate() {
+        let marker = if index == selected { ">" } else { " " };
+        writeln!(error, "{marker} {option}")
+            .map_err(|error| format!("ACTION_REQUIRED: cannot render menu: {error}"))?;
+    }
+    writeln!(error, "\nArrow keys move, Enter selects, Esc cancels.")
+        .map_err(|error| format!("ACTION_REQUIRED: cannot render menu: {error}"))?;
+    error
+        .flush()
+        .map_err(|error| format!("ACTION_REQUIRED: cannot render menu: {error}"))
 }
 
 fn clear(error: &mut impl Write) -> Result<(), String> {

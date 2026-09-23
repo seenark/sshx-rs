@@ -1556,6 +1556,20 @@ fn classify_master_failure(
         format!("SSH_AUTH_FAILED: {detail}")
     }
 }
+pub fn stored_password(entry: &HostEntry, no_input: bool) -> Result<Option<String>, String> {
+    selected_password(entry, no_input)
+}
+
+pub fn has_stored_password(entry: &HostEntry) -> Result<bool, String> {
+    let bytes = fs::read(&entry.source.path).map_err(|error| {
+        format!(
+            "CONFIG_READ_FAILED: cannot read {}: {error}",
+            entry.source.path
+        )
+    })?;
+    Ok(extract_password(&bytes, entry)?.is_some())
+}
+
 fn selected_password(entry: &HostEntry, no_input: bool) -> Result<Option<String>, String> {
     let mut repaired = false;
     loop {
