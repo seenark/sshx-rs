@@ -367,3 +367,227 @@ fn doctor_accepts_private_ready_state_locations() {
     );
     fs::remove_dir_all(root).expect("fixture should be removed");
 }
+
+use sshx::doctor::{self, Selection};
+use sshx::permissions;
+use sshx::settings::{self, RegisteredRoot};
+
+fn mode_of(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(path)
+        .expect("path should exist")
+        .permissions()
+        .mode()
+        & 0o7777
+}
+
+fn report_for(home: &Path) -> doctor::DoctorReport {
+    let roots = vec![RegisteredRoot {
+        scope: "personal".to_string(),
+        path: home.join(".ssh/config"),
+        project: None,
+    }];
+    doctor::run(
+        home,
+        &roots,
+        None,
+        false,
+        Selection {
+            id: None,
+            source: None,
+            line: None,
+            alias: None,
+        },
+    )
+}
+
+#[test]
+fn repair_plan_covers_only_eligible_private_paths() {
+    let (root, home) = fixture();
+    let config = home.join(".ssh/config");
+    write(
+        &config,
+        "Host gateway\n  HostName gateway.example\n  ##PASSWORD stored-secret\nHost plain\n  HostName plain.example\n",
+    );
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o644)).unwrap();
+    let app_dir = home.join(".config/sshx");
+    let tunnel_dir = app_dir.join("tunnels");
+    fs::create_dir_all(&tunnel_dir).unwrap();
+    fs::set_permissions(&tunnel_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&app_dir, fs::Permissions::from_mode(0o755)).unwrap();
+    let settings_path = app_dir.join("config.json");
+    write(&settings_path, "{}");
+    fs::set_permissions(&settings_path, fs::Permissions::from_mode(0o644)).unwrap();
+    let work_hosts_parent = app_dir.join("known_hosts");
+    fs::create_dir_all(&work_hosts_parent).unwrap();
+    let work_hosts = work_hosts_parent.join("work");
+    write(&work_hosts, "");
+    fs::set_permissions(&work_hosts, fs::Permissions::from_mode(0o644)).unwrap();
+
+    let report = report_for(&home);
+    let planned = report
+        .repairs
+        .iter()
+        .map(|candidate| (candidate.path.clone(), candidate.file))
+        .collect::<Vec<_>>();
+    assert!(
+        planned.contains(&(settings_path.clone(), true)),
+        "settings should be planned: {planned:?}"
+    );
+    assert!(
+        planned.contains(&(app_dir.clone(), false)),
+        "app dir should be planned: {planned:?}"
+    );
+    assert!(
+        planned.contains(&(work_hosts.clone(), true)),
+        "work known-hosts should be planned: {planned:?}"
+    );
+    assert!(
+        planned.contains(&(config.clone(), true)),
+        "password-bearing config should be planned: {planned:?}"
+    );
+    assert!(
+        !planned.iter().any(|(path, _)| path.ends_with("tunnels")),
+        "tunnel dir mode is 0700 already: {planned:?}"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn generic_readable_config_without_password_never_becomes_repair() {
+    let (root, home) = fixture();
+    let config = home.join(".ssh/config");
+    write(&config, "Host plain\n  HostName plain.example\n");
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o644)).unwrap();
+    let report = report_for(&home);
+    assert!(
+        report
+            .repairs
+            .iter()
+            .all(|candidate| !candidate.path.ends_with(".ssh/config")),
+        "non-password config must not be planned: {:?}",
+        report.repairs
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn symlinked_state_is_diagnosed_but_never_planned_or_repaired() {
+    let (root, home) = fixture();
+    write(
+        &home.join(".ssh/config"),
+        "Host plain\n  HostName plain.example\n",
+    );
+    let app_dir = home.join(".config/sshx");
+    fs::create_dir_all(&app_dir).unwrap();
+    let outside = root.join("outside.json");
+    write(&outside, "{}");
+    let settings_path = app_dir.join("config.json");
+    std::os::unix::fs::symlink(&outside, &settings_path).unwrap();
+
+    let report = report_for(&home);
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|finding| finding.code == "app_state_insecure"),
+        "symlink must remain a diagnostic: {:?}",
+        report.findings
+    );
+    assert!(
+        report
+            .repairs
+            .iter()
+            .all(|candidate| candidate.path != settings_path),
+        "symlink must not be planned: {:?}",
+        report.repairs
+    );
+    let results = permissions::apply_all(&report.repairs);
+    assert!(
+        results
+            .iter()
+            .all(|result| result.candidate.path != settings_path),
+        "symlinked path must never be repaired: {results:?}"
+    );
+    assert!(
+        settings_path
+            .symlink_metadata()
+            .expect("symlink should still exist")
+            .file_type()
+            .is_symlink(),
+        "symlink must never be replaced"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn apply_all_repairs_exact_modes_and_continues_after_failure() {
+    let (root, home) = fixture();
+    write(
+        &home.join(".ssh/config"),
+        "Host plain\n  HostName plain.example\n",
+    );
+    let app_dir = home.join(".config/sshx");
+    fs::create_dir_all(&app_dir).unwrap();
+    fs::set_permissions(&app_dir, fs::Permissions::from_mode(0o755)).unwrap();
+    let settings_path = app_dir.join("config.json");
+    write(&settings_path, "{}");
+    fs::set_permissions(&settings_path, fs::Permissions::from_mode(0o644)).unwrap();
+    let known_hosts = home.join(".ssh/known_hosts");
+    write(&known_hosts, "");
+    fs::set_permissions(&known_hosts, fs::Permissions::from_mode(0o644)).unwrap();
+
+    let report = report_for(&home);
+    assert!(report.repairs.len() >= 3, "{:?}", report.repairs);
+    fs::remove_file(&known_hosts).unwrap();
+    let results = permissions::apply_all(&report.repairs);
+    assert_eq!(results.len(), report.repairs.len());
+    let missing = results
+        .iter()
+        .find(|result| result.candidate.path == known_hosts)
+        .expect("removed path should still be reported");
+    assert_eq!(missing.outcome, "skipped");
+    for result in &results {
+        if result.outcome == "fixed" {
+            assert_eq!(
+                mode_of(&result.candidate.path),
+                if result.candidate.file {
+                    permissions::PRIVATE_FILE_MODE
+                } else {
+                    permissions::PRIVATE_DIR_MODE
+                }
+            );
+        }
+    }
+    assert_eq!(mode_of(&settings_path), permissions::PRIVATE_FILE_MODE);
+    assert_eq!(mode_of(&app_dir), permissions::PRIVATE_DIR_MODE);
+    let rendered = sshx::output::render_repairs(&results, sshx::output::OutputFormat::Human)
+        .expect("repair results should render");
+    assert!(rendered.contains("fixed:"), "{rendered}");
+    assert!(rendered.contains("skipped:"), "{rendered}");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn settings_save_creates_private_modes_regardless_of_umask() {
+    let (root, home) = fixture();
+    let roots = vec![RegisteredRoot {
+        scope: "personal".to_string(),
+        path: home.join(".ssh/config"),
+        project: None,
+    }];
+    settings::save(&home, &roots).expect("settings should save");
+    let app_dir = home.join(".config/sshx");
+    assert_eq!(mode_of(&app_dir), permissions::PRIVATE_DIR_MODE);
+    assert_eq!(
+        mode_of(&settings::settings_path(&home)),
+        permissions::PRIVATE_FILE_MODE
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn manual_chmod_hint_is_shell_quoted() {
+    let hint = permissions::manual_chmod_command(&PathBuf::from("/tmp/my config's/id_rsa"), true);
+    assert_eq!(hint, "chmod 600 '/tmp/my config'\\''s/id_rsa'");
+}

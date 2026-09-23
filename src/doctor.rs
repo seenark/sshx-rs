@@ -92,6 +92,7 @@ pub struct DoctorReport {
     pub state: Vec<StateReport>,
     pub runtime: Vec<RuntimeReport>,
     pub findings: Vec<Finding>,
+    pub repairs: Vec<crate::permissions::RepairCandidate>,
 }
 
 #[derive(Default)]
@@ -105,6 +106,7 @@ struct ScanState {
 struct ReportBuilder {
     report: DoctorReport,
     seen: HashSet<String>,
+    planned_repairs: HashSet<PathBuf>,
 }
 
 impl ReportBuilder {
@@ -121,11 +123,12 @@ impl ReportBuilder {
                 state: Vec::new(),
                 runtime: Vec::new(),
                 findings: Vec::new(),
+                repairs: Vec::new(),
             },
             seen: HashSet::new(),
+            planned_repairs: HashSet::new(),
         }
     }
-
     fn finding(
         &mut self,
         code: &str,
@@ -155,6 +158,31 @@ impl ReportBuilder {
         });
     }
 
+    fn repair(
+        &mut self,
+        kind: &str,
+        path: &Path,
+        file: bool,
+        current_mode: u32,
+        expected_mode: u32,
+    ) {
+        if !self.planned_repairs.insert(path.to_path_buf()) {
+            return;
+        }
+        self.report
+            .repairs
+            .push(crate::permissions::RepairCandidate {
+                kind: kind.to_string(),
+                path: path.to_path_buf(),
+                file,
+                current_mode,
+                reason: format!(
+                    "current mode {:o} requires {:o}",
+                    current_mode, expected_mode
+                ),
+            });
+    }
+
     fn finish(mut self) -> DoctorReport {
         self.report.findings.sort_by(|left, right| {
             (&left.stage, &left.code, &left.path, &left.message).cmp(&(
@@ -164,6 +192,9 @@ impl ReportBuilder {
                 &right.message,
             ))
         });
+        self.report
+            .repairs
+            .sort_by(|left, right| (&left.kind, &left.path).cmp(&(&right.kind, &right.path)));
         self.report
     }
 }
@@ -674,10 +705,22 @@ fn check_password_permissions(path: &Path, builder: &mut ReportBuilder) {
     let Ok(metadata) = fs::symlink_metadata(path) else {
         return;
     };
+    if metadata.file_type().is_symlink() {
+        builder.finding(
+            "password_file_permissions",
+            "warning",
+            "config",
+            format!("password-bearing config file {} is a symlink", path.display()),
+            "Replace the path manually with a user-owned regular file; doctor never follows symlinks.",
+            Some(path),
+        );
+        return;
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let unsafe_mode = metadata.permissions().mode() & 0o077 != 0;
+        let mode = metadata.permissions().mode() & 0o7777;
+        let unsafe_mode = mode & 0o077 != 0 || mode & 0o700 != 0o600;
         let unsafe_owner = metadata.uid() != unsafe { libc::geteuid() } as u32;
         if unsafe_mode || unsafe_owner {
             builder.finding(
@@ -691,6 +734,9 @@ fn check_password_permissions(path: &Path, builder: &mut ReportBuilder) {
                 "Review ownership and chmod the file manually to owner-only permissions; doctor never changes modes.",
                 Some(path),
             );
+            if !unsafe_owner && metadata.is_file() {
+                builder.repair("password_file", path, true, mode, 0o600);
+            }
         }
     }
 }
@@ -715,7 +761,7 @@ fn check_state_locations(home: &Path, builder: &mut ReportBuilder) {
         ),
     ];
     for (kind, path, file, mode) in locations {
-        let status = inspect_location(&path, file, mode, builder, "app_state");
+        let status = inspect_location(kind, &path, file, mode, builder, "app_state");
         builder.report.state.push(StateReport {
             kind: kind.to_string(),
             path: display_path(&path),
@@ -728,7 +774,7 @@ fn check_state_locations(home: &Path, builder: &mut ReportBuilder) {
         ("personal", home.join(".ssh/known_hosts")),
         ("work", home.join(".config/sshx/known_hosts/work")),
     ] {
-        let status = inspect_location(&path, true, 0o600, builder, "known_hosts");
+        let status = inspect_location(scope, &path, true, 0o600, builder, "known_hosts");
         builder.report.known_hosts.push(KnownHostReport {
             scope: scope.to_string(),
             path: display_path(&path),
@@ -739,6 +785,7 @@ fn check_state_locations(home: &Path, builder: &mut ReportBuilder) {
 }
 
 fn inspect_location(
+    kind: &str,
     path: &Path,
     file: bool,
     expected_mode: u32,
@@ -807,19 +854,21 @@ fn inspect_location(
         );
         return "unsafe".to_string();
     }
-    let unsafe_state = {
+    let (unsafe_mode, unsafe_owner) = {
         #[cfg(unix)]
         {
             use std::os::unix::fs::{MetadataExt, PermissionsExt};
-            metadata.permissions().mode() & 0o7777 != expected_mode
-                || metadata.uid() != unsafe { libc::geteuid() } as u32
+            (
+                metadata.permissions().mode() & 0o7777 != expected_mode,
+                metadata.uid() != unsafe { libc::geteuid() } as u32,
+            )
         }
         #[cfg(not(unix))]
         {
-            false
+            (false, false)
         }
     };
-    if unsafe_state {
+    if unsafe_mode || unsafe_owner {
         let code = if stage == "known_hosts" {
             "known_hosts_insecure"
         } else {
@@ -833,6 +882,20 @@ fn inspect_location(
             "Review ownership and chmod the path manually; doctor never changes permissions.",
             Some(path),
         );
+        if unsafe_mode && !unsafe_owner {
+            let current_mode = {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    metadata.permissions().mode() & 0o7777
+                }
+                #[cfg(not(unix))]
+                {
+                    expected_mode
+                }
+            };
+            builder.repair(kind, path, file, current_mode, expected_mode);
+        }
         "insecure".to_string()
     } else {
         "ready".to_string()
@@ -1223,4 +1286,19 @@ fn lexical_normalize(path: &Path) -> PathBuf {
 
 fn display_path(path: &Path) -> String {
     lexical_normalize(path).to_string_lossy().into_owned()
+}
+
+/// Permission findings that remain unsafe until repaired. Callers combine
+/// this with repair results to decide the `--fix-permissions` exit status.
+pub fn unsafe_permission_findings(report: &DoctorReport) -> Vec<&Finding> {
+    report
+        .findings
+        .iter()
+        .filter(|finding| {
+            matches!(
+                finding.code.as_str(),
+                "app_state_insecure" | "known_hosts_insecure" | "password_file_permissions"
+            )
+        })
+        .collect()
 }

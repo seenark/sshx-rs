@@ -4,6 +4,7 @@ pub mod doctor;
 pub mod mutation;
 pub mod output;
 pub mod pair;
+pub mod permissions;
 pub mod session;
 pub mod settings;
 pub mod tunnel;

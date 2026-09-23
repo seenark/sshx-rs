@@ -394,8 +394,48 @@ pub fn render_doctor(
             finding.severity, finding.stage, finding.code, finding.message, finding.guidance
         ));
     }
+    if !report.repairs.is_empty() {
+        rendered.push_str("Repair plan:\n");
+        for candidate in &report.repairs {
+            rendered.push_str(&format!(
+                "  {} {}: {}\n",
+                candidate.kind,
+                candidate.path.display(),
+                candidate.reason
+            ));
+        }
+    }
     if report.findings.is_empty() {
         rendered.push_str("No findings.\n");
+    }
+    Ok(rendered)
+}
+
+pub fn render_repairs(
+    results: &[crate::permissions::RepairResult],
+    format: OutputFormat,
+) -> Result<String, String> {
+    if format.is_machine() {
+        let mut rendered = match format {
+            OutputFormat::Json => serde_json::to_string_pretty(results)
+                .map_err(|error| format!("cannot render JSON output: {error}"))?,
+            OutputFormat::Yaml => serde_yaml::to_string(results)
+                .map_err(|error| format!("cannot render YAML output: {error}"))?,
+            OutputFormat::Human => unreachable!(),
+        };
+        if !rendered.ends_with('\n') {
+            rendered.push('\n');
+        }
+        return Ok(rendered);
+    }
+    let mut rendered = String::new();
+    for result in results {
+        rendered.push_str(&format!(
+            "{}: {} ({})\n",
+            result.outcome,
+            result.candidate.path.display(),
+            result.detail
+        ));
     }
     Ok(rendered)
 }

@@ -47,8 +47,7 @@ pub fn save(home: &Path, roots: &[RegisteredRoot]) -> Result<(), String> {
     let parent = path
         .parent()
         .ok_or_else(|| "sshx settings path has no parent".to_string())?;
-    fs::create_dir_all(parent)
-        .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
+    private_directory(parent)?;
     let settings = SettingsFile {
         version: SETTINGS_VERSION,
         roots: roots.to_vec(),
@@ -57,10 +56,50 @@ pub fn save(home: &Path, roots: &[RegisteredRoot]) -> Result<(), String> {
         .map_err(|error| format!("cannot render sshx settings: {error}"))?;
     rendered.push(b'\n');
     let temporary = path.with_extension("json.tmp");
-    fs::write(&temporary, rendered)
-        .map_err(|error| format!("cannot write {}: {error}", temporary.display()))?;
+    private_file(&temporary, &rendered)?;
     fs::rename(&temporary, &path)
         .map_err(|error| format!("cannot replace {}: {error}", path.display()))
+}
+
+/// Create the sshx-owned settings directory with mode `0700` regardless of
+/// the process umask. Shared parents such as `~/.config` keep their mode.
+fn private_directory(path: &Path) -> Result<(), String> {
+    fs::create_dir_all(path)
+        .map_err(|error| format!("cannot create {}: {error}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("cannot set private mode on {}: {error}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// Write a new file with mode `0600` regardless of the process umask.
+fn private_file(path: &Path, contents: &[u8]) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
+        use std::io::Write;
+        file.write_all(contents)
+            .and_then(|_| file.sync_all())
+            .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .map_err(|error| format!("cannot set private mode on {}: {error}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(path, contents)
+            .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
+    }
+    Ok(())
 }
 
 pub fn auto_detect(home: &Path) -> Vec<RegisteredRoot> {
