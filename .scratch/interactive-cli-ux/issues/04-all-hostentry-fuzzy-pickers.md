@@ -4,7 +4,7 @@
 
 **Blocked by:** 03: Select connect targets with a live fuzzy picker.
 
-**Status:** ready-for-agent
+**Status:** claimed
 
 - [ ] Direct and paired tunnel starts use the shared picker whenever a HostEntry selector is omitted and input is interactive.
 - [ ] `host update`, `host rename`, and `host delete` use the shared picker whenever they require interactive HostEntry selection.
