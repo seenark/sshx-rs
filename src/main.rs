@@ -62,6 +62,36 @@ fn canonical_help_path(path: Vec<String>) -> Vec<String> {
     ) {
         return path.into_iter().take(1).collect();
     }
+    if path.first().map(String::as_str) == Some("tunnel") {
+        match path.as_slice() {
+            [tunnel] if tunnel == "tunnel" => return path,
+            [tunnel, group]
+                if tunnel == "tunnel" && matches!(group.as_str(), "direct" | "paired") =>
+            {
+                return path;
+            }
+            [tunnel, command, ..]
+                if tunnel == "tunnel"
+                    && matches!(
+                        command.as_str(),
+                        "start" | "list" | "status" | "stop" | "restart"
+                    ) =>
+            {
+                return vec!["tunnel".to_string(), command.clone()];
+            }
+            [tunnel, group, command, ..]
+                if tunnel == "tunnel"
+                    && matches!(group.as_str(), "direct" | "paired")
+                    && matches!(
+                        command.as_str(),
+                        "start" | "list" | "status" | "stop" | "restart"
+                    ) =>
+            {
+                return vec!["tunnel".to_string(), group.clone(), command.clone()];
+            }
+            _ => {}
+        }
+    }
     match path.as_slice() {
         [host, command, ..]
             if host == "host"
@@ -149,6 +179,9 @@ fn option_takes_value(token: &str) -> bool {
             | "-L"
             | "-R"
             | "-D"
+            | "--local-forward"
+            | "--remote-forward"
+            | "--dynamic-forward"
             | "--forward"
     )
 }

@@ -7,6 +7,8 @@ pub const CONNECT_USAGE: &str = "Usage: sshx connect [SELECTOR] [OPTIONS]";
 pub const HOST_USAGE: &str = "Usage: sshx [--config PATH] host COMMAND [OPTIONS]";
 pub const PAIR_USAGE: &str = "Usage: sshx pair COMMAND [OPTIONS]";
 pub const TUNNEL_USAGE: &str = "Usage: sshx tunnel COMMAND [OPTIONS]";
+pub const TUNNEL_DIRECT_USAGE: &str = "Usage: sshx tunnel direct COMMAND [OPTIONS]";
+pub const TUNNEL_PAIRED_USAGE: &str = "Usage: sshx tunnel paired COMMAND [OPTIONS]";
 
 pub fn render(path: &[String]) -> Result<String, String> {
     let path = path.iter().map(String::as_str).collect::<Vec<_>>();
@@ -26,6 +28,60 @@ pub fn render(path: &[String]) -> Result<String, String> {
         ["pair", "setup"] | ["pair", "create"] => Ok(pair_setup()),
         ["pair", "list"] => Ok(pair_list()),
         ["pair", "validate"] => Ok(pair_validate()),
+        ["tunnel"] => Ok(tunnel()),
+        ["tunnel", "direct"] => Ok(tunnel_direct()),
+        ["tunnel", "paired"] => Ok(tunnel_paired()),
+        ["tunnel", "start"] => Ok(tunnel_start()),
+        ["tunnel", "direct", "start"] => Ok(tunnel_direct_start()),
+        ["tunnel", "paired", "start"] => Ok(tunnel_paired_start()),
+        ["tunnel", "list"] => Ok(tunnel_lifecycle("tunnel list", "tunnel list", "List")),
+        ["tunnel", "direct", "list"] => Ok(tunnel_lifecycle(
+            "tunnel direct list (alias: tunnel list)",
+            "tunnel direct list",
+            "List",
+        )),
+        ["tunnel", "paired", "list"] => Ok(tunnel_lifecycle(
+            "tunnel paired list (alias: tunnel list)",
+            "tunnel paired list",
+            "List",
+        )),
+        ["tunnel", "status"] => Ok(tunnel_lifecycle("tunnel status", "tunnel status", "Status")),
+        ["tunnel", "direct", "status"] => Ok(tunnel_lifecycle(
+            "tunnel direct status (alias: tunnel status)",
+            "tunnel direct status",
+            "Status",
+        )),
+        ["tunnel", "paired", "status"] => Ok(tunnel_lifecycle(
+            "tunnel paired status (alias: tunnel status)",
+            "tunnel paired status",
+            "Status",
+        )),
+        ["tunnel", "stop"] => Ok(tunnel_lifecycle("tunnel stop", "tunnel stop", "Stop")),
+        ["tunnel", "direct", "stop"] => Ok(tunnel_lifecycle(
+            "tunnel direct stop (alias: tunnel stop)",
+            "tunnel direct stop",
+            "Stop",
+        )),
+        ["tunnel", "paired", "stop"] => Ok(tunnel_lifecycle(
+            "tunnel paired stop (alias: tunnel stop)",
+            "tunnel paired stop",
+            "Stop",
+        )),
+        ["tunnel", "restart"] => Ok(tunnel_lifecycle(
+            "tunnel restart",
+            "tunnel restart",
+            "Restart",
+        )),
+        ["tunnel", "direct", "restart"] => Ok(tunnel_lifecycle(
+            "tunnel direct restart (alias: tunnel restart)",
+            "tunnel direct restart",
+            "Restart",
+        )),
+        ["tunnel", "paired", "restart"] => Ok(tunnel_lifecycle(
+            "tunnel paired restart (alias: tunnel restart)",
+            "tunnel paired restart",
+            "Restart",
+        )),
         _ => Err(format!(
             "unknown help path `{}`\n{}",
             path.join(" "),
@@ -42,6 +98,8 @@ pub fn usage(path: &[&str]) -> &'static str {
         ["connect", ..] => CONNECT_USAGE,
         ["host", ..] => HOST_USAGE,
         ["pair", ..] => PAIR_USAGE,
+        ["tunnel", "direct", ..] => TUNNEL_DIRECT_USAGE,
+        ["tunnel", "paired", ..] => TUNNEL_PAIRED_USAGE,
         ["tunnel", ..] => TUNNEL_USAGE,
         _ => ROOT_USAGE,
     }
@@ -279,5 +337,170 @@ fn pair_validate() -> String {
         "sshx pair validate",
         "Exit 0 when all Pair routes validate. Invalid routes exit nonzero. Help exits 0.",
         "sshx pair list, sshx doctor",
+    )
+}
+fn tunnel() -> String {
+    page(
+        "tunnel",
+        "Manage detached standalone direct and Pair-routed tunnels.",
+        "sshx tunnel COMMAND [OPTIONS]\nsshx tunnel --help\nsshx help tunnel",
+        "COMMAND    start, direct, paired, list, status, stop, or restart.",
+        "--config PATH    Select the config root.\n--format human|json|yaml    Select human or machine tunnel output.\nA standalone tunnel is owned by its locked registry record and control socket. Tunnel IDs, not process IDs, identify tunnel state.",
+        "start (compatibility alias; canonical: tunnel paired start)    Run the canonical paired start command.\ndirect    Start or manage direct tunnels.\npaired    Start or manage Pair-routed tunnels.\nlist    List all registered tunnels.\nstatus    Show one tunnel by ID.\nstop    Stop one tunnel by ID.\nrestart    Restart one tunnel by ID.",
+        "sshx tunnel direct start prod -L 8080:localhost:80\nsshx tunnel paired start vm --forward 8080=18080",
+        "Exit 0 after rendering or lifecycle success. Missing IDs, route conflicts, registry ownership failures, and parse errors exit 2. Help exits 0. Interactive cancellation exits 130.",
+        "sshx tunnel direct, sshx tunnel paired, sshx pair list",
+    )
+}
+
+fn tunnel_direct() -> String {
+    page(
+        "tunnel direct",
+        "Start and manage one-host standalone tunnels with explicit OpenSSH forwarding.",
+        "sshx tunnel direct COMMAND [OPTIONS]\nsshx tunnel direct --help\nsshx help tunnel direct",
+        "COMMAND    start, list, status, stop, or restart.",
+        "-L SPEC, --local-forward SPEC    Add local forwarding.\n-R SPEC, --remote-forward SPEC    Add remote forwarding.\n-D SPEC, --dynamic-forward SPEC    Add dynamic forwarding.\n--allow-bind, --allow-non-loopback    Allow non-loopback listener binds.\n--password-fd FD    Supply the selected Host password through an inherited descriptor.\n--config PATH --format human|json|yaml    Select config root and output.\nDirect start requires at least one -L, -R, or -D. Pair-routed HostEntry records are rejected; exact HostEntry ProxyCommand stays a direct-host concern.",
+        "start    Start one direct tunnel.\nlist, status, stop, restart    Operate on registered tunnel IDs; each is an alias of the root tunnel lifecycle command.",
+        "sshx tunnel direct start prod -L 8080:localhost:80\nsshx tunnel direct status dt-1",
+        "Exit 0 on success. TUNNEL_FORWARD_REQUIRED, TUNNEL_DIRECT_PAIR, selector errors, lifecycle errors, and parse errors exit 2. Help exits 0. Interactive cancellation exits 130.",
+        "sshx tunnel direct start, sshx tunnel paired, sshx host show",
+    )
+}
+
+fn tunnel_paired() -> String {
+    page(
+        "tunnel paired",
+        "Start and manage standalone tunnels through a saved Pair route.",
+        "sshx tunnel paired COMMAND [OPTIONS]\nsshx tunnel paired --help\nsshx help tunnel paired",
+        "COMMAND    start, list, status, stop, or restart.",
+        "--forward REMOTE[=LOCAL]    Forward a declared VM service by remote port or PORT#INDEX; optional LOCAL overrides its local port.\n--bind    Interactively select declared VM service forwards and local ports.\n--password-fd FD    Supply the VM password through an inherited descriptor.\n--gateway-password-fd FD    Supply the gateway password through an inherited descriptor.\n--vm-password-fd FD    Supply the VM password through an inherited descriptor; overrides --password-fd.\n--config PATH --format human|json|yaml    Select config root and output.\nPaired start requires --forward or --bind. Pair owns the transit route; ProxyCommand is unsupported. -L, -R, and -D are direct-mode options.",
+        "start    Start one Pair-routed tunnel.\nlist, status, stop, restart    Operate on registered tunnel IDs; each is an alias of the root tunnel lifecycle command.",
+        "sshx tunnel paired start vm --forward 8080=18080\nsshx tunnel paired start vm --bind",
+        "Exit 0 on success. TUNNEL_FORWARD_REQUIRED, TUNNEL_PAIRED_REQUIRED, TUNNEL_FORWARD_MODE, route errors, lifecycle errors, and parse errors exit 2. Help exits 0. Interactive cancellation exits 130.",
+        "sshx tunnel paired start, sshx pair list, sshx tunnel direct",
+    )
+}
+
+fn tunnel_start() -> String {
+    page(
+        "tunnel start (compatibility alias; canonical: tunnel paired start)",
+        "Start one Pair-routed standalone tunnel; keep this root form for compatibility.",
+        "sshx tunnel start [SELECTOR] [OPTIONS]\nsshx tunnel start --help\nsshx help tunnel start\nCompatibility alias for sshx tunnel paired start [SELECTOR] [OPTIONS].",
+        "SELECTOR    Exact alias or stable HostEntry ID. Use --source PATH --line NUMBER for exact source disambiguation. Without a selector on a usable TTY, a live fuzzy picker selects one HostEntry.",
+        "--forward REMOTE[=LOCAL]    Forward a declared VM service by remote port or PORT#INDEX; optional LOCAL overrides its local port.\n--bind    Interactively select declared VM service forwards and local ports.\n--password-fd FD    Supply the VM password through an inherited descriptor.\n--gateway-password-fd FD    Supply the gateway password through an inherited descriptor.\n--vm-password-fd FD    Supply the VM password through an inherited descriptor; overrides --password-fd.\n--no-input    Reject the fuzzy picker, --bind prompts, host-key enrollment, and password prompts.\n--config PATH --format human|json|yaml    Select config root and output.\nDo not pass -L, -R, or -D. Pair owns the transit route; ProxyCommand is unsupported.",
+        "",
+        "sshx tunnel start vm --forward 8080=18080\nsshx tunnel start --source ~/.ssh/config --line 12 --bind",
+        "Exit 0 after both gateway and VM masters and listeners become ready. TUNNEL_PAIRED_REQUIRED, TUNNEL_FORWARD_MODE, selector errors, route errors, and parse errors exit 2. Escape or Ctrl-C cancels before or during setup and exits 130. The response includes a tunnel ID and state.",
+        "sshx tunnel paired start, sshx pair list, sshx tunnel list",
+    )
+}
+
+fn tunnel_direct_start() -> String {
+    page(
+        "tunnel direct start",
+        "Start one detached standalone tunnel for one exact HostEntry using direct forwarding.",
+        "sshx tunnel direct start [SELECTOR] [OPTIONS]\nsshx tunnel direct start --help\nsshx help tunnel direct start",
+        "SELECTOR    Exact alias or stable HostEntry ID. Use --source PATH --line NUMBER for exact source disambiguation. Without a selector on a usable TTY, a live fuzzy picker selects one HostEntry.",
+        "-L SPEC, --local-forward SPEC    Add local forwarding.\n-R SPEC, --remote-forward SPEC    Add remote forwarding.\n-D SPEC, --dynamic-forward SPEC    Add dynamic forwarding.\n--allow-bind, --allow-non-loopback    Allow non-loopback listener binds.\n--password-fd FD    Supply the selected Host password through an inherited descriptor.\n--no-input    Reject the fuzzy picker, host-key enrollment, and password prompts.\n--config PATH --format human|json|yaml    Select config root and output.\nAt least one -L, -R, or -D is required. --forward and --bind belong to paired mode. Exact HostEntry ProxyCommand is supported; Pair-routed entries are rejected.",
+        "",
+        "sshx tunnel direct start prod -L 8080:localhost:80\nsshx tunnel direct start --id host-123 -D 1080",
+        "Exit 0 after the detached master and listeners become ready. TUNNEL_FORWARD_REQUIRED, TUNNEL_DIRECT_PAIR, selector errors, listener errors, and parse errors exit 2. Escape or Ctrl-C cancels before or during setup and exits 130. The response includes a tunnel ID and state.",
+        "sshx tunnel direct list, sshx tunnel paired start, sshx host show",
+    )
+}
+
+fn tunnel_paired_start() -> String {
+    page(
+        "tunnel paired start",
+        "Start one detached standalone tunnel for one Pair route with gateway and VM masters.",
+        "sshx tunnel paired start [SELECTOR] [OPTIONS]\nsshx tunnel paired start --help\nsshx help tunnel paired start",
+        "SELECTOR    Exact alias or stable HostEntry ID for the VM. Use --source PATH --line NUMBER for exact source disambiguation. Without a selector on a usable TTY, a live fuzzy picker selects one HostEntry.",
+        "--forward REMOTE[=LOCAL]    Forward a declared VM service by remote port or PORT#INDEX; optional LOCAL overrides its local port.\n--bind    Interactively select declared VM service forwards and local ports.\n--password-fd FD    Supply the VM password through an inherited descriptor.\n--gateway-password-fd FD    Supply the gateway password through an inherited descriptor.\n--vm-password-fd FD    Supply the VM password through an inherited descriptor; overrides --password-fd.\n--no-input    Reject the fuzzy picker, --bind prompts, host-key enrollment, and password prompts.\n--config PATH --format human|json|yaml    Select config root and output.\nDo not pass -L, -R, or -D. Pair owns the transit route; ProxyCommand is unsupported.",
+        "",
+        "sshx tunnel paired start vm --forward 8080=18080\nsshx tunnel paired start --id vm-123 --bind",
+        "Exit 0 after gateway and VM masters and listeners become ready. TUNNEL_FORWARD_REQUIRED, TUNNEL_PAIRED_REQUIRED, TUNNEL_FORWARD_MODE, selector errors, route errors, and parse errors exit 2. Escape or Ctrl-C cancels before or during setup and exits 130. The response includes one tunnel ID and state for both gateway and VM.",
+        "sshx tunnel paired list, sshx pair list, sshx tunnel direct start",
+    )
+}
+
+fn tunnel_lifecycle(name: &str, command_path: &str, operation: &str) -> String {
+    let is_list = operation == "List";
+    let arguments = if is_list {
+        "None. The command lists every registered tunnel."
+    } else {
+        "ID    Exact persisted tunnel ID returned by start or list; it is not a process ID."
+    };
+    let options = match operation {
+        "Restart" => {
+            "--config PATH    Select the discovery root when restart re-resolves the current HostEntry or Pair identity.\n--format human|json|yaml    Render lifecycle output.\n--password-fd FD    Supply a direct or VM password through an inherited descriptor.\n--gateway-password-fd FD    Supply a Pair gateway password through an inherited descriptor.\n--vm-password-fd FD    Supply a Pair VM password through an inherited descriptor."
+        }
+        "List" | "Status" | "Stop" => {
+            "--config PATH    Accepted for common CLI compatibility; this lifecycle command reads the runtime registry under sshx home and does not select discovery roots.\n--format human|json|yaml    Render lifecycle output."
+        }
+        _ => unreachable!(),
+    };
+    let purpose = match operation {
+        "List" => "List every registered standalone tunnel.",
+        "Status" => "Show one registered tunnel and its live health.",
+        "Stop" => "Stop one registered tunnel using its ownership controls.",
+        "Restart" => "Restart one registered tunnel with its persisted forwarding request.",
+        _ => unreachable!(),
+    };
+    let examples = match operation {
+        "List" => "sshx tunnel list --format json\nsshx tunnel direct list",
+        "Status" => "sshx tunnel status dt-1\nsshx tunnel paired status pt-1",
+        "Stop" => "sshx tunnel stop dt-1",
+        "Restart" => "sshx tunnel restart dt-1 --password-fd 3",
+        _ => unreachable!(),
+    };
+    let exits = match operation {
+        "List" => {
+            "Exit 0 after registry rendering. REGISTRY_UNSAFE and parse errors exit 2. Help exits 0."
+        }
+        "Status" => {
+            "Exit 0 after status rendering. TUNNEL_NOT_FOUND, REGISTRY_UNSAFE, and parse errors exit 2. Help exits 0."
+        }
+        "Stop" => {
+            "Exit 0 after the owned tunnel stops. TUNNEL_NOT_FOUND, TUNNEL_STOP_FAILED, REGISTRY_UNSAFE, and parse errors exit 2. Help exits 0."
+        }
+        "Restart" => {
+            "Exit 0 after the owned tunnel restarts. TUNNEL_NOT_FOUND, CONFIG_CHANGED, PAIR_BROKEN, REGISTRY_UNSAFE, and parse errors exit 2. Help exits 0."
+        }
+        _ => unreachable!(),
+    };
+    let detail = match operation {
+        "List" => {
+            "The locked registry is the source of truth. Human output includes tunnel ID, state, master, listener, and application health; JSON and YAML preserve stable fields including master_status, listener_status, and application_health."
+        }
+        "Status" => {
+            "The locked registry and control socket prove ownership. Output includes tunnel ID, state, kind, master status, listener status, application health, selected host, source, and forwards."
+        }
+        "Stop" => {
+            "The command validates the locked registry and control socket, then stops the owned runtime. Paired tunnels stop VM before gateway. It never treats an arbitrary PID as ownership."
+        }
+        "Restart" => {
+            "The command validates the locked registry and current HostEntry or Pair identity, then preserves forwarding configuration. CONFIG_CHANGED and PAIR_BROKEN prevent a stale restart."
+        }
+        _ => unreachable!(),
+    };
+    let usage = if is_list {
+        format!(
+            "sshx {command_path} [OPTIONS]\nsshx {command_path} --help\nsshx help {command_path}"
+        )
+    } else {
+        format!(
+            "sshx {command_path} ID [OPTIONS]\nsshx {command_path} --help\nsshx help {command_path}"
+        )
+    };
+    page(
+        name,
+        purpose,
+        &usage,
+        arguments,
+        &format!("{options}\n{detail}"),
+        "",
+        examples,
+        exits,
+        "sshx tunnel, sshx tunnel direct, sshx tunnel paired",
     )
 }
