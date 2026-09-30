@@ -20,7 +20,8 @@ fn hosts_opens_direct_session_and_restores_selected_alias() {
     fs::create_dir_all(&ssh_dir).unwrap();
     fs::set_permissions(&ssh_dir, fs::Permissions::from_mode(0o700)).unwrap();
     let config = ssh_dir.join("config");
-    fs::write(&config, "Host direct secondary\n  HostName direct.example\nHost other\n  HostName other.example\n").unwrap();
+    let original = "##SSHX ID=11111111-1111-4111-8111-111111111111\nHost direct secondary\n  HostName direct.example\nHost other\n  HostName other.example\n";
+    fs::write(&config, original).unwrap();
     fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
     let bin = root.join("bin");
     fs::create_dir(&bin).unwrap();
@@ -48,69 +49,45 @@ esac
     assert_eq!(explicit.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&explicit.stderr).contains("TUI_REQUIRED"));
 
-    let mut master = -1;
-    let mut slave = -1;
-    let mut size = libc::winsize { ws_row: 40, ws_col: 100, ws_xpixel: 0, ws_ypixel: 0 };
-    assert_eq!(unsafe { libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null_mut(), &mut size) }, 0);
-    let slave = unsafe { File::from_raw_fd(slave) };
     let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
-    let mut child = Command::new(binary)
-        .arg("--config").arg(&config).arg("tui")
-        .env("HOME", &home).env("PATH", path)
-        .env("SSHX_STARTED", root.join("started"))
-        .env("SSHX_CLOSED", root.join("closed"))
-        .env("SSHX_CAPTURE", root.join("runtime-config"))
-        .stdin(Stdio::from(slave.try_clone().unwrap()))
-        .stdout(Stdio::from(slave.try_clone().unwrap()))
-        .stderr(Stdio::from(slave))
-        .spawn().unwrap();
-    let mut master = unsafe { File::from_raw_fd(master) };
-    let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
-    assert!(flags >= 0);
-    assert_eq!(unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) }, 0);
-    let mut output = Vec::new();
-    for (marker, input) in [("sshx Hosts", b"secondary\r".as_slice()), ("Session ended.", b"\x1b".as_slice())] {
-        let stage_start = output.len();
-        let deadline = Instant::now() + Duration::from_secs(8);
-        loop {
-            let mut buffer = [0u8; 4096];
-            match master.read(&mut buffer) {
-                Ok(size) => output.extend_from_slice(&buffer[..size]),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {},
-                Err(error) => panic!("PTY read failed: {error}"),
-            }
-            if contains_tui_text(&output, marker) {
-                break;
-            }
-            if Instant::now() >= deadline || child.try_wait().unwrap().is_some() {
-                let _ = child.kill();
-                panic!("Hosts did not show {marker}: {}", String::from_utf8_lossy(&output));
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        if marker == "Session ended." {
-            assert!(
-                contains_tui_text(&output[stage_start..], "secondary"),
-                "Hosts did not restore the selected alias"
-            );
-        }
-        master.write_all(input).unwrap();
-    }
-    let deadline = Instant::now() + Duration::from_secs(8);
-    while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    if child.try_wait().unwrap().is_none() {
-        child.kill().unwrap();
-        panic!("Hosts did not exit after Esc");
-    }
-    assert!(child.wait().unwrap().success());
-    assert!(String::from_utf8_lossy(&output).contains("direct-shell"));
-    assert!(root.join("closed").exists(), "session-bound master was not closed");
+    let started = root.join("started");
+    let closed = root.join("closed");
+    let capture = root.join("runtime-config");
+    let mut terminal = HostEditTerminal::open_with_env(
+        &home, &config, &[],
+        &[
+            ("PATH", &path),
+            ("SSHX_STARTED", started.to_str().unwrap()),
+            ("SSHX_CLOSED", closed.to_str().unwrap()),
+            ("SSHX_CAPTURE", capture.to_str().unwrap()),
+        ],
+    );
+    terminal.expect("sshx Hosts");
+    terminal.send(b"secondary\r");
+    terminal.expect("Connection workspace");
+    terminal.expect("secondary");
+    assert!(!started.exists(), "selection started OpenSSH before review");
+    terminal.send(b"\r");
+    terminal.expect("Review:");
+    assert!(!started.exists(), "review started OpenSSH before confirmation");
+    terminal.send(b"\r");
+    terminal.expect("direct-shell");
+    terminal.expect("Connection workspace");
+    assert!(closed.exists(), "session-bound master was not closed");
+    terminal.send(b"\x1b");
+    terminal.expect("sshx Hosts");
+    terminal.expect("> secondary");
+    terminal.expect("direct.example");
+    terminal.send(b"\t");
+    terminal.expect("11111111-1111-4111-8111-111111111111");
+    terminal.send(b"\x1b");
+    assert_eq!(terminal.finish(), Some(0));
     let runtime = fs::read_to_string(root.join("runtime-config")).unwrap();
     assert!(runtime.contains("Host secondary"), "selected secondary alias lost: {runtime}");
     assert!(!runtime.contains("LocalForward"), "Session unexpectedly opened a forward");
-    assert!(Path::new(&config).exists());
+    assert!(!runtime.contains("RemoteForward"), "Session unexpectedly opened a remote forward");
+    assert!(!runtime.contains("DynamicForward"), "Session unexpectedly opened a SOCKS forward");
+    assert_eq!(fs::read_to_string(&config).unwrap(), original);
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -144,8 +121,9 @@ fn continuation_exact_prefills_remain_editable_and_cancel_without_side_effect() 
         terminal.expect("first.example");
         terminal.send(b"other\r");
         terminal.expect("Connection workspace");
-        terminal.expect("Route: other at");
+        terminal.expect("other");
         terminal.expect("config:5");
+        terminal.expect("22222222-2222-4222-8222-222222222222");
         terminal.send(b"\x1b");
         terminal.expect("Search:");
         terminal.send(b"\x03");
