@@ -558,24 +558,7 @@ fn run_hosts(
                 continue;
             }
             Err(action) if action == "PAIRS_TAB" => {
-                let pairs = sshx::pair::records(&catalog.entries);
-                let labels = pairs.iter().map(|pair| {
-                    format!("{} ({}) via {} ({}) {}:{}",
-                        pair.vm_alias, pair.vm_id, pair.gateway_alias, pair.gateway_id,
-                        pair.transit_host, pair.transit_port)
-                }).collect::<Vec<_>>();
-                status = match picker::pairs_workspace(&labels, &[], None) {
-                    Ok(picker::PairWorkspaceAction::Exit) => None,
-                    Ok(picker::PairWorkspaceAction::Setup) => {
-                        let mut pair = Cli::parse(vec!["pair".into(), "setup".into()])?;
-                        pair.config = cli.config.clone();
-                        pair.scopes = cli.scopes.clone();
-                        pair.projects = cli.projects.clone();
-                        run_pair(&pair, &roots).err()
-                    }
-                    Ok(picker::PairWorkspaceAction::Recover) => None,
-                    Err(error) => Some(error),
-                };
+                status = run_pairs_workspace(cli, &roots).err();
                 continue;
             }
             Err(action) if action == "SETUP_TAB" => {
@@ -688,6 +671,31 @@ fn run_hosts(
     }
 }
 
+fn run_pairs_workspace(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), String> {
+    let configured = settings::discovery_roots(roots);
+    let mut status = None;
+    loop {
+        let catalog = discover_roots(&configured).map_err(|error| error.to_string())?;
+        let pairs = sshx::pair::records(&catalog.entries);
+        let mut findings = catalog.diagnostics;
+        findings.extend(sshx::pair::diagnostics(&catalog.entries));
+        match picker::pairs_workspace(&pairs, &catalog.entries, &findings, status.as_deref())? {
+            picker::PairWorkspaceAction::Exit => return Ok(()),
+            picker::PairWorkspaceAction::Validate => {
+                status = Some("Validation refreshed from SSH config; no files changed or OpenSSH started.".to_string());
+            }
+            picker::PairWorkspaceAction::Setup => {
+                let mut pair = Cli::parse(vec!["pair".into(), "setup".into()])?;
+                pair.config = cli.config.clone();
+                pair.scopes = cli.scopes.clone();
+                pair.projects = cli.projects.clone();
+                status = run_pair(&pair, roots).err();
+            }
+            picker::PairWorkspaceAction::Recover => {}
+        }
+    }
+}
+
 fn run_tunnels_workspace(
     cli: &Cli, home: &Path, mut selected: usize, requested: Option<(char, Option<TunnelRoute>)>,
 ) -> Result<(), String> {
@@ -792,6 +800,10 @@ fn run_tui_operation(cli: &Cli) -> Result<(), String> {
         return run_host_create(cli, &registered_roots(cli)?);
     }
     let roots = registered_roots(cli)?;
+    if matches!(cli.command, Command::PairList | Command::PairValidate) {
+        run_pairs_workspace(cli, &roots)?;
+        return run_hosts(cli, &home, &roots, None);
+    }
     let catalog = discover_with_permission_repair(&settings::discovery_roots(&roots), false)?;
     let filtered = filter_entries(&catalog.entries, cli);
     match &cli.command {
@@ -1078,8 +1090,15 @@ fn render_entries(
 
 fn run_pair(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), String> {
     let configured = settings::discovery_roots(roots);
-    mutation::validate_mutation_roots(&configured)?;
-    let initial = discover_with_permission_repair(&configured, cli.no_input)?;
+    let inspection = matches!(cli.command, Command::PairList | Command::PairValidate);
+    if !inspection {
+        mutation::validate_mutation_roots(&configured)?;
+    }
+    let initial = if inspection {
+        discover_roots(&configured).map_err(|error| error.to_string())?
+    } else {
+        discover_with_permission_repair(&configured, cli.no_input)?
+    };
     let mut journal_paths = configured
         .iter()
         .map(|root| root.path.clone())
@@ -1112,7 +1131,11 @@ fn run_pair(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), String> {
         }
         mutation::recover_pair_journals(&journal_paths, &targets)?;
     }
-    let catalog = discover_with_permission_repair(&configured, cli.no_input)?;
+    let catalog = if inspection {
+        initial
+    } else {
+        discover_with_permission_repair(&configured, cli.no_input)?
+    };
     let diagnostics = sshx::pair::diagnostics(&catalog.entries);
     for diagnostic in &catalog.diagnostics {
         eprintln!("{}", render_diagnostic(diagnostic));

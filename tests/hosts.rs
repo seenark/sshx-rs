@@ -1038,6 +1038,185 @@ fn hosts_preview_returns_to_unchanged_entry_without_claiming_mutation() {
     fs::remove_dir_all(root).unwrap();
 }
 
+#[test]
+fn hosts_pairs_inspects_exact_entries_and_refreshes_read_only_validation() {
+    let (root, home, config) = pair_inspection_fixture("pi", 3333);
+    let gateway_source = home.join(".ssh/g");
+    let vm_source = home.join(".ssh/v");
+    let sentinel = root.join("ssh-called");
+    let path = format!("{}:{}", root.join("bin").display(), std::env::var("PATH").unwrap_or_default());
+    let config_before = fs::read_to_string(&config).unwrap();
+    let gateway_before = fs::read_to_string(&gateway_source).unwrap();
+    let vm_before = fs::read_to_string(&vm_source).unwrap();
+    let assert_source = |source: &Path, expected: &str| {
+        assert_eq!(fs::read(source).unwrap(), expected.as_bytes());
+        assert_eq!(fs::metadata(source).unwrap().permissions().mode() & 0o777, 0o600);
+    };
+    let resize = |terminal: &HostEditTerminal, width| {
+        let size = libc::winsize { ws_row: 40, ws_col: width, ws_xpixel: 0, ws_ypixel: 0 };
+        assert_eq!(unsafe { libc::ioctl(terminal.master.as_raw_fd(), libc::TIOCSWINSZ, &size) }, 0);
+    };
+    let mut terminal = HostEditTerminal::open_with_env(&home, &config, &["tui"],
+        &[("PATH", &path), ("SSHX_SENTINEL", sentinel.to_str().unwrap())]);
+    terminal.expect("sshx Hosts");
+    terminal.send(b"\x10");
+    terminal.expect("Status: invalid");
+    terminal.expect("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+    terminal.expect("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb");
+    terminal.expect("exact-gateway");
+    terminal.expect("exact-vm");
+    terminal.expect(gateway_source.to_str().unwrap());
+    terminal.expect(vm_source.to_str().unwrap());
+    terminal.expect("Host line: 3");
+    terminal.expect("Host line: 4");
+    terminal.expect("127.0.0.1:2222");
+    assert!(!String::from_utf8_lossy(&terminal.output).contains("stored-secret"));
+    resize(&terminal, 121);
+    terminal.send(b"\x1b[B");
+    terminal.expect("PAIR_ROUTE_CHANGED");
+    terminal.expect("Evidence:");
+    terminal.expect("Guidance:");
+    terminal.expect(gateway_source.to_str().unwrap());
+    terminal.expect(vm_source.to_str().unwrap());
+    terminal.expect("3333");
+    terminal.expect("127.0.0.1:2222");
+    assert_source(&config, &config_before);
+    assert_source(&gateway_source, &gateway_before);
+    assert_source(&vm_source, &vm_before);
+    assert!(!sentinel.exists(), "Pair inspection invoked OpenSSH");
+
+    let gateway_refreshed = gateway_before.replace("127.0.0.1:2222", "127.0.0.2:2299");
+    let vm_refreshed = vm_before.replace("127.0.0.1:2222", "127.0.0.2:2299")
+        .replace("exact-vm", "refreshed-vm").replace("Port 3333", "Port 2299");
+    fs::write(&gateway_source, &gateway_refreshed).unwrap();
+    fs::write(&vm_source, &vm_refreshed).unwrap();
+    terminal.send(b"V");
+    terminal.expect("Status: valid");
+    terminal.expect("refreshed-vm");
+    terminal.expect("127.0.0.2:2299");
+    assert!(!contains_tui_text(&terminal.output, "PAIR_ROUTE_CHANGED"));
+    assert_source(&config, &config_before);
+    assert_source(&gateway_source, &gateway_refreshed);
+    assert_source(&vm_source, &vm_refreshed);
+
+    let ambiguous = format!("{config_before}##SSHX ID=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\nHost duplicate-id\n  HostName ambiguous.example\n");
+    fs::write(&config, &ambiguous).unwrap();
+    terminal.send(b"v");
+    terminal.expect("broken_reference");
+    assert!(!contains_tui_text(&terminal.output, "Status: valid"));
+    resize(&terminal, 122);
+    terminal.send(b"\x1b[B");
+    terminal.expect("duplicate_id");
+    terminal.expect("Evidence:");
+    terminal.expect("Guidance:");
+    terminal.expect("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+    terminal.expect(gateway_source.to_str().unwrap());
+    terminal.expect(config.to_str().unwrap());
+    terminal.send(b"\x1b");
+    terminal.expect("sshx Hosts");
+    terminal.send(b"\x1b");
+    assert_eq!(terminal.finish(), Some(0));
+    assert_source(&config, &ambiguous);
+    assert_source(&gateway_source, &gateway_refreshed);
+    assert_source(&vm_source, &vm_refreshed);
+    assert_eq!(fs::metadata(home.join(".ssh")).unwrap().permissions().mode() & 0o777, 0o700);
+    assert!(!sentinel.exists(), "Pair validation invoked OpenSSH");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn pair_inspection_cli_preserves_version_one_machine_contract_and_sources() {
+    let (root, home, config) = pair_inspection_fixture("pm", 2222);
+    let gateway_source = home.join(".ssh/g");
+    let vm_source = home.join(".ssh/v");
+    let sentinel = root.join("ssh-called");
+    let path = format!("{}:{}", root.join("bin").display(), std::env::var("PATH").unwrap_or_default());
+    let config_before = fs::read_to_string(&config).unwrap();
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o644)).unwrap();
+    let expected = serde_json::json!({
+        "version": 1,
+        "pairs": [{
+            "gateway_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "vm_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            "gateway_alias": "gateway",
+            "vm_alias": "vm",
+            "transit_host": "127.0.0.1",
+            "transit_port": 2222
+        }],
+        "diagnostics": []
+    });
+    for ambiguous in [false, true] {
+        if ambiguous {
+            fs::write(&config, format!("{config_before}##SSHX ID=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\nHost duplicate-id\n  HostName ambiguous.example\n")).unwrap();
+        }
+        let sources = [&config, &gateway_source, &vm_source];
+        let before = sources.iter().map(|source| (
+            fs::read(source).unwrap(),
+            fs::metadata(source).unwrap().permissions().mode() & 0o777
+        )).collect::<Vec<_>>();
+        for action in ["list", "validate"] {
+            for format in ["json", "yaml"] {
+                let output = Command::new(env!("CARGO_BIN_EXE_sshx")).arg("--config").arg(&config)
+                    .args(["pair", action, "--format", format, "--no-input"])
+                    .env("HOME", &home).env("PATH", &path).env("SSHX_SENTINEL", &sentinel)
+                    .output().unwrap();
+                assert!(output.status.success(), "{action} {format}: {output:?}");
+                let document: serde_json::Value = if format == "json" {
+                    serde_json::from_slice(&output.stdout).unwrap()
+                } else {
+                    serde_yaml::from_slice(&output.stdout).unwrap()
+                };
+                if !ambiguous {
+                    assert_eq!(document, expected, "{action} {format}");
+                } else {
+                    assert_eq!(document.as_object().unwrap().keys().map(String::as_str).collect::<Vec<_>>(),
+                        ["diagnostics", "pairs", "version"]);
+                    assert_eq!(document["version"], 1);
+                    assert_eq!(document["pairs"], serde_json::json!([]));
+                    let diagnostic = document["diagnostics"].as_array().unwrap().iter()
+                        .find(|diagnostic| diagnostic["code"] == "duplicate_id")
+                        .expect("duplicate immutable IDs must remain diagnosable");
+                    assert_eq!(diagnostic.as_object().unwrap().keys().map(String::as_str).collect::<Vec<_>>(),
+                        ["code", "message"]);
+                    let evidence = diagnostic["message"].as_str().unwrap();
+                    assert!(evidence.contains("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"));
+                    assert!(evidence.contains(gateway_source.to_str().unwrap()));
+                    assert!(evidence.contains(config.to_str().unwrap()));
+                }
+                assert!(!String::from_utf8_lossy(&output.stdout).contains("stored-secret"));
+                assert!(!String::from_utf8_lossy(&output.stderr).contains("stored-secret"));
+                for (source, (bytes, mode)) in sources.iter().zip(&before) {
+                    assert_eq!(fs::read(source).unwrap(), *bytes, "{action} {format}: {}", source.display());
+                    assert_eq!(fs::metadata(source).unwrap().permissions().mode() & 0o777, *mode);
+                }
+                assert!(!sentinel.exists(), "{action} {format} invoked OpenSSH");
+                assert_eq!(fs::metadata(home.join(".ssh")).unwrap().permissions().mode() & 0o777, 0o700);
+            }
+        }
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+fn pair_inspection_fixture(name: &str, vm_port: u16) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+    let (root, home, config) = host_edit_fixture(name,
+        "Include g v\nHost gateway\n  HostName decoy-gateway.example\nHost vm\n  HostName decoy-vm.example\n");
+    let gateway = home.join(".ssh/g");
+    fs::write(&gateway,
+        "##SSHX ID=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\n##SSHX VM=bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb\nHost gateway exact-gateway\n  HostName actual-gateway.example\n  LocalForward 2222 127.0.0.1:2222\n  ##PASSWORD stored-secret\n").unwrap();
+    let vm = home.join(".ssh/v");
+    fs::write(&vm, format!(
+        "##SSHX ID=bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb\n##SSHX GATEWAY=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\n##SSHX TRANSIT=127.0.0.1:2222\nHost vm exact-vm\n  HostName actual-vm.example\n  Port {vm_port}\n")).unwrap();
+    for source in [&gateway, &vm] {
+        fs::set_permissions(source, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let bin = root.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let ssh = bin.join("ssh");
+    fs::write(&ssh, "#!/bin/sh\ntouch \"$SSHX_SENTINEL\"\nexit 97\n").unwrap();
+    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
+    (root, home, config)
+}
+
 fn host_edit_fixture(name: &str, contents: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
     let root = std::env::temp_dir().join(format!("sshx-{name}-{}-{}", std::process::id(),
         SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
@@ -1058,13 +1237,17 @@ struct HostEditTerminal {
 
 impl HostEditTerminal {
     fn open(home: &Path, config: &Path, arguments: &[&str]) -> Self {
+        Self::open_with_env(home, config, arguments, &[])
+    }
+
+    fn open_with_env(home: &Path, config: &Path, arguments: &[&str], environment: &[(&str, &str)]) -> Self {
         let mut master = -1;
         let mut slave = -1;
         let mut size = libc::winsize { ws_row: 40, ws_col: 120, ws_xpixel: 0, ws_ypixel: 0 };
         assert_eq!(unsafe { libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null_mut(), &mut size) }, 0);
         let slave = unsafe { File::from_raw_fd(slave) };
         let child = Command::new(env!("CARGO_BIN_EXE_sshx"))
-            .arg("--config").arg(config).args(arguments).env("HOME", home)
+            .arg("--config").arg(config).args(arguments).env("HOME", home).envs(environment.iter().copied())
             .stdin(Stdio::from(slave.try_clone().unwrap()))
             .stdout(Stdio::from(slave.try_clone().unwrap()))
             .stderr(Stdio::from(slave)).spawn().unwrap();

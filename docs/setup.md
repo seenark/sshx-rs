@@ -119,6 +119,8 @@ The selected HostEntry's `IdentityFile`, agent options, and supported OpenSSH se
 
 A **Pair** links exact gateway and VM HostEntries. The gateway OpenSSH master opens a temporary loopback transit forward. A separate VM OpenSSH master uses that port and its own host-key identity.
 
+In the Hosts TUI, press `Ctrl+P` to open Pairs, or run `sshx tui pair list` or `sshx tui pair validate`. Use Up/Down to select a Pair or a diagnostic group. The detail pane shows exact gateway and VM aliases, IDs, source paths and Host lines, approved transit, and route validity. Diagnostic groups show evidence and guidance; use Page Up/Page Down to scroll details. Press `V` to rediscover and validate current SSH config without changing files, repairing permissions, or starting OpenSSH. Press `Esc` to return to Hosts, or `S` to begin Pair setup.
+
 Create a Pair when one route is unambiguous:
 
 ```sh
