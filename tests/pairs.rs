@@ -9,6 +9,74 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[test]
+fn pair_setup_recovers_interrupted_journal_only_after_explicit_consent() {
+    let fixture = PairFixture::new("recovery-pair");
+    let original = fixture.snapshot();
+    let target = fs::canonicalize(&fixture.gateway).unwrap();
+    let before = fixture.root.join("gateway-before");
+    let after = fixture.root.join("gateway-after");
+    let lock = fixture.gateway.with_file_name(".gateway-source.sshx.lock");
+    let journal = lock.with_file_name(".gateway-source.sshx.lock.journal");
+    fs::copy(&fixture.gateway, &before).unwrap();
+    let interrupted = fs::read_to_string(&fixture.gateway).unwrap()
+        .replace("Host gateway\n", "Host interrupted-gateway\n");
+    fs::write(&fixture.gateway, &interrupted).unwrap();
+    fs::copy(&fixture.gateway, &after).unwrap();
+    fs::write(&lock, b"stale lock file from crashed writer").unwrap();
+    // The journal wire format uses FNV-1a digests of the before and after bytes.
+    let digest = |bytes: &[u8]| bytes.iter().fold(0xcbf29ce484222325_u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    });
+    let journal_bytes = serde_json::to_vec(&serde_json::json!({
+        "writes": [{
+            "path": target,
+            "before": before,
+            "after": after,
+            "before_digest": digest(&original[1].0),
+            "after_digest": digest(interrupted.as_bytes()),
+            "existed": true
+        }]
+    })).unwrap();
+    fs::write(&journal, &journal_bytes).unwrap();
+    let pending = fixture.snapshot();
+
+    let output = fixture.command()
+        .args(["pair", "setup", "gateway", "--yes", "--no-input"]).output().unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    fixture.assert_snapshot(&pending);
+    assert_eq!(fs::read(&journal).unwrap(), journal_bytes);
+    assert_eq!(fs::read(&before).unwrap(), original[1].0);
+
+    let arguments = ["pair", "setup", "gateway", "--yes"];
+    let mut terminal = PairTerminal::open(&fixture, &arguments);
+    terminal.expect("Pending Pair mutation affects:");
+    terminal.expect("Recover pending Pair mutation before setup?");
+    assert!(String::from_utf8_lossy(&terminal.output).contains(target.to_str().unwrap()));
+    fixture.assert_snapshot(&pending);
+    terminal.send(b"n\r");
+    assert_eq!(terminal.finish(), Some(2));
+    fixture.assert_snapshot(&pending);
+    assert_eq!(fs::read(&journal).unwrap(), journal_bytes);
+    assert_eq!(fs::read(&before).unwrap(), original[1].0);
+    assert_eq!(fs::read(&after).unwrap(), interrupted.as_bytes());
+
+    let mut terminal = PairTerminal::open(&fixture, &arguments);
+    terminal.expect("Pending Pair mutation affects:");
+    terminal.expect("Recover pending Pair mutation before setup?");
+    assert!(String::from_utf8_lossy(&terminal.output).contains(target.to_str().unwrap()));
+    fixture.assert_snapshot(&pending);
+    terminal.send(b"y\r");
+    terminal.expect("Pair setup");
+    terminal.expect("Gateway: gateway");
+    fixture.assert_snapshot(&original);
+    assert!(!journal.exists(), "recovered journal remains pending");
+    terminal.send(b"\x1b");
+    assert_eq!(terminal.finish(), Some(130));
+    fixture.assert_snapshot(&original);
+    assert_eq!(fixture.pairs()["pairs"], serde_json::json!([]));
+}
+
+#[test]
 fn partial_pair_setup_reviews_exact_duplicate_vm_and_chosen_transit_before_apply() {
     let fixture = PairFixture::new("exact-pair");
     let before = fixture.snapshot();

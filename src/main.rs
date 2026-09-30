@@ -1121,10 +1121,25 @@ fn run_pair(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), String> {
     journal_paths.sort();
     journal_paths.dedup();
     let pending = mutation::pending_pair_journals(&journal_paths);
-    if !pending.is_empty() && matches!(cli.command, Command::PairSetup { .. }) {
-        return Err("PAIR_RECOVERY_PENDING: pending Pair mutation requires explicit recovery before setup; no files changed".to_string());
-    }
-    let catalog = initial;
+    let catalog = if !pending.is_empty() && matches!(cli.command, Command::PairSetup { .. }) {
+        let targets = mutation::pair_recovery_targets(&pending)?;
+        if cli.no_input || cli.format.is_machine() || cli.password_stdin
+            || !io::stdin().is_terminal() || !io::stderr().is_terminal()
+        {
+            return Err("PAIR_RECOVERY_REVIEW_REQUIRED: review pending Pair mutation targets in an interactive terminal before setup".to_string());
+        }
+        eprintln!("Pending Pair mutation affects:");
+        for path in &targets {
+            eprintln!("  {}", path.display());
+        }
+        if !prompt_yes("Recover pending Pair mutation before setup? [y/N]: ")? {
+            return Err("PAIR_RECOVERY_DECLINED: pending Pair mutation was not recovered".to_string());
+        }
+        mutation::recover_pair_journals(&journal_paths, &targets)?;
+        discover_roots(&configured).map_err(|error| error.to_string())?
+    } else {
+        initial
+    };
     let diagnostics = sshx::pair::diagnostics(&catalog.entries);
     for diagnostic in &catalog.diagnostics {
         eprintln!("{}", render_diagnostic(diagnostic));

@@ -143,7 +143,7 @@ Press `Ctrl+S` to review both exact sources, transit, and metadata changes in th
 
 Use `--preview` or `--dry-run` to render Pair changes without writing config. In the workspace, a successful review completes preview without allowing Apply. Complete CLI commands retain direct preview and consent behavior.
 
-Pair setup stops when a recovery journal is pending. Resolve the pending transaction before reopening setup; setup does not roll back files or recover a journal implicitly.
+When a recovery journal is pending, Pair setup lists the affected files and asks separately for explicit recovery consent before opening setup. Declining changes nothing. Confirming restores the interrupted transaction's saved content, then rediscovers HostEntries. `--yes` does not bypass recovery review; non-interactive or machine-output setup remains blocked until interactive recovery completes.
 
 Inspect Pair records and validation diagnostics from the CLI:
 
