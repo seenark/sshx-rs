@@ -6255,7 +6255,7 @@ fn tui_workspace_marks_each_conflicting_service_row_before_start() {
         &root,
         &[
             (b"Search:", b"\n"),
-            (b"Connection workspace", b"\r"),
+            (b"5432#1", b"\r"),
             (b"Fix marked", b"\x1b[B"),
             (b"6379#2", b"\x1b[B"),
             (b"cannot reserve", b"\x03"),
@@ -6303,7 +6303,7 @@ fn tui_tunnel_returns_id_and_leaves_hosts_available() {
         &root,
         &[
             (b"Search:", b"\n"),
-            (b"Connection workspace", b"m \x1b[B \x1b[B \r"),
+            (b"5432#1", b"m \x1b[B \x1b[B \r"),
             (b"Enter confirm", b"\r"),
             (b"dt-", b"\x1b"),
             (b"Search:", b"\x1b"),
@@ -6483,7 +6483,7 @@ fn workspace_restores_edited_rows_after_startup_failure() {
         &root,
         &[
             (b"Search:", b"\n"),
-            (b"Connection workspace", b"e"),
+            (b"5432#1", b"e"),
             (b"Enter save", first_edit.as_bytes()),
             (b"Forwarding rows", b"\x1b[Be"),
             (b"Enter save", second_edit.as_bytes()),
@@ -6497,6 +6497,10 @@ fn workspace_restores_edited_rows_after_startup_failure() {
         None,
         Some((48, 18)),
         |index| {
+            if index == 6 {
+                assert!(!root.join("master-started").exists());
+                assert!(!root.join("runtime-config").exists());
+            }
             if index == 7 {
                 first_runtime = Some(fs::read_to_string(root.join("runtime-config")).unwrap());
                 assert!(!root.join("master-started").exists());
