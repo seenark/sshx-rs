@@ -95,6 +95,8 @@ sshx connect --id <entry-id> --no-input
 sshx connect db-prod --source ~/.ssh/hosts.conf --line 42 --no-input
 ```
 
+In Hosts, press `Ctrl+U` to update the selected HostEntry or `Ctrl+R` to rename only its selected alias. `sshx host update HOST` and `sshx host rename HOST` continue in the editor when no change is supplied; `sshx tui host update HOST --hostname DESTINATION` and `sshx tui host rename HOST --alias ALIAS` open it even with complete fields. Fields show `keep`, `replace`, or `clear`; a password marked `keep` is never revealed, typing replaces it, and `Ctrl+X` clears it. Interactive review always requires `Enter`, including with `--yes`; `--no-input`, password stdin, and JSON/YAML output never open the editor.
+
 ## Direct shell
 
 Open one HostEntry through its normal OpenSSH settings:

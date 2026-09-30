@@ -206,6 +206,9 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
         );
     }
     validate_connect_without_catalog(&cli)?;
+    if matches!(cli.command, Command::UpdateHost(_) | Command::RenameHost(_)) {
+        return run_host_edit(&cli, &registered_roots(&cli)?);
+    }
     if cli.tui {
         let selector = match &cli.command {
             Command::Connect(Some(selector)) | Command::Show(Some(selector))
@@ -495,6 +498,7 @@ fn start_direct_tunnel(
 fn run_hosts(cli: &Cli, home: &Path, roots: &[RegisteredRoot]) -> Result<(), String> {
     let mut roots = roots.to_vec();
     let mut state = picker::HostsState::default();
+    state.editing_enabled = true;
     let mut status = None;
     loop {
         let configured = settings::discovery_roots(&roots);
@@ -583,6 +587,7 @@ fn run_hosts(cli: &Cli, home: &Path, roots: &[RegisteredRoot]) -> Result<(), Str
         let Some(selection) = selection else { return Ok(()); };
         let entry = selection.entry;
         let alias = selection.alias;
+        let edit_action = state.edit_action.take();
         let unchanged = sources
             .get(entry.source.path.as_str())
             .and_then(Option::as_ref)
@@ -594,6 +599,33 @@ fn run_hosts(cli: &Cli, home: &Path, roots: &[RegisteredRoot]) -> Result<(), Str
                 "HOST_SOURCE_CHANGED: {} changed; select its current HostEntry again",
                 entry.source.path
             ));
+            continue;
+        }
+        if let Some(operation) = edit_action {
+            let before = sources.get(entry.source.path.as_str()).and_then(Option::as_ref)
+                .ok_or_else(|| "HOST_SOURCE_CHANGED: source is unavailable; select again".to_string())?;
+            let alias_index = entry.aliases.iter().position(|value| value == alias).unwrap_or(0);
+            status = match mutation::validate_mutation_roots(&configured)
+                .and_then(|()| run_host_edit_workspace(cli, entry, alias, operation, before)) {
+                Ok(()) => {
+                    if let Ok(updated) = discover_roots(&configured)
+                        && let Some(updated) = updated.entries.iter().find(|updated| {
+                            updated.source.path == entry.source.path
+                                && updated.source.byte_start == entry.source.byte_start
+                        })
+                        && let Some(alias) = updated.aliases.get(alias_index)
+                    {
+                        state.prefill(updated, alias, "");
+                    }
+                    Some(if operation == MutationKind::Rename {
+                        "HostEntry renamed.".to_string()
+                    } else {
+                        "HostEntry updated.".to_string()
+                    })
+                }
+                Err(error) if error == picker::CANCELLED => Some("HostEntry edit cancelled.".to_string()),
+                Err(error) => Some(error),
+            };
             continue;
         }
         if catalog
@@ -1437,15 +1469,73 @@ fn run_host_edit(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), String> {
     {
         return Err("MUTATION_FIELDS: rename accepts only --alias".to_string());
     }
+    if cli.user.is_some() && cli.clear_user
+        || cli.port.is_some() && cli.clear_port
+        || cli.password_stdin && cli.clear_password
+    {
+        return Err("MUTATION_CONFLICT: cannot set and clear one field together".to_string());
+    }
+    let mut request = UpdateRequest {
+        path: PathBuf::new(), expected_id: String::new(), selected_alias: String::new(),
+        byte_start: 0, byte_end: 0, alias: cli.alias.clone(), hostname: cli.hostname.clone(),
+        user: cli.user.clone(), port: cli.port, password: None, clear_user: cli.clear_user,
+        clear_port: cli.clear_port, clear_password: cli.clear_password,
+    };
+    if request.alias.is_some() || request.hostname.is_some() || request.user.is_some()
+        || request.port.is_some() || request.clear_user || request.clear_port || request.clear_password
+    {
+        mutation::validate_update_request(&request)?;
+    }
+    let incomplete = operation != MutationKind::Delete
+        && (positional.is_none() && cli.id.is_none()
+            || cli.alias.is_none() && cli.hostname.is_none() && cli.user.is_none()
+                && cli.port.is_none() && !cli.password_stdin
+                && !cli.clear_user && !cli.clear_port && !cli.clear_password);
+    let workspace = operation != MutationKind::Delete && (cli.tui
+        || incomplete && !cli.no_input && !cli.format.is_machine() && !cli.password_stdin
+            && io::stdin().is_terminal() && io::stderr().is_terminal());
+    let exact_selection = if cli.tui && (positional.is_some() || cli.id.is_some()) {
+        Some(select_mutation_entry(&filtered, positional, cli, "host edit")?)
+    } else {
+        None
+    };
+    if cli.tui && (cli.no_input || cli.format.is_machine() || cli.password_stdin
+        || !io::stdin().is_terminal() || !io::stderr().is_terminal())
+    {
+        return Err("TUI_REQUIRED: host editing requires usable stdin and stderr terminals without --no-input, password stdin, or machine output".to_string());
+    }
+    let mut sources = HashMap::new();
+    if workspace {
+        for entry in &filtered {
+            if !sources.contains_key(entry.source.path.as_str()) {
+                let bytes = std::fs::read(&entry.source.path).map_err(|error| error.to_string())?;
+                sources.insert(entry.source.path.as_str(), bytes);
+            }
+        }
+    }
     let picker_label = match operation {
         MutationKind::Update => "host update",
         MutationKind::Rename => "host rename",
         MutationKind::Delete => "host delete",
     };
-    let selected = select_mutation_entry(&filtered, positional, cli, picker_label)?;
+    let selected = match exact_selection {
+        Some(selected) => selected,
+        None => select_mutation_entry(&filtered, positional, cli, picker_label)?,
+    };
     let entry = selected.entry;
     mutation::validate_entry_paths(entry)?;
-    let selected_alias = selected.alias.to_string();
+    let selected_alias = selected.alias;
+    request.path = PathBuf::from(&entry.source.path);
+    request.expected_id = entry.id.clone();
+    request.selected_alias = selected_alias.to_string();
+    request.byte_start = entry.source.byte_start;
+    request.byte_end = entry.source.byte_end;
+    if workspace {
+        let before = sources.get(entry.source.path.as_str()).ok_or_else(|| {
+            "HOST_SOURCE_CHANGED: selected source is unavailable; select its current HostEntry again".to_string()
+        })?;
+        return run_host_edit_workspace(cli, entry, selected_alias, operation, before);
+    }
     let home = home_dir()?;
     let plan = match operation {
         MutationKind::Delete => {
@@ -1456,7 +1546,7 @@ fn run_host_edit(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), String> {
             mutation::plan_delete(
                 PathBuf::from(&entry.source.path).as_path(),
                 &entry.id,
-                &selected_alias,
+                selected_alias,
                 entry.source.byte_start,
                 entry.source.byte_end,
             )?
@@ -1468,21 +1558,8 @@ fn run_host_edit(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), String> {
             } else {
                 String::new()
             };
-            let mut plan = mutation::plan_update(&UpdateRequest {
-                path: PathBuf::from(&entry.source.path),
-                expected_id: entry.id.clone(),
-                selected_alias,
-                byte_start: entry.source.byte_start,
-                byte_end: entry.source.byte_end,
-                alias: cli.alias.clone(),
-                hostname: cli.hostname.clone(),
-                user: cli.user.clone(),
-                port: cli.port,
-                password: cli.password_stdin.then_some(password),
-                clear_user: cli.clear_user,
-                clear_port: cli.clear_port,
-                clear_password: cli.clear_password,
-            })?;
+            request.password = cli.password_stdin.then_some(password);
+            let mut plan = mutation::plan_update(&request)?;
             plan.operation = operation;
             plan
         }
@@ -1507,6 +1584,105 @@ fn run_host_edit(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), String> {
     print!("{}", render_edit(&plan, cli.format, true)?);
     Ok(())
 }
+fn run_host_edit_workspace(
+    cli: &Cli, entry: &HostEntry, alias: &str, operation: MutationKind, before: &[u8],
+) -> Result<(), String> {
+    let unchanged = || {
+        mutation::validate_entry_paths(entry)?;
+        if std::fs::read(&entry.source.path).is_ok_and(|bytes| bytes == before) {
+            Ok(())
+        } else {
+            Err(format!("HOST_SOURCE_CHANGED: {} changed; cancel and select its current HostEntry again",
+                entry.source.path))
+        }
+    };
+    unchanged()?;
+    let mut request = UpdateRequest {
+        path: PathBuf::from(&entry.source.path), expected_id: entry.id.clone(),
+        selected_alias: alias.to_string(), byte_start: entry.source.byte_start,
+        byte_end: entry.source.byte_end, alias: None, hostname: None, user: None,
+        port: None, password: None, clear_user: false, clear_port: false, clear_password: false,
+    };
+    let current = mutation::current_values(&request)?;
+    let original = [
+        alias.to_string(), current.hostname.unwrap_or_default(), current.user.unwrap_or_default(),
+        current.port.map_or_else(String::new, |port| port.to_string()),
+        if current.has_password { "********".to_string() } else { String::new() },
+    ];
+    let mut fields = original.clone();
+    for (index, value) in [(0, cli.alias.as_ref()), (1, cli.hostname.as_ref()), (2, cli.user.as_ref())] {
+        if let Some(value) = value { fields[index] = value.clone(); }
+    }
+    if let Some(port) = cli.port { fields[3] = port.to_string(); }
+    let mut clears = [cli.clear_user, cli.clear_port, cli.clear_password];
+    for (index, clear) in clears.iter().enumerate() {
+        if *clear { fields[index + 2].clear(); }
+    }
+    let mut password_edited = false;
+    let mut focus = None;
+    let mut status = None;
+    let identity = format!("ID: {}\nAlias: {alias}\nSource: {}:{}\nSpan: {}..{}\n",
+        entry.id, entry.source.path, entry.source.line_start, entry.source.byte_start, entry.source.byte_end);
+    loop {
+        let (edited, edited_clears, edited_password, selected, action) = picker::host_edit_workspace(
+            fields, clears, password_edited, &original, operation == MutationKind::Rename,
+            focus, status.as_deref(), None, cli.preview,
+        )?;
+        fields = edited;
+        clears = edited_clears;
+        password_edited = edited_password;
+        focus = Some(selected);
+        if action != picker::HostEditAction::Submit { continue; }
+        let result = (|| {
+            unchanged()?;
+            request.alias = (fields[0] != original[0]).then(|| fields[0].clone());
+            request.hostname = (fields[1] != original[1]).then(|| fields[1].clone());
+            request.user = (!clears[0] && fields[2] != original[2]).then(|| fields[2].clone());
+            request.port = if !clears[1] && fields[3] != original[3] {
+                Some(fields[3].parse::<u16>().ok().filter(|port| *port != 0)
+                    .ok_or_else(|| "PORT_INVALID: enter a port from 1 to 65535, or Ctrl-X to clear".to_string())?)
+            } else { None };
+            request.password = (!clears[2] && password_edited).then(|| fields[4].clone());
+            [request.clear_user, request.clear_port, request.clear_password] = clears;
+            let mut plan = mutation::plan_update(&request)?;
+            plan.operation = operation;
+            unchanged()?;
+            Ok::<_, String>(plan)
+        })();
+        let plan = match result {
+            Ok(plan) => plan,
+            Err(error) => { status = Some(error); continue; }
+        };
+        let review = format!("{identity}{}", render_edit(&plan, OutputFormat::Human, false)?);
+        let (edited, edited_clears, edited_password, selected, action) = picker::host_edit_workspace(
+            fields, clears, password_edited, &original, operation == MutationKind::Rename,
+            focus, None, Some(&review), cli.preview,
+        )?;
+        fields = edited;
+        clears = edited_clears;
+        password_edited = edited_password;
+        focus = Some(selected);
+        match action {
+            picker::HostEditAction::Edit => status = None,
+            picker::HostEditAction::PreviewComplete => {
+                unchanged()?;
+                print!("{review}");
+                return Ok(());
+            }
+            picker::HostEditAction::Apply => {
+                match unchanged().and_then(|()| mutation::apply_edit(&plan)) {
+                    Ok(()) => {
+                        print!("{}", render_edit(&plan, cli.format, true)?);
+                        return Ok(());
+                    }
+                    Err(error) => status = Some(error),
+                }
+            }
+            picker::HostEditAction::Submit => {}
+        }
+    }
+}
+
 fn select_mutation_entry<'a>(
     entries: &[&'a HostEntry],
     positional: Option<&str>,
@@ -1514,6 +1690,9 @@ fn select_mutation_entry<'a>(
     picker_label: &str,
 ) -> Result<picker::Selection<'a>, String> {
     if positional.is_none() && cli.id.is_none() {
+        if cli.format.is_machine() || cli.password_stdin || !io::stderr().is_terminal() {
+            return Err("HOST_REQUIRED: host mutation requires an exact selector outside interactive mode".to_string());
+        }
         if cli.no_input {
             return Err(
                 "HOST_REQUIRED: host mutation requires a host in --no-input mode".to_string(),

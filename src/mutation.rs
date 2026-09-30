@@ -999,7 +999,7 @@ struct Change {
     replacement: Vec<u8>,
 }
 
-fn validate_update_request(request: &UpdateRequest) -> Result<(), String> {
+pub fn validate_update_request(request: &UpdateRequest) -> Result<(), String> {
     if request.alias.is_none()
         && request.hostname.is_none()
         && request.user.is_none()

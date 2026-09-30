@@ -84,6 +84,8 @@ pub struct HostsState {
     detail_page: HostDetailPage,
     detail_scroll: u16,
     pub active_tunnels: usize,
+    pub edit_action: Option<sshx::mutation::MutationKind>,
+    pub editing_enabled: bool,
 }
 
 impl HostsState {
@@ -299,7 +301,14 @@ pub fn browse_hosts<'a>(
                 "No matching HostEntry aliases."
             };
             let width = terminal.backend().size().map_or(80, |area| area.width);
-            let footer = hosts_footer(width, !rows.is_empty(), state.active_tunnels);
+            let mut footer = hosts_footer(width, !rows.is_empty(), state.active_tunnels);
+            if state.editing_enabled && !rows.is_empty() {
+                footer.push_str(if width < 48 {
+                    "\n^U Update · ^R Rename"
+                } else {
+                    "\nCtrl+U Update · Ctrl+R Rename"
+                });
+            }
             let scroll_step = terminal.backend().size().map_or(1, |area| {
                 area.height
                     .saturating_sub(footer.lines().count() as u16)
@@ -333,6 +342,20 @@ pub fn browse_hosts<'a>(
                             entry: row.entry,
                             alias: row.alias,
                         }));
+                    }
+                }
+                KeyEvent {
+                    code: KeyCode::Char(character @ ('u' | 'r')),
+                    modifiers,
+                    ..
+                } if state.editing_enabled && modifiers.contains(KeyModifiers::CONTROL) => {
+                    if let Some(row) = rows.get(selected) {
+                        state.edit_action = Some(if character == 'u' {
+                            sshx::mutation::MutationKind::Update
+                        } else {
+                            sshx::mutation::MutationKind::Rename
+                        });
+                        return Ok(Some(Selection { entry: row.entry, alias: row.alias }));
                     }
                 }
                 KeyEvent {
@@ -2740,21 +2763,31 @@ fn toggle_password_clear(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostEditAction {
+    Submit,
+    Apply,
+    Edit,
+    PreviewComplete,
+}
+
 pub fn host_edit_workspace(
     mut fields: [String; 5],
     mut clears: [bool; 3],
     mut password_edited: bool,
+    original_fields: &[String; 5],
     rename_only: bool,
+    focus: Option<usize>,
     status: Option<&str>,
-) -> Result<([String; 5], [bool; 3], bool), String> {
+    review: Option<&str>,
+    preview: bool,
+) -> Result<([String; 5], [bool; 3], bool, usize, HostEditAction), String> {
     const LABELS: [&str; 5] = ["Alias", "Host destination", "User", "Port", "Password"];
     let label = if rename_only {
         "Rename HostEntry"
     } else {
         "Edit HostEntry"
     };
-    let original_fields = fields.clone();
-    let original_password_edited = password_edited;
     with_terminal(
         label,
         "HOST_EDIT_REQUIRED: editing a HostEntry requires usable stdin and stderr terminals"
@@ -2764,14 +2797,63 @@ pub fn host_edit_workspace(
             let mut selected = status
                 .and_then(|message| match message.split(':').next()?.trim() {
                     "ALIAS_INVALID" => Some(0),
-                    "HOSTNAME_INVALID" => Some(1),
-                    "USER_INVALID" => Some(2),
+                    "HOSTNAME_INVALID" | "hostname_INVALID" => Some(1),
+                    "USER_INVALID" | "user_INVALID" => Some(2),
                     "PORT_INVALID" => Some(3),
-                    "PASSWORD_INVALID" | "PASSWORD_FILE_INSECURE" => Some(4),
+                    "PASSWORD_INVALID" | "password_INVALID" | "PASSWORD_FILE_INSECURE" => Some(4),
                     _ => None,
                 })
+                .or(focus)
                 .unwrap_or(0)
                 .min(field_count - 1);
+            if let Some(review) = review {
+                let mut scroll = 0u16;
+                loop {
+                    terminal.draw(|frame| {
+                        let footer = if frame.area().width < 32 {
+                            if preview {
+                                "Enter finish preview\nE/Esc edit · ^C cancel\nPgUp/Dn scroll"
+                            } else {
+                                "Enter apply\nE/Esc edit · ^C cancel\nPgUp/Dn scroll"
+                            }
+                        } else if frame.area().width < 80 {
+                            if preview {
+                                "Enter finish preview · E/Esc edit\nCtrl-C cancel · PgUp/Dn scroll"
+                            } else {
+                                "Enter apply · E/Esc edit\nCtrl-C cancel · PgUp/Dn scroll"
+                            }
+                        } else if preview {
+                            "Enter finish preview · E/Esc edit · Ctrl-C cancel · PgUp/PgDn scroll"
+                        } else {
+                            "Enter apply · E/Esc edit · Ctrl-C cancel · PgUp/PgDn scroll"
+                        };
+                        let rows = Layout::default().direction(Direction::Vertical)
+                            .constraints([Constraint::Length(1), Constraint::Min(1),
+                                Constraint::Length(footer.lines().count() as u16)])
+                            .split(frame.area());
+                        frame.render_widget(Paragraph::new("Review HostEntry changes")
+                            .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)), rows[0]);
+                        frame.render_widget(Paragraph::new(review).wrap(Wrap { trim: false })
+                            .scroll((scroll, 0)), rows[1]);
+                        frame.render_widget(Paragraph::new(footer)
+                            .style(Style::default().fg(Color::Cyan)), rows[2]);
+                    }).map_err(|error| format!("HOST_EDIT_REQUIRED: cannot render review: {error}"))?;
+                    match read_key(input, "HOST_EDIT_REQUIRED")? {
+                        KeyEvent { code: KeyCode::Enter, .. } => return Ok((fields, clears, password_edited,
+                            selected, if preview { HostEditAction::PreviewComplete } else { HostEditAction::Apply })),
+                        KeyEvent { code: KeyCode::Esc | KeyCode::Char('e' | 'E'), .. } =>
+                            return Ok((fields, clears, password_edited, selected, HostEditAction::Edit)),
+                        KeyEvent { code: KeyCode::Char('c'), modifiers, .. }
+                            if modifiers.contains(KeyModifiers::CONTROL) => return Err(CANCELLED.to_string()),
+                        KeyEvent { code: KeyCode::Down, .. } => scroll = scroll.saturating_add(1),
+                        KeyEvent { code: KeyCode::Up, .. } => scroll = scroll.saturating_sub(1),
+                        KeyEvent { code: KeyCode::PageDown, .. } => scroll = scroll.saturating_add(10),
+                        KeyEvent { code: KeyCode::PageUp, .. } => scroll = scroll.saturating_sub(10),
+                        KeyEvent { code: KeyCode::Home, .. } => scroll = 0,
+                        _ => {}
+                    }
+                }
+            }
             loop {
                 terminal
                     .draw(|frame| {
@@ -2811,7 +2893,15 @@ pub fn host_edit_workspace(
                             } else {
                                 Style::default().fg(Color::White)
                             };
-                            let text = format!("{label}: {display}");
+                            let state = if (2..=4).contains(&index) && clears[index - 2] {
+                                "clear"
+                            } else if index == 4 && password_edited || index != 4 && fields[index] != original_fields[index] {
+                                "replace"
+                            } else {
+                                "keep"
+                            };
+                            let marker = if index == selected { "> " } else { "  " };
+                            let text = format!("{marker}{label} [{state}]: {display}");
                             let width = field_area.width.saturating_sub(2) as usize;
                             let scroll = text.chars().count().saturating_sub(width) as u16;
                             frame.render_widget(
@@ -2860,7 +2950,7 @@ pub fn host_edit_workspace(
                     KeyEvent { code: KeyCode::Char('s'), modifiers, .. }
                         if modifiers.contains(KeyModifiers::CONTROL) =>
                     {
-                        return Ok((fields, clears, password_edited));
+                        return Ok((fields, clears, password_edited, selected, HostEditAction::Submit));
                     }
                     KeyEvent { code: KeyCode::Char('x'), modifiers, .. }
                         if !rename_only
@@ -2874,7 +2964,7 @@ pub fn host_edit_workspace(
                                 &original_fields[selected],
                                 &mut clears[index],
                                 &mut password_edited,
-                                original_password_edited,
+                                false,
                             );
                         } else {
                             clears[index] = !clears[index];
@@ -3130,6 +3220,7 @@ fn read_key(input: &mut File, prefix: &str) -> Result<KeyEvent, String> {
         0x14 => return Ok(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL)),
         0x04 => return Ok(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)),
         0x15 => return Ok(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)),
+        0x12 => return Ok(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
         0x08 | 0x7f => KeyCode::Backspace,
         0x1b => {
             let Some(prefix_byte) = read_escape_byte(input, prefix)? else {
