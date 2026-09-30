@@ -6750,6 +6750,42 @@ fn workspace_restores_edited_rows_after_startup_failure() {
 
 #[cfg(unix)]
 #[test]
+fn hosts_tui_keeps_running_when_config_root_disappears() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(&config, "Host direct\n  HostName direct.example\n");
+    let bin = fake_ssh(&root);
+    let (status, output) = run_with_pty_interactions_with_hook(
+        &home,
+        &[],
+        &bin,
+        &root,
+        &[
+            (b"Search:", b"\r"),
+            (b"No HostEntries", b"\x13"),
+            (b"SSH config file path:", b"\x1b"),
+            (b"No HostEntries", b"\x04"),
+            (b"Evidence and guidance", b"\x1b"),
+            (b"No HostEntries", b"\x1b"),
+        ],
+        None,
+        Some((100, 36)),
+        |index| {
+            if index == 0 {
+                fs::remove_file(&config).unwrap();
+            }
+        },
+    );
+    assert!(status.success(), "status={status:?} output={output}");
+    assert!(!root.join("master-started").exists());
+    assert!(!root.join("runtime-config").exists());
+    assert!(!config.exists());
+    assert!(!home.join(".config/sshx/config.json").exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
 fn workspace_edit_scroll_reveals_local_listener_on_eighteen_by_twelve_terminal() {
     let (root, home) = fixture_root();
     write(
