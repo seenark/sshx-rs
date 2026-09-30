@@ -3272,11 +3272,34 @@ pub fn host_edit_workspace(
                 terminal
                     .draw(|frame| {
                         let area = frame.area();
+                        let footer = if area.width < 20 {
+                            if rename_only {
+                                "Ctrl-S review Esc"
+                            } else {
+                                "Ctrl-S review Esc\nTab move · ^X clear"
+                            }
+                        } else if area.width < 32 {
+                            if rename_only {
+                                "Ctrl-S review · Esc"
+                            } else {
+                                "Ctrl-S review · Esc\nTab move · Ctrl-X clear"
+                            }
+                        } else if area.width < 80 {
+                            if rename_only {
+                                "Ctrl-S review · Esc cancel\nRename selected alias only"
+                            } else {
+                                "Ctrl-S review · Esc cancel\nTab/↑↓ move · Ctrl-X clear optional field"
+                            }
+                        } else if rename_only {
+                            "Rename selected alias only · Ctrl-S review · Esc cancel"
+                        } else {
+                            "Tab/↑↓ move · Ctrl-X clear optional field · Ctrl-S review · Esc cancel"
+                        };
                         let mut constraints = vec![Constraint::Length(1), Constraint::Min(1)];
                         if status.is_some() {
                             constraints.push(Constraint::Length(1));
                         }
-                        constraints.push(Constraint::Length(1));
+                        constraints.push(Constraint::Length(footer.lines().count() as u16));
                         let rows = Layout::default()
                             .direction(Direction::Vertical)
                             .constraints(constraints)
@@ -3337,20 +3360,6 @@ pub fn host_edit_workspace(
                                 rows[status_row],
                             );
                         }
-                        let width = area.width;
-                        let footer = if width < 20 {
-                            "Ctrl-S review Esc"
-                        } else if width < 32 {
-                            if rename_only {
-                                "Ctrl-S review · Esc"
-                            } else {
-                                "Ctrl-S review · Esc · Ctrl-X"
-                            }
-                        } else if rename_only {
-                            "Rename selected alias only · Ctrl-S review · Esc cancel"
-                        } else {
-                            "Tab/↑↓ move · Ctrl-X clear optional field · Ctrl-S review · Esc cancel"
-                        };
                         frame.render_widget(
                             Paragraph::new(footer).style(Style::default().fg(Color::Cyan)),
                             rows[rows.len() - 1],

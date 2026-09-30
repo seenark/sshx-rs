@@ -3469,6 +3469,70 @@ fn direct_connect_repair_does_not_retry_real_auth_failure() {
 
 #[cfg(unix)]
 #[test]
+fn host_update_short_terminal_keeps_password_and_controls_visible() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(&config, "Host target\n  HostName target.example\n");
+    let bin = root.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let (status, output) = run_with_pty_interactions(
+        &home,
+        &["--config", config.to_str().unwrap(), "host", "update", "target"],
+        &bin,
+        &root,
+        &[(b"Edit HostEntry", b"\t\t\t\t"), (b"> Password [keep]", b"\x1b")],
+        None,
+        Some((48, 8)),
+    );
+    assert_eq!(status.code(), Some(130), "status={status:?} output={output}");
+    assert_eq!(fs::read_to_string(&config).unwrap(), "Host target\n  HostName target.example\n");
+    assert!(contains_tui_text(output.as_bytes(), b"Ctrl-S review"), "{output}");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn host_update_workspace_accepts_mask_placeholder_as_password() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(
+        &config,
+        concat!(
+            "##SSHX ID=33333333-3333-4333-8333-333333333333\n",
+            "Host target\n",
+            "  HostName target.example\n",
+        ),
+    );
+    let mut permissions = fs::metadata(&config).unwrap().permissions();
+    permissions.set_mode(0o600);
+    fs::set_permissions(&config, permissions).unwrap();
+    let bin = root.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let (status, output) = run_with_pty_interactions(
+        &home,
+        &["--config", config.to_str().unwrap(), "host", "update", "target"],
+        &bin,
+        &root,
+        &[
+            (b"Edit HostEntry", b"\t\t\t\t********\x13"),
+            (b"Review HostEntry changes", b"\n"),
+        ],
+        None,
+        Some((100, 40)),
+    );
+    assert!(status.success(), "status={status:?} output={output}");
+    assert!(!output.contains("********"), "password leaked: {output}");
+    assert!(
+        fs::read_to_string(&config)
+            .unwrap()
+            .contains("##PASSWORD ********"),
+        "literal mask password was not applied"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
 fn host_rename_picker_preserves_selected_alias_and_identity() {
     let (root, home) = fixture_root();
     let config = home.join(".ssh/config");
@@ -3484,7 +3548,7 @@ fn host_rename_picker_preserves_selected_alias_and_identity() {
         ),
     );
     let bin = fake_ssh(&root);
-    let (status, output) = run_with_pty_header(
+    let (status, output) = run_with_pty_interactions(
         &home,
         &[
             "--config",
@@ -3496,20 +3560,30 @@ fn host_rename_picker_preserves_selected_alias_and_identity() {
         ],
         &bin,
         &root,
-        b"second\ny\n",
-        b"sshx host rename picker",
+        &[
+            (b"host rename", b"common\x1b[B\n"),
+            (b"Rename HostEntry", b"\x13"),
+            (b"Review HostEntry changes", b"\n"),
+        ],
+        None,
+        Some((120, 40)),
     );
     assert!(status.success(), "status={status:?} output={output}");
-    assert!(output.contains("Apply changes?"), "output={output}");
-    assert!(
-        !output.contains("sshx connect host picker"),
-        "output={output}"
+    assert!(contains_tui_text(output.as_bytes(), b"Alias: common"), "{output}");
+    assert!(contains_tui_text(output.as_bytes(), b"ID: bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"), "{output}");
+    let source = format!("Source: {}:5", fs::canonicalize(&config).unwrap().display());
+    assert!(contains_tui_text(output.as_bytes(), source.as_bytes()), "{output}");
+    assert_eq!(
+        fs::read_to_string(&config).unwrap(),
+        concat!(
+            "##SSHX ID=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\n",
+            "Host first common\n",
+            "  HostName first.example\n",
+            "##SSHX ID=bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb\n",
+            "Host second renamed\n",
+            "  HostName second.example\n",
+        )
     );
-    let updated = fs::read_to_string(&config).unwrap();
-    assert!(updated.contains("Host first common\n"));
-    assert!(updated.contains("Host renamed common\n"));
-    assert!(updated.contains("##SSHX ID=bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb\n"));
-    assert!(!updated.contains("Host second common\n"));
     fs::remove_dir_all(root).unwrap();
 }
 
