@@ -520,7 +520,28 @@ fn run_pair(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), String> {
             .iter()
             .map(|entry| PathBuf::from(&entry.source.path)),
     );
-    mutation::recover_pair_journals(&journal_paths, &[])?;
+    for path in &mut journal_paths {
+        if let Ok(canonical) = std::fs::canonicalize(&path) {
+            *path = canonical;
+        }
+    }
+    journal_paths.sort();
+    journal_paths.dedup();
+    let pending = mutation::pending_pair_journals(&journal_paths);
+    if !pending.is_empty() && matches!(cli.command, Command::PairSetup { .. }) {
+        let targets = mutation::pair_recovery_targets(&pending)?;
+        if cli.no_input || !io::stdin().is_terminal() || !io::stderr().is_terminal() {
+            return Err("PAIR_RECOVERY_REVIEW_REQUIRED: review pending Pair mutation targets in an interactive terminal before setup".to_string());
+        }
+        eprintln!("Pending Pair mutation affects:");
+        for path in &targets {
+            eprintln!("  {}", path.display());
+        }
+        if !prompt_yes("Recover pending Pair mutation before setup? [y/N]: ")? {
+            return Err("PAIR_RECOVERY_DECLINED: pending Pair mutation was not recovered".to_string());
+        }
+        mutation::recover_pair_journals(&journal_paths, &targets)?;
+    }
     let catalog = discover_with_permission_repair(&configured, cli.no_input)?;
     let diagnostics = sshx::pair::diagnostics(&catalog.entries);
     for diagnostic in &catalog.diagnostics {
@@ -697,21 +718,22 @@ fn run_host_create(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), String> {
     if matches!(cli.command, Command::TuiCreateHost) && !interactive {
         return Err("HOST_CREATE_REQUIRED: tui host create requires usable stdin and stderr terminals".to_string());
     }
+    let candidates = roots
+        .iter()
+        .filter(|root| cli.scopes.first().is_none_or(|scope| root.scope == *scope))
+        .filter(|root| cli.projects.first().is_none_or(|project| root.project.as_ref() == Some(project)))
+        .collect::<Vec<_>>();
     let incomplete = cli.scopes.is_empty()
         || cli.file.is_none()
         || cli.alias.is_none()
-        || cli.hostname.is_none();
+        || cli.hostname.is_none()
+        || candidates.len() > 1;
     if interactive && (incomplete || matches!(cli.command, Command::TuiCreateHost)) {
         return run_host_create_workspace(cli, roots);
     }
     let scope = cli.scopes.first().ok_or_else(|| {
         "SCOPE_REQUIRED: provide --scope in non-interactive mode".to_string()
     })?;
-    let candidates = roots
-        .iter()
-        .filter(|root| root.scope == *scope)
-        .filter(|root| cli.projects.first().is_none_or(|project| root.project.as_ref() == Some(project)))
-        .collect::<Vec<_>>();
     let root = match candidates.as_slice() {
         [root] => *root,
         [] => return Err(format!("ROOT_NOT_FOUND: no registered root matches scope `{scope}`")),
@@ -774,7 +796,7 @@ fn run_host_create_workspace(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), 
     let mut status = None::<String>;
     loop {
         let (edited, selected, action) = picker::host_create_workspace(
-            fields, focus, status.as_deref(), None, cli.preview
+            fields, roots, focus, status.as_deref(), None, cli.preview
         )?;
         fields = edited;
         focus = Some(selected);
@@ -841,7 +863,7 @@ fn run_host_create_workspace(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), 
             Ok(plan) => {
                 let review = render_create(&plan, OutputFormat::Human, false)?;
                 let (edited, selected, action) = picker::host_create_workspace(
-                    fields, focus, None, Some(&review), cli.preview
+                    fields, roots, focus, None, Some(&review), cli.preview
                 )?;
                 fields = edited;
                 focus = Some(selected);
