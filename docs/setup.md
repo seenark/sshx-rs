@@ -68,6 +68,10 @@ Register another scope or project without moving files:
 sshx setup --project payments --root work=~/work/ssh/config
 ```
 
+In Hosts, press **Ctrl+S** for Setup or **Ctrl+D** for Doctor, including when no HostEntries are found. Setup lists registered roots and lets you edit scope (usually personal/work), optional project, and an existing SSH config path. Press **Ctrl+S** to register the displayed root; opening or editing Setup never registers it. Missing paths, directories, and symlinked root files do not register. **Esc** cancels without changing SSH config or root settings.
+
+Partial `sshx setup --scope work --project payments` continues in Setup when no work root is discovered on a usable TTY, with scope and project prefilled and the path focused. Complete root options retain direct CLI behavior, including `--config PATH` with inferred scope. Use `sshx tui setup --config PATH --scope work --project payments` to edit even a complete request before registering. Successful registration returns to Hosts and rediscovers HostEntries from SSH config files. Without usable terminals, with `--no-input`, or with machine output, missing roots produce an actionable CLI error instead of opening Setup.
+
 Check roots, Include diagnostics, permissions, OpenSSH, host-key paths, ports, and runtime state:
 
 ```sh

@@ -524,14 +524,22 @@ fn run_hosts(
         state.active_tunnels = sshx::tunnel::list(home)
             .map(|response| response.tunnels.iter().filter(|tunnel| tunnel.state == "active").count())
             .unwrap_or(0);
+        let mut discovery_error = None;
         let catalog = if missing_default {
-            Catalog {
-                entries: Vec::new(),
-                diagnostics: Vec::new(),
-            }
+            None
         } else {
-            discover_roots(&configured).map_err(|error| error.to_string())?
-        };
+            match discover_roots(&configured) {
+                Ok(catalog) => Some(catalog),
+                Err(error) => {
+                    discovery_error = Some(error.to_string());
+                    None
+                }
+            }
+        }.unwrap_or_else(|| Catalog { entries: Vec::new(), diagnostics: Vec::new() });
+        let discovery_status = discovery_error.map(|error| match status.as_deref() {
+            Some(status) => format!("{status}\n{error}"),
+            None => error,
+        });
         let filtered = filter_entries(&catalog.entries, cli);
         let mut sources = HashMap::new();
         for entry in &filtered {
@@ -539,7 +547,9 @@ fn run_hosts(
                 .entry(entry.source.path.as_str())
                 .or_insert_with(|| std::fs::read(&entry.source.path).ok());
         }
-        let selection = match picker::browse_hosts(&filtered, &catalog.entries, &mut state, status.as_deref()) {
+        let selection = match picker::browse_hosts(
+            &filtered, &catalog.entries, &mut state, discovery_status.as_deref().or(status.as_deref()),
+        ) {
             Ok(selection) => selection,
             Err(action) if action == "HOST_CREATE" => {
                 let mut create = Cli::parse(vec!["host".into(), "create".into()])?;
@@ -563,11 +573,13 @@ fn run_hosts(
             }
             Err(action) if action == "SETUP_TAB" => {
                 status = match run_setup_workspace(cli, home) {
-                    Ok(()) => Some("Config root registered.".to_string()),
+                    Ok(()) => {
+                        roots = settings::load(home)?;
+                        Some("Config root registered.".to_string())
+                    }
                     Err(error) if error == picker::CANCELLED => None,
                     Err(error) => Some(error),
                 };
-                roots = registered_roots(cli)?;
                 continue;
             }
             Err(action) if action == "DOCTOR_TAB" => {
@@ -785,7 +797,7 @@ fn run_tui_operation(cli: &Cli) -> Result<(), String> {
     }
     if matches!(cli.command, Command::Setup) {
         run_setup_workspace(cli, &home)?;
-        return run_hosts(cli, &home, &registered_roots(cli)?, Some("Config root registered.".to_string()));
+        return run_hosts(cli, &home, &settings::load(&home)?, Some("Config root registered.".to_string()));
     }
     if matches!(cli.command, Command::Doctor) {
         let (roots, settings_error) = doctor_roots(cli, &home);

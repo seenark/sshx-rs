@@ -5100,8 +5100,7 @@ fn empty_hosts_setup_registers_selected_config() {
     let original = fs::read(&config).unwrap();
     let mut setup_input = b"\x15".to_vec();
     setup_input.extend_from_slice(config.to_string_lossy().as_bytes());
-    setup_input.extend_from_slice(b"\x13");
-    let (status, output) = run_with_pty_interactions(
+    let (status, output) = run_with_pty_interactions_with_hook(
         &home,
         &[],
         &bin,
@@ -5109,10 +5108,17 @@ fn empty_hosts_setup_registers_selected_config() {
         &[
             (b"No HostEntries", b"\x13"),
             (b"SSH config file path:", &setup_input),
+            (b"_config", b"\x13"),
             (b"Config root registered.", b"\x1b"),
         ],
         None,
         Some((100, 36)),
+        |stage| {
+            if stage == 1 || stage == 2 {
+                assert!(!home.join(".config/sshx/config.json").exists());
+                assert_eq!(fs::read(&config).unwrap(), original);
+            }
+        },
     );
     assert!(status.success(), "status={status:?} output={output}");
     assert_eq!(fs::read(&config).unwrap(), original);
@@ -5236,16 +5242,16 @@ fn partial_setup_prefills_scope_and_project_before_registering() {
 fn explicit_tui_setup_prefills_config_path() {
     let (root, home) = fixture_root();
     let config = home.join("configs/ssh_config");
-    write(&config, "Host personal-host\n  HostName personal.example\n");
+    write(&config, "Host work-host\n  HostName work.example\n");
     let bin = fake_ssh(&root);
     let (status, output) = run_with_pty_interactions(
         &home,
-        &["tui", "setup", "--config", config.to_str().unwrap(), "--project", "demo"],
+        &["tui", "setup", "--config", config.to_str().unwrap(), "--scope", "work", "--project", "demo"],
         &bin,
         &root,
         &[
             (b"SSH config file path:", b"\x13"),
-            (b"Config root registered.", b"\x1b"),
+            (b"work-host", b"\x1b"),
         ],
         None,
         Some((100, 36)),
@@ -5253,6 +5259,7 @@ fn explicit_tui_setup_prefills_config_path() {
     assert!(status.success(), "status={status:?} output={output}");
     let settings = fs::read_to_string(home.join(".config/sshx/config.json")).unwrap();
     let document: serde_json::Value = serde_json::from_str(&settings).unwrap();
+    assert_eq!(document["roots"][0]["scope"], "work");
     assert_eq!(document["roots"][0]["project"], "demo");
     assert_eq!(document["roots"][0]["path"], config.to_str().unwrap());
     fs::remove_dir_all(root).unwrap();
@@ -5416,5 +5423,46 @@ fn empty_hosts_setup_cancel_keeps_explicit_config_available_for_create() {
             .contains("Host saved\n  HostName endpoint.example\n"),
         "{output}"
     );
+    fs::remove_dir_all(root).unwrap();
+}
+
+
+#[cfg(unix)]
+#[test]
+fn setup_registration_stays_open_when_saved_root_is_missing() {
+    let (root, home) = fixture_root();
+    let missing = home.join("missing.conf");
+    let config = home.join("valid.conf");
+    let original = "Host valid\n  HostName valid.example\n";
+    write(&config, original);
+    write(
+        &home.join(".config/sshx/config.json"),
+        &format!(
+            "{{\"version\":1,\"roots\":[{{\"scope\":\"personal\",\"path\":\"{}\",\"project\":null}}]}}\n",
+            missing.display()
+        ),
+    );
+    let bin = fake_ssh(&root);
+    let (status, output) = run_with_pty_interactions(
+        &home,
+        &["tui", "setup", "--personal", config.to_str().unwrap()],
+        &bin,
+        &root,
+        &[
+            (b"SSH config file path:", b"\x13"),
+            (b"Config root registered.", b"\x1b"),
+        ],
+        None,
+        Some((100, 36)),
+    );
+    assert!(status.success(), "status={status:?} output={output}");
+    assert_eq!(fs::read_to_string(&config).unwrap(), original);
+    let settings: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(home.join(".config/sshx/config.json")).unwrap()
+    ).unwrap();
+    assert!(settings["roots"].as_array().unwrap().iter()
+        .any(|root| root["path"] == config.to_str().unwrap()));
+    assert!(!missing.exists());
+    assert!(!root.join("master-started").exists());
     fs::remove_dir_all(root).unwrap();
 }
