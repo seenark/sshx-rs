@@ -3589,6 +3589,46 @@ fn host_rename_picker_preserves_selected_alias_and_identity() {
 
 #[cfg(unix)]
 #[test]
+fn hosts_tui_keeps_mutations_available_for_pair_gateway() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    let original = concat!(
+        "##SSHX ID=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\n",
+        "##SSHX VM=bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb\n",
+        "Host gateway\n",
+        "  HostName gateway.example\n",
+        "  LocalForward 2200 vm.internal:22\n",
+        "##SSHX ID=bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb\n",
+        "##SSHX GATEWAY=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\n",
+        "##SSHX TRANSIT=vm.internal:22\n",
+        "Host vm\n",
+        "  HostName vm.internal\n",
+        "  Port 22\n",
+    );
+    write(&config, original);
+    let bin = root.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let (status, output) = run_with_pty_interactions(
+        &home,
+        &["--config", config.to_str().unwrap(), "tui"],
+        &bin,
+        &root,
+        &[
+            (b"Search:", b"gateway\x15"),
+            (b"Alias [keep]: gateway", b"\x1b"),
+            (b"HostEntry edit cancelled.", b"\x1b"),
+        ],
+        None,
+        Some((100, 40)),
+    );
+    assert!(status.success(), "status={status:?} output={output}");
+    assert!(!output.contains("PAIR_BROKEN"), "{output}");
+    assert_eq!(fs::read_to_string(&config).unwrap(), original);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
 fn pair_setup_picker_selects_gateway_and_vm_alias_rows() {
     let (root, home) = fixture_root();
     let config = home.join(".ssh/config");
