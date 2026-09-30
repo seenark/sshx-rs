@@ -13,6 +13,21 @@ use std::ffi::OsString;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{self, Stdio};
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TunnelRoute {
+    Direct,
+    Paired,
+}
+
+impl TunnelRoute {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Paired => "paired",
+        }
+    }
+}
+
 
 fn main() {
     match run(env::args_os().skip(1).collect()) {
@@ -211,7 +226,7 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
         _ => {}
     }
     let roots = registered_roots(&cli)?;
-    if matches!(&cli.command, Command::CreateHost) {
+    if matches!(&cli.command, Command::CreateHost | Command::TuiCreateHost) {
         return run_host_create(&cli, &roots);
     }
     if matches!(
@@ -395,6 +410,7 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
         Command::Setup
         | Command::Doctor
         | Command::CreateHost
+        | Command::TuiCreateHost
         | Command::UpdateHost(_)
         | Command::RenameHost(_)
         | Command::DeleteHost(_)
@@ -504,7 +520,7 @@ fn run_pair(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), String> {
             .iter()
             .map(|entry| PathBuf::from(&entry.source.path)),
     );
-    mutation::recover_pair_journals(&journal_paths)?;
+    mutation::recover_pair_journals(&journal_paths, &[])?;
     let catalog = discover_with_permission_repair(&configured, cli.no_input)?;
     let diagnostics = sshx::pair::diagnostics(&catalog.entries);
     for diagnostic in &catalog.diagnostics {
@@ -661,123 +677,59 @@ fn select_pair_entry<'a>(
 }
 
 fn run_host_create(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), String> {
-    let interactive = !cli.no_input && io::stdin().is_terminal();
     if cli.scopes.len() > 1 {
         return Err("SCOPE_AMBIGUOUS: provide one --scope".to_string());
     }
     if cli.projects.len() > 1 {
         return Err("PROJECT_AMBIGUOUS: provide one --project".to_string());
     }
-    let scope = if let Some(scope) = cli.scopes.first() {
-        scope.clone()
-    } else if interactive {
-        let mut scopes = roots
-            .iter()
-            .map(|root| root.scope.as_str())
-            .collect::<Vec<_>>();
-        scopes.sort_unstable();
-        scopes.dedup();
-        eprintln!("Scopes:");
-        for (index, scope) in scopes.iter().enumerate() {
-            eprintln!("  {}. {scope}", index + 1);
-        }
-        prompt_value("Scope: ", None)?
-            .ok_or_else(|| "SCOPE_REQUIRED: scope cannot be empty".to_string())?
-    } else {
-        return Err("SCOPE_REQUIRED: provide --scope in non-interactive mode".to_string());
-    };
-    let requested_project = cli.projects.first().cloned();
-    let mut candidates = roots
-        .iter()
-        .filter(|root| root.scope == scope)
-        .filter(|root| {
-            requested_project
-                .as_deref()
-                .is_none_or(|project| root.project.as_deref() == Some(project))
-        })
-        .collect::<Vec<_>>();
-    if candidates.is_empty() {
-        return Err(format!(
-            "ROOT_NOT_FOUND: no registered root matches scope `{scope}`{}",
-            requested_project
-                .as_deref()
-                .map(|project| format!(" and project `{project}`"))
-                .unwrap_or_default()
-        ));
+    if cli.config.is_some()
+        && let (Some(scope), Some(root)) = (cli.scopes.first(), roots.first())
+        && scope != &root.scope
+    {
+        return Err("SCOPE_ROOT_CONFLICT: --scope does not match --config".to_string());
     }
-    let root = if candidates.len() == 1 {
-        candidates.remove(0)
-    } else if interactive {
-        eprintln!("Config roots:");
-        for (index, root) in candidates.iter().enumerate() {
-            eprintln!(
-                "  {}. {}{}",
-                index + 1,
-                root.path.display(),
-                root.project
-                    .as_deref()
-                    .map(|project| format!(" ({project})"))
-                    .unwrap_or_default()
-            );
-        }
-        let choice = prompt_value("Root number: ", None)?
-            .ok_or_else(|| "ROOT_REQUIRED: select one config root".to_string())?
-            .parse::<usize>()
-            .map_err(|_| "ROOT_REQUIRED: root choice must be a number".to_string())?;
-        *candidates
-            .get(choice.saturating_sub(1))
-            .ok_or_else(|| "ROOT_REQUIRED: root choice is out of range".to_string())?
-    } else {
-        return Err("ROOT_AMBIGUOUS: provide --project or one registered root".to_string());
+    let interactive = !cli.no_input
+        && !cli.format.is_machine()
+        && io::stdin().is_terminal()
+        && io::stderr().is_terminal()
+        && !cli.password_stdin;
+    if matches!(cli.command, Command::TuiCreateHost) && !interactive {
+        return Err("HOST_CREATE_REQUIRED: tui host create requires usable stdin and stderr terminals".to_string());
+    }
+    let incomplete = cli.scopes.is_empty()
+        || cli.file.is_none()
+        || cli.alias.is_none()
+        || cli.hostname.is_none();
+    if interactive && (incomplete || matches!(cli.command, Command::TuiCreateHost)) {
+        return run_host_create_workspace(cli, roots);
+    }
+    let scope = cli.scopes.first().ok_or_else(|| {
+        "SCOPE_REQUIRED: provide --scope in non-interactive mode".to_string()
+    })?;
+    let candidates = roots
+        .iter()
+        .filter(|root| root.scope == *scope)
+        .filter(|root| cli.projects.first().is_none_or(|project| root.project.as_ref() == Some(project)))
+        .collect::<Vec<_>>();
+    let root = match candidates.as_slice() {
+        [root] => *root,
+        [] => return Err(format!("ROOT_NOT_FOUND: no registered root matches scope `{scope}`")),
+        _ => return Err("ROOT_AMBIGUOUS: provide --project or one registered root".to_string()),
     };
-    let root_parent = root
-        .path
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."));
-    let folder_text = match &cli.folder {
-        Some(folder) => folder.to_string_lossy().into_owned(),
-        None if interactive => prompt_value(
-            &format!("Folder [{}]: ", root_parent.display()),
-            Some(root_parent.to_string_lossy().into_owned()),
-        )?
-        .ok_or_else(|| "FOLDER_REQUIRED: folder cannot be empty".to_string())?,
-        None => root_parent.to_string_lossy().into_owned(),
-    };
-    let folder = resolve_relative_path(&folder_text, root_parent);
-    let file_text = match &cli.file {
-        Some(file) => file.to_string_lossy().into_owned(),
-        None if interactive => prompt_value("File: ", None)?
-            .ok_or_else(|| "FILE_REQUIRED: provide a target file".to_string())?,
-        None => {
-            return Err("FILE_REQUIRED: provide --file in non-interactive mode".to_string());
-        }
-    };
-    let target = resolve_relative_path(&file_text, &folder);
-    let alias = required_create_value(cli.alias.as_deref(), "Alias", interactive)?;
-    let hostname = required_create_value(cli.hostname.as_deref(), "Hostname", interactive)?;
-    let user = optional_create_value(cli.user.as_deref(), "User", interactive)?;
-    let port = match cli.port {
-        Some(port) => Some(port),
-        None if interactive => optional_create_value(None, "Port", true)?
-            .filter(|value| !value.is_empty())
-            .map(|value| {
-                value
-                    .parse::<u16>()
-                    .map_err(|_| "PORT_INVALID: port must be a number".to_string())
-            })
-            .transpose()?,
-        None => None,
-    };
-    let password = create_password(cli, interactive)?;
-    let request = CreateRequest::new(
-        root.path.clone(),
-        target,
-        alias,
-        hostname,
-        user,
-        port,
-        password,
+    let root_parent = root.path.parent().unwrap_or(Path::new("."));
+    let folder = cli.folder.as_ref().map_or_else(
+        || root_parent.to_path_buf(),
+        |path| resolve_relative_path(&path.to_string_lossy(), root_parent),
     );
+    let target = resolve_relative_path(
+        &cli.file.as_ref().ok_or_else(|| "FILE_REQUIRED: provide --file in non-interactive mode".to_string())?.to_string_lossy(),
+        &folder,
+    );
+    let alias = required_create_value(cli.alias.as_deref(), "Alias")?;
+    let hostname = required_create_value(cli.hostname.as_deref(), "Hostname")?;
+    let password = create_password(cli)?;
+    let request = CreateRequest::new(root.path.clone(), target, alias, hostname, cli.user.clone(), cli.port, password);
     let plan = mutation::plan_create(&request)?;
     if cli.preview {
         print!("{}", render_create(&plan, cli.format, false)?);
@@ -795,6 +747,124 @@ fn run_host_create(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), String> {
     mutation::apply(&plan)?;
     print!("{}", render_create(&plan, cli.format, true)?);
     Ok(())
+}
+
+fn run_host_create_workspace(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), String> {
+    let matching = roots.iter().filter(|root| {
+        cli.scopes.first().is_none_or(|scope| root.scope == *scope)
+            && cli.projects.first().is_none_or(|project| root.project.as_ref() == Some(project))
+    }).collect::<Vec<_>>();
+    let selected_root = if matching.len() == 1 { Some(matching[0]) } else { None };
+    let mut fields = [
+        selected_root.map_or_else(String::new, |root| root.path.to_string_lossy().into_owned()),
+        cli.scopes.first().cloned().or_else(|| selected_root.map(|root| root.scope.clone())).unwrap_or_default(),
+        cli.projects.first().cloned().or_else(|| selected_root.and_then(|root| root.project.clone())).unwrap_or_default(),
+        cli.folder.as_ref().map_or_else(
+            || selected_root.and_then(|root| root.path.parent()).map_or_else(String::new, |path| path.to_string_lossy().into_owned()),
+            |path| path.to_string_lossy().into_owned(),
+        ),
+        cli.file.as_ref().map_or_else(String::new, |path| path.to_string_lossy().into_owned()),
+        cli.alias.clone().unwrap_or_default(),
+        cli.hostname.clone().unwrap_or_default(),
+        cli.user.clone().unwrap_or_default(),
+        cli.port.map_or_else(String::new, |port| port.to_string()),
+        String::new(),
+    ];
+    let mut focus = None;
+    let mut status = None::<String>;
+    loop {
+        let (edited, selected, action) = picker::host_create_workspace(
+            fields, focus, status.as_deref(), None, cli.preview
+        )?;
+        fields = edited;
+        focus = Some(selected);
+        if action != picker::HostCreateAction::Submit {
+            continue;
+        }
+        let result = (|| {
+            let root_input = fields[0].trim();
+            let root = if root_input.is_empty() {
+                return Err("CONFIG_ROOT_REQUIRED: select a registered config root".to_string());
+            } else {
+                let matches = roots.iter().filter(|root| {
+                    root.path.to_string_lossy() == root_input
+                        || root.path.file_name().is_some_and(|name| name == root_input)
+                }).collect::<Vec<_>>();
+                match matches.as_slice() {
+                    [root] => *root,
+                    [] => return Err("ROOT_NOT_FOUND: select an existing registered config root".to_string()),
+                    _ => return Err("CONFIG_ROOT_AMBIGUOUS: enter the full config root path".to_string()),
+                }
+            };
+            if fields[1].trim().is_empty() {
+                return Err("SCOPE_REQUIRED: select the config root scope".to_string());
+            }
+            if fields[1].trim() != root.scope {
+                return Err("SCOPE_ROOT_CONFLICT: scope does not match selected config root".to_string());
+            }
+            if fields[2].trim() != root.project.as_deref().unwrap_or("") {
+                return Err("PROJECT_ROOT_CONFLICT: project does not match selected config root".to_string());
+            }
+            if fields[4].trim().is_empty() {
+                return Err("FILE_REQUIRED: enter a destination file".to_string());
+            }
+            if fields[5].trim().is_empty() {
+                return Err("ALIAS_REQUIRED: enter an alias".to_string());
+            }
+            if fields[6].trim().is_empty() {
+                return Err("HOSTNAME_REQUIRED: enter a host destination".to_string());
+            }
+            let port = if fields[8].trim().is_empty() {
+                None
+            } else {
+                Some(fields[8].trim().parse::<u16>().ok().filter(|port| *port != 0)
+                    .ok_or_else(|| "PORT_INVALID: enter a port from 1 to 65535".to_string())?)
+            };
+            let folder = if fields[3].trim().is_empty() {
+                root.path.parent().unwrap_or(Path::new(".")).to_path_buf()
+            } else {
+                resolve_relative_path(fields[3].trim(), root.path.parent().unwrap_or(Path::new(".")))
+            };
+            let request = CreateRequest::new(
+                root.path.clone(),
+                resolve_relative_path(fields[4].trim(), &folder),
+                fields[5].trim().to_string(),
+                fields[6].trim().to_string(),
+                (!fields[7].trim().is_empty()).then(|| fields[7].trim().to_string()),
+                port,
+                (!fields[9].is_empty()).then(|| fields[9].clone()),
+            );
+            mutation::plan_create(&request)
+        })();
+        match result {
+            Err(error) => status = Some(error),
+            Ok(plan) => {
+                let review = render_create(&plan, OutputFormat::Human, false)?;
+                let (edited, selected, action) = picker::host_create_workspace(
+                    fields, focus, None, Some(&review), cli.preview
+                )?;
+                fields = edited;
+                focus = Some(selected);
+                match action {
+                    picker::HostCreateAction::PreviewComplete => {
+                        print!("{review}");
+                        return Ok(());
+                    }
+                    picker::HostCreateAction::Apply => {
+                        match mutation::apply(&plan) {
+                            Ok(()) => {
+                                print!("{}", render_create(&plan, cli.format, true)?);
+                                return Ok(());
+                            }
+                            Err(error) => status = Some(error),
+                        }
+                    }
+                    picker::HostCreateAction::Edit => status = None,
+                    picker::HostCreateAction::Submit => {}
+                }
+            }
+        }
+    }
 }
 
 fn run_host_edit(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), String> {
@@ -860,7 +930,7 @@ fn run_host_edit(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), String> {
         }
         MutationKind::Update | MutationKind::Rename => {
             let password = if cli.password_stdin {
-                create_password(cli, false)?
+                create_password(cli)?
                     .ok_or_else(|| "PASSWORD_REQUIRED: password input is empty".to_string())?
             } else {
                 String::new()
@@ -1005,44 +1075,16 @@ fn has_active_reference(text: &str, id: &str) -> bool {
             || lower.contains("\"state\":\"starting\"")
             || lower.contains("\"state\":\"stopping\""))
 }
-fn required_create_value(
-    value: Option<&str>,
-    label: &str,
-    interactive: bool,
-) -> Result<String, String> {
-    if let Some(value) = value {
-        return Ok(value.to_string());
-    }
-    if !interactive {
-        return Err(format!(
-            "{}_REQUIRED: provide --{} in non-interactive mode",
-            label.to_ascii_uppercase(),
-            label.to_ascii_lowercase()
-        ));
-    }
-    prompt_value(&format!("{label}: "), None)?.ok_or_else(|| {
-        format!(
-            "{}_REQUIRED: value cannot be empty",
-            label.to_ascii_uppercase()
-        )
-    })
+fn required_create_value(value: Option<&str>, label: &str) -> Result<String, String> {
+    value.map(str::to_owned).ok_or_else(|| format!(
+        "{}_REQUIRED: provide --{} in non-interactive mode",
+        label.to_ascii_uppercase(),
+        label.to_ascii_lowercase()
+    ))
 }
 
-fn optional_create_value(
-    value: Option<&str>,
-    label: &str,
-    interactive: bool,
-) -> Result<Option<String>, String> {
-    if let Some(value) = value {
-        return Ok(Some(value.to_string()));
-    }
-    if !interactive {
-        return Ok(None);
-    }
-    prompt_value(&format!("{label} [optional]: "), Some(String::new()))
-}
 
-fn create_password(cli: &Cli, interactive: bool) -> Result<Option<String>, String> {
+fn create_password(cli: &Cli) -> Result<Option<String>, String> {
     if cli.password_stdin {
         if io::stdin().is_terminal() {
             return Err("PASSWORD_STDIN: password input must come from a pipe".to_string());
@@ -1054,51 +1096,9 @@ fn create_password(cli: &Cli, interactive: bool) -> Result<Option<String>, Strin
         let password = password.trim_end_matches(['\r', '\n']).to_string();
         return Ok((!password.is_empty()).then_some(password));
     }
-    if interactive {
-        prompt_password()
-    } else {
-        Ok(None)
-    }
+    Ok(None)
 }
 
-#[cfg(unix)]
-fn prompt_password() -> Result<Option<String>, String> {
-    use std::mem::MaybeUninit;
-    use std::os::fd::AsRawFd;
-
-    eprint!("Password [optional]: ");
-    io::stderr()
-        .flush()
-        .map_err(|error| format!("cannot flush prompt: {error}"))?;
-    let fd = io::stdin().as_raw_fd();
-    let mut original = MaybeUninit::uninit();
-    let hidden = unsafe {
-        if libc::tcgetattr(fd, original.as_mut_ptr()) != 0 {
-            return prompt_value("", Some(String::new()));
-        }
-        let original = original.assume_init();
-        let mut hidden = original;
-        hidden.c_lflag &= !libc::ECHO;
-        if libc::tcsetattr(fd, libc::TCSANOW, &hidden) != 0 {
-            return prompt_value("", Some(String::new()));
-        }
-        (original, hidden)
-    };
-    let mut value = String::new();
-    let read_result = io::stdin().read_line(&mut value);
-    unsafe {
-        let _ = libc::tcsetattr(fd, libc::TCSANOW, &hidden.0);
-    }
-    eprintln!();
-    read_result.map_err(|error| format!("cannot read password: {error}"))?;
-    let value = value.trim().to_string();
-    Ok((!value.is_empty()).then_some(value))
-}
-
-#[cfg(not(unix))]
-fn prompt_password() -> Result<Option<String>, String> {
-    prompt_value("Password [optional]: ", Some(String::new()))
-}
 
 fn prompt_value(prompt: &str, default: Option<String>) -> Result<Option<String>, String> {
     eprint!("{prompt}");
@@ -1575,12 +1575,12 @@ fn choose_host_action(entry: &HostEntry, entries: &[HostEntry]) -> Result<HostAc
     }
     let labels = actions
         .iter()
-        .map(|action| match action {
+        .map(|action| picker::MenuOption::new(match action {
             HostAction::Connect => "Connect",
             HostAction::CopySsh => "Copy SSH",
             HostAction::CopySshx => "Copy sshx",
             HostAction::CopyPassword => "Copy password",
-        })
+        }, ""))
         .collect::<Vec<_>>();
     let choice = picker::select_menu(&labels, "host action menu")?;
     actions
@@ -1988,6 +1988,7 @@ enum Command {
     Show(String),
     Connect(Option<String>),
     CreateHost,
+    TuiCreateHost,
     UpdateHost(Option<String>),
     RenameHost(Option<String>),
     DeleteHost(Option<String>),
@@ -2113,6 +2114,7 @@ impl Cli {
                 index += 1;
                 args.get(index)
                     .and_then(|argument| argument.to_str())
+                    .filter(|value| !value.starts_with('-'))
                     .map(str::to_owned)
                     .ok_or_else(|| format!("{name} requires a value"))
             };
@@ -2334,6 +2336,9 @@ impl Cli {
                 return Err("host show requires a selector".to_string());
             }
             [host, create] if host == "host" && create == "create" => Command::CreateHost,
+            [tui, host, create] if tui == "tui" && host == "host" && create == "create" => {
+                Command::TuiCreateHost
+            }
             [host, update, selector] if host == "host" && update == "update" => {
                 Command::UpdateHost(Some(selector.clone()))
             }
@@ -2469,7 +2474,7 @@ impl Cli {
             Command::Connect(selector) => {
                 Command::Connect(selector.or(host).or_else(|| alias.clone()))
             }
-            Command::CreateHost => {
+            Command::CreateHost | Command::TuiCreateHost => {
                 if host.is_some()
                     || id.is_some()
                     || location.source.is_some()
@@ -2479,7 +2484,7 @@ impl Cli {
                         "SELECTOR_CONFLICT: host create does not accept host selectors".to_string(),
                     );
                 }
-                Command::CreateHost
+                command
             }
             Command::UpdateHost(selector) => {
                 if host.is_some() && selector.is_some() {
