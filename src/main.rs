@@ -8,6 +8,7 @@ use sshx::output::{
     render_machine, render_pair, render_pairs, render_repairs, render_tunnels,
 };
 use sshx::settings::{self, RegisteredRoot};
+use std::collections::HashMap;
 use std::env;
 use std::ffi::OsString;
 use std::io::{self, IsTerminal, Read, Write};
@@ -160,7 +161,7 @@ fn nearest_usage(positional: &[String]) -> &'static str {
 }
 
 fn run(args: Vec<OsString>) -> Result<(), String> {
-    if args.is_empty() {
+    if args.is_empty() && (!io::stdin().is_terminal() || !io::stderr().is_terminal()) {
         println!("{}", help::render(&[])?);
         return Ok(());
     }
@@ -182,6 +183,22 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
             format!("{error}\n{}", nearest_usage_for_args(&args))
         }
     })?;
+    if let Command::Hosts { explicit } = cli.command {
+        if cli.no_input
+            || cli.format.is_machine()
+            || !io::stdin().is_terminal()
+            || !io::stderr().is_terminal()
+        {
+            if explicit {
+                return Err("TUI_REQUIRED: sshx tui requires usable stdin and stderr terminals without --no-input or machine output".to_string());
+            }
+            println!("{}", help::render(&[])?);
+            return Ok(());
+        }
+        let home = home_dir()?;
+        let roots = registered_roots(&cli)?;
+        return run_hosts(&cli, &home, &roots);
+    }
     if cli.action.is_some() && cli.format.is_machine() {
         return Err(
             "ACTION_FORMAT_CONFLICT: --action cannot be combined with JSON or YAML output"
@@ -407,7 +424,8 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
             print!("{}", render_tunnels(&response, cli.format)?);
             Ok(())
         }
-        Command::Setup
+        Command::Hosts { .. }
+        | Command::Setup
         | Command::Doctor
         | Command::CreateHost
         | Command::TuiCreateHost
@@ -420,6 +438,67 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
         | Command::TunnelList
         | Command::TunnelStatus(_)
         | Command::TunnelStop(_) => unreachable!(),
+    }
+}
+
+fn run_hosts(cli: &Cli, home: &Path, roots: &[RegisteredRoot]) -> Result<(), String> {
+    let configured = settings::discovery_roots(roots);
+    let mut state = picker::HostsState::default();
+    let mut status = None;
+    loop {
+        let catalog = discover_roots(&configured).map_err(|error| error.to_string())?;
+        let filtered = filter_entries(&catalog.entries, cli);
+        let mut sources = HashMap::new();
+        for entry in &filtered {
+            sources
+                .entry(entry.source.path.as_str())
+                .or_insert_with(|| std::fs::read(&entry.source.path).ok());
+        }
+        let Some(selection) =
+            picker::browse_hosts(&filtered, &catalog.entries, &mut state, status.as_deref())?
+        else {
+            return Ok(());
+        };
+        let entry = selection.entry;
+        let alias = selection.alias;
+        let unchanged = sources
+            .get(entry.source.path.as_str())
+            .and_then(Option::as_ref)
+            .is_some_and(|before| {
+                std::fs::read(&entry.source.path).is_ok_and(|after| after == *before)
+            });
+        if !unchanged {
+            status = Some(format!(
+                "HOST_SOURCE_CHANGED: {} changed; select its current HostEntry again",
+                entry.source.path
+            ));
+            continue;
+        }
+        if catalog
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "unsupported_match")
+        {
+            status =
+                Some("UNSUPPORTED_MATCH: Match prevents exact runtime configuration".to_string());
+            continue;
+        }
+        match sshx::pair::paired_route(&catalog.entries, entry) {
+            Ok(Some(_)) => {
+                status =
+                    Some("PAIR_REQUIRED: this HostEntry uses a Pair route, not a direct Session".to_string());
+                continue;
+            }
+            Err(error) => {
+                status = Some(error);
+                continue;
+            }
+            Ok(None) => {}
+        }
+        status = Some(match sshx::connect::open(entry, home, false, alias) {
+            Ok(()) => "Session ended.".to_string(),
+            Err(error) => error,
+        });
     }
 }
 
@@ -2007,6 +2086,7 @@ struct ConfigRootChoice {
 #[derive(Debug)]
 enum Command {
     List,
+    Hosts { explicit: bool },
     Show(String),
     Connect(Option<String>),
     CreateHost,
@@ -2350,6 +2430,8 @@ impl Cli {
         }
 
         let command = match positional.as_slice() {
+            [] => Command::Hosts { explicit: false },
+            [tui] if tui == "tui" => Command::Hosts { explicit: true },
             [host, list] if host == "host" && list == "list" => Command::List,
             [host, show, selector] if host == "host" && show == "show" => {
                 Command::Show(selector.clone())
