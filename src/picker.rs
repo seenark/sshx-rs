@@ -304,9 +304,9 @@ pub fn browse_hosts<'a>(
             let mut footer = hosts_footer(width, !rows.is_empty(), state.active_tunnels);
             if state.editing_enabled && !rows.is_empty() {
                 footer.push_str(if width < 48 {
-                    "\n^U Update · ^R Rename"
+                    "\n^U Update · ^R Rename · ^X Delete"
                 } else {
-                    "\nCtrl+U Update · Ctrl+R Rename"
+                    "\nCtrl+U Update · Ctrl+R Rename · Ctrl+X Delete"
                 });
             }
             let scroll_step = terminal.backend().size().map_or(1, |area| {
@@ -345,15 +345,15 @@ pub fn browse_hosts<'a>(
                     }
                 }
                 KeyEvent {
-                    code: KeyCode::Char(character @ ('u' | 'r')),
+                    code: KeyCode::Char(character @ ('u' | 'r' | 'x')),
                     modifiers,
                     ..
                 } if state.editing_enabled && modifiers.contains(KeyModifiers::CONTROL) => {
                     if let Some(row) = rows.get(selected) {
-                        state.edit_action = Some(if character == 'u' {
-                            sshx::mutation::MutationKind::Update
-                        } else {
-                            sshx::mutation::MutationKind::Rename
+                        state.edit_action = Some(match character {
+                            'u' => sshx::mutation::MutationKind::Update,
+                            'r' => sshx::mutation::MutationKind::Rename,
+                            _ => sshx::mutation::MutationKind::Delete,
                         });
                         return Ok(Some(Selection { entry: row.entry, alias: row.alias }));
                     }

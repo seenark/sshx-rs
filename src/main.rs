@@ -206,7 +206,7 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
         );
     }
     validate_connect_without_catalog(&cli)?;
-    if matches!(cli.command, Command::UpdateHost(_) | Command::RenameHost(_)) {
+    if matches!(cli.command, Command::UpdateHost(_) | Command::RenameHost(_) | Command::DeleteHost(_)) {
         return run_host_edit(&cli, &registered_roots(&cli)?);
     }
     if cli.tui {
@@ -606,7 +606,11 @@ fn run_hosts(cli: &Cli, home: &Path, roots: &[RegisteredRoot]) -> Result<(), Str
                 .ok_or_else(|| "HOST_SOURCE_CHANGED: source is unavailable; select again".to_string())?;
             let alias_index = entry.aliases.iter().position(|value| value == alias).unwrap_or(0);
             status = match mutation::validate_mutation_roots(&configured)
-                .and_then(|()| run_host_edit_workspace(cli, entry, alias, operation, before)) {
+                .and_then(|()| if operation == MutationKind::Delete {
+                    run_host_delete_workspace(cli, home, &configured, entry, alias, before)
+                } else {
+                    run_host_edit_workspace(cli, entry, alias, operation, before)
+                }) {
                 Ok(()) => {
                     if let Ok(updated) = discover_roots(&configured)
                         && let Some(updated) = updated.entries.iter().find(|updated| {
@@ -621,11 +625,17 @@ fn run_hosts(cli: &Cli, home: &Path, roots: &[RegisteredRoot]) -> Result<(), Str
                         "HostEntry preview complete.".to_string()
                     } else if operation == MutationKind::Rename {
                         "HostEntry renamed.".to_string()
+                    } else if operation == MutationKind::Delete {
+                        "HostEntry deleted.".to_string()
                     } else {
                         "HostEntry updated.".to_string()
                     })
                 }
-                Err(error) if error == picker::CANCELLED => Some("HostEntry edit cancelled.".to_string()),
+                Err(error) if error == picker::CANCELLED => Some(if operation == MutationKind::Delete {
+                    "HostEntry deletion cancelled.".to_string()
+                } else {
+                    "HostEntry edit cancelled.".to_string()
+                }),
                 Err(error) => Some(error),
             };
             continue;
@@ -1488,14 +1498,13 @@ fn run_host_edit(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), String> {
     {
         mutation::validate_update_request(&request)?;
     }
-    let incomplete = operation != MutationKind::Delete
-        && (positional.is_none() && cli.id.is_none()
-            || cli.alias.is_none() && cli.hostname.is_none() && cli.user.is_none()
-                && cli.port.is_none() && !cli.password_stdin
-                && !cli.clear_user && !cli.clear_port && !cli.clear_password);
-    let workspace = operation != MutationKind::Delete && (cli.tui
+    let incomplete = positional.is_none() && cli.id.is_none()
+        || operation != MutationKind::Delete && cli.alias.is_none() && cli.hostname.is_none()
+            && cli.user.is_none() && cli.port.is_none() && !cli.password_stdin
+            && !cli.clear_user && !cli.clear_port && !cli.clear_password;
+    let workspace = cli.tui
         || incomplete && !cli.no_input && !cli.format.is_machine() && !cli.password_stdin
-            && io::stdin().is_terminal() && io::stderr().is_terminal());
+            && io::stdin().is_terminal() && io::stderr().is_terminal();
     let exact_selection = if cli.tui && (positional.is_some() || cli.id.is_some()) {
         Some(select_mutation_entry(&filtered, positional, cli, "host edit")?)
     } else {
@@ -1536,7 +1545,11 @@ fn run_host_edit(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), String> {
         let before = sources.get(entry.source.path.as_str()).ok_or_else(|| {
             "HOST_SOURCE_CHANGED: selected source is unavailable; select its current HostEntry again".to_string()
         })?;
-        return run_host_edit_workspace(cli, entry, selected_alias, operation, before);
+        return if operation == MutationKind::Delete {
+            run_host_delete_workspace(cli, &home_dir()?, &configured, entry, selected_alias, before)
+        } else {
+            run_host_edit_workspace(cli, entry, selected_alias, operation, before)
+        };
     }
     let home = home_dir()?;
     let plan = match operation {
@@ -1586,6 +1599,72 @@ fn run_host_edit(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), String> {
     print!("{}", render_edit(&plan, cli.format, true)?);
     Ok(())
 }
+fn run_host_delete_workspace(
+    cli: &Cli, home: &Path, roots: &[DiscoveryRoot], entry: &HostEntry, alias: &str, before: &[u8],
+) -> Result<(), String> {
+    let current_catalog = || {
+        mutation::validate_mutation_roots(roots)?;
+        mutation::validate_entry_paths(entry)?;
+        if !std::fs::read(&entry.source.path).is_ok_and(|bytes| bytes == before) {
+            return Err(format!(
+                "HOST_SOURCE_CHANGED: {} changed; select its current HostEntry again",
+                entry.source.path
+            ));
+        }
+        discover_roots(roots).map_err(|error| error.to_string())
+    };
+    let catalog = current_catalog()?;
+    let plan = mutation::plan_delete(
+        Path::new(&entry.source.path), &entry.id, alias,
+        entry.source.byte_start, entry.source.byte_end,
+    )?;
+    let mut review = format!(
+        "ID: {}\nAlias: {alias}\nSource: {}:{}\nSpan: {}..{}\nDelete this exact HostEntry block.\n{}",
+        entry.id, entry.source.path, entry.source.line_start,
+        entry.source.byte_start, entry.source.byte_end,
+        render_edit(&plan, OutputFormat::Human, false)?
+    );
+    for pair in sshx::pair::records(&catalog.entries).iter().filter(|pair| {
+        pair.gateway_id == entry.id || pair.vm_id == entry.id
+    }) {
+        let gateway = catalog.entries.iter().find(|entry| entry.id == pair.gateway_id);
+        let vm = catalog.entries.iter().find(|entry| entry.id == pair.vm_id);
+        if let (Some(gateway), Some(vm)) = (gateway, vm) {
+            review.push_str(&format!(
+                "\nPair gateway: {} ({}) at {}:{}\nPair VM: {} ({}) at {}:{}\nTransit: {}:{}\n",
+                pair.gateway_alias, pair.gateway_id, gateway.source.path, gateway.source.line_start,
+                pair.vm_alias, pair.vm_id, vm.source.path, vm.source.line_start,
+                pair.transit_host, pair.transit_port,
+            ));
+        }
+    }
+    let safety = |catalog: &Catalog| {
+        if let Some(error) = sshx::pair::deletion_reference(entry, &catalog.entries) {
+            return Err(error);
+        }
+        ensure_delete_allowed(home, entry)
+    };
+    let blocker = safety(&catalog).err();
+    if let Some(error) = &blocker { review.push_str(&format!("\n{error}\n")); }
+    let mode = if blocker.is_some() {
+        picker::MutationReviewMode::Blocked
+    } else if cli.preview {
+        picker::MutationReviewMode::PreviewOnly
+    } else {
+        picker::MutationReviewMode::Delete
+    };
+    let action = picker::mutation_review_workspace(&review, mode)?;
+    if let Some(error) = blocker { return Err(error); }
+    safety(&current_catalog()?)?;
+    if action == picker::MutationReviewAction::Apply {
+        mutation::apply_edit(&plan)?;
+        print!("{}", render_edit(&plan, cli.format, true)?);
+    } else {
+        print!("{review}");
+    }
+    Ok(())
+}
+
 fn run_host_edit_workspace(
     cli: &Cli, entry: &HostEntry, alias: &str, operation: MutationKind, before: &[u8],
 ) -> Result<(), String> {
@@ -1722,10 +1801,30 @@ fn ensure_delete_allowed(home: &std::path::Path, entry: &HostEntry) -> Result<()
         .map(PathBuf::from)
         .collect::<Vec<_>>();
     let metadata_root = home.join(".config/sshx");
+    let registry_path = metadata_root.join("tunnels/registry.json");
+    match std::fs::symlink_metadata(&registry_path) {
+        Ok(metadata) => {
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                return Err(format!("DELETE_REGISTRY_INVALID: unsafe registry {}", registry_path.display()));
+            }
+            let bytes = std::fs::read(&registry_path).map_err(|error| {
+                format!("DELETE_REGISTRY_INVALID: cannot read {}: {error}", registry_path.display())
+            })?;
+            if has_active_reference(&bytes, id).map_err(|error| {
+                format!("DELETE_REGISTRY_INVALID: {}: {error}", registry_path.display())
+            })? {
+                return Err(format!("DELETE_ACTIVE: entry {id} has active managed use in {}",
+                    registry_path.display()));
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("DELETE_REGISTRY_INVALID: {}: {error}", registry_path.display())),
+    }
     collect_regular_files(&metadata_root, &mut paths);
     paths.sort();
     paths.dedup();
     for path in paths {
+        if path == registry_path { continue; }
         let Ok(bytes) = std::fs::read(&path) else {
             continue;
         };
@@ -1733,13 +1832,6 @@ fn ensure_delete_allowed(home: &std::path::Path, entry: &HostEntry) -> Result<()
         if has_pair_reference(&text, id) {
             return Err(format!(
                 "DELETE_REFERENCED: entry {} is referenced by {}",
-                id,
-                path.display()
-            ));
-        }
-        if path.starts_with(&metadata_root) && has_active_reference(&text, id) {
-            return Err(format!(
-                "DELETE_ACTIVE: entry {} has active managed use in {}",
                 id,
                 path.display()
             ));
@@ -1782,15 +1874,33 @@ fn has_pair_reference(text: &str, id: &str) -> bool {
         || normalized.contains(&format!("vm_id\":\"{id}\""))
 }
 
-fn has_active_reference(text: &str, id: &str) -> bool {
-    let lower = text.to_ascii_lowercase().replace(char::is_whitespace, "");
-    let id = id.to_ascii_lowercase();
-    (lower.contains(&format!("\"entry_id\":\"{id}\""))
-        || lower.contains(&format!("\"gateway_entry_id\":\"{id}\""))
-        || lower.contains(&format!("\"vm_entry_id\":\"{id}\"")))
-        && (lower.contains("\"state\":\"active\"")
-            || lower.contains("\"state\":\"starting\"")
-            || lower.contains("\"state\":\"stopping\""))
+fn has_active_reference(bytes: &[u8], id: &str) -> Result<bool, String> {
+    #[derive(serde::Deserialize)]
+    struct PairReferences {
+        gateway_entry_id: String,
+        vm_entry_id: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct Record {
+        state: String,
+        entry_id: String,
+        pair: Option<PairReferences>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Registry {
+        version: u8,
+        tunnels: Vec<Record>,
+    }
+    let registry: Registry = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+    if registry.version != 1 {
+        return Err("unsupported tunnel registry version".to_string());
+    }
+    Ok(registry.tunnels.iter().any(|record| {
+        matches!(record.state.as_str(), "active" | "starting" | "stopping")
+            && (record.entry_id == id || record.pair.as_ref().is_some_and(|pair| {
+                pair.gateway_entry_id == id || pair.vm_entry_id == id
+            }))
+    }))
 }
 fn required_create_value(value: Option<&str>, label: &str) -> Result<String, String> {
     value.map(str::to_owned).ok_or_else(|| format!(

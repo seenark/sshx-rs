@@ -324,6 +324,273 @@ fn missing_show_selector_and_tunnel_id_cancel_without_effect() {
 }
 
 #[test]
+fn host_delete_hosts_shortcut_cancels_then_deletes_exact_duplicate_and_stays_open() {
+    let before = "Host duplicate\n  HostName first.example\nHost duplicate\n  HostName second.example\nHost other\n  HostName untouched.example\n";
+    let (root, home, config) = host_edit_fixture("hosts-delete", before);
+    let mut terminal = HostEditTerminal::open(&home, &config, &["tui", "--yes"]);
+    terminal.expect("sshx Hosts");
+    terminal.send(b"duplicate\x1b[B\x18");
+    terminal.expect("Review HostEntry mutation");
+    terminal.expect("-  HostName second.example");
+    terminal.send(b"\x1b");
+    terminal.expect("HostEntry deletion cancelled.");
+    assert_eq!(fs::read_to_string(&config).unwrap(), before);
+    terminal.send(b"\x18");
+    terminal.expect("Review HostEntry mutation");
+    terminal.send(b"\r");
+    terminal.expect("HostEntry deleted.");
+    assert_eq!(fs::read_to_string(&config).unwrap(),
+        "Host duplicate\n  HostName first.example\nHost other\n  HostName untouched.example\n");
+    assert!(terminal.child.try_wait().unwrap().is_none());
+    terminal.send(b"\x1b");
+    assert_eq!(terminal.finish(), Some(0));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn host_delete_preview_and_review_cancellation_preserve_source() {
+    let before = "Host prod secondary\n  HostName old.example\n  ##PASSWORD stored-secret\n";
+    let (root, home, config) = host_edit_fixture("preview-delete", before);
+    for (arguments, exit, key) in [
+        (vec!["tui", "host", "delete", "secondary", "--preview", "--yes"], 0, b"\r".as_slice()),
+        (vec!["tui", "host", "delete", "secondary", "--yes"], 130, b"\x03".as_slice()),
+        (vec!["tui", "--preview"], 0, b"\r".as_slice()),
+    ] {
+        let hosts = arguments.len() == 2;
+        let mut terminal = HostEditTerminal::open(&home, &config, &arguments);
+        if hosts {
+            terminal.expect("sshx Hosts");
+            terminal.send(b"secondary\x18");
+        }
+        terminal.expect("Review HostEntry mutation");
+        terminal.expect("Alias: secondary");
+        terminal.expect("<redacted>");
+        assert!(!String::from_utf8_lossy(&terminal.output).contains("stored-secret"));
+        if arguments.contains(&"--preview") {
+            if !hosts {
+                let size = libc::winsize { ws_row: 8, ws_col: 24, ws_xpixel: 0, ws_ypixel: 0 };
+                assert_eq!(unsafe { libc::ioctl(terminal.master.as_raw_fd(), libc::TIOCSWINSZ, &size) }, 0);
+                terminal.send(b"\x1b[6~");
+            }
+            terminal.expect("Enter finish preview");
+        }
+        terminal.send(key);
+        if hosts {
+            terminal.expect("HostEntry preview complete.");
+            assert!(!contains_tui_text(&terminal.output, "HostEntry deleted."));
+            terminal.send(b"\x1b");
+        }
+        assert_eq!(terminal.finish(), Some(exit));
+        assert_eq!(fs::read_to_string(&config).unwrap(), before);
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn host_delete_rejects_changed_source_and_new_dependencies_after_review() {
+    let id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let before = format!("##SSHX ID={id}\nHost selected\n  HostName old.example\n");
+    let (root, home, config) = host_edit_fixture("stale-delete", &before);
+    for after_review in [false, true] {
+        fs::write(&config, &before).unwrap();
+        let arguments = if after_review {
+            vec!["tui", "host", "delete", "selected"]
+        } else { vec!["host", "delete"] };
+        let mut terminal = HostEditTerminal::open(&home, &config, &arguments);
+        terminal.expect(if after_review { "Review HostEntry mutation" } else { "host delete" });
+        let external = format!("{before}# external edit\n");
+        fs::write(&config, &external).unwrap();
+        terminal.send(b"\r");
+        terminal.expect("HOST_SOURCE_CHANGED");
+        assert_eq!(terminal.finish(), Some(2));
+        assert_eq!(fs::read_to_string(&config).unwrap(), external);
+    }
+    fs::write(&config, &before).unwrap();
+    let replacement = home.join(".ssh/replacement");
+    fs::write(&replacement, &before).unwrap();
+    let mut terminal = HostEditTerminal::open(&home, &config,
+        &["tui", "host", "delete", "selected"]);
+    terminal.expect("Review HostEntry mutation");
+    fs::remove_file(&config).unwrap();
+    std::os::unix::fs::symlink(&replacement, &config).unwrap();
+    terminal.send(b"\r");
+    terminal.expect("CONFIG_ROOT_SYMLINK");
+    assert_eq!(terminal.finish(), Some(2));
+    assert!(fs::symlink_metadata(&config).unwrap().file_type().is_symlink());
+    assert_eq!(fs::read_to_string(&replacement).unwrap(), before);
+    fs::remove_file(&config).unwrap();
+    let dependency = home.join(".ssh/dependency");
+    fs::write(&dependency, "Host vm\n  HostName vm.example\n").unwrap();
+    fs::set_permissions(&dependency, fs::Permissions::from_mode(0o600)).unwrap();
+    let included = format!("Include dependency\n{before}");
+    fs::write(&config, &included).unwrap();
+    let mut terminal = HostEditTerminal::open(&home, &config,
+        &["tui", "host", "delete", "selected"]);
+    terminal.expect("Review HostEntry mutation");
+    fs::write(&dependency, format!("##SSHX GATEWAY={id}\nHost vm\n  HostName vm.example\n")).unwrap();
+    terminal.send(b"\r");
+    terminal.expect("DELETE_REFERENCED");
+    assert_eq!(terminal.finish(), Some(2));
+    assert_eq!(fs::read_to_string(&config).unwrap(), included);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn host_delete_pair_blocker_shows_exact_sources_and_redacts_password() {
+    let gateway = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let vm = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    let before = format!("##SSHX ID={gateway}\n##SSHX VM={vm}\nHost gateway\n  HostName gateway.example\n  ##PASSWORD stored-secret\n##SSHX ID={vm}\n##SSHX GATEWAY={gateway}\n##SSHX TRANSIT=127.0.0.1:2222\nHost vm\n  HostName vm.example\n");
+    let (root, home, config) = host_edit_fixture("pair-delete", &before);
+    let mut terminal = HostEditTerminal::open(&home, &config,
+        &["tui", "host", "delete", "gateway", "--yes"]);
+    terminal.expect("HostEntry deletion blocked");
+    terminal.expect("-Host gateway");
+    terminal.expect("<redacted>");
+    terminal.expect("Pair gateway: gateway");
+    terminal.expect("Pair VM: vm");
+    terminal.expect("Transit: 127.0.0.1:2222");
+    terminal.expect("DELETE_REFERENCED");
+    assert!(!String::from_utf8_lossy(&terminal.output).contains("stored-secret"));
+    terminal.send(b"\r");
+    assert_eq!(terminal.finish(), Some(2));
+    assert_eq!(fs::read_to_string(&config).unwrap(), before);
+    fs::write(&config, format!("##SSHX ID={gateway}\n##SSHX TRANSIT=broken\nHost gateway\n  HostName gateway.example\n")).unwrap();
+    let mut terminal = HostEditTerminal::open(&home, &config,
+        &["tui", "host", "delete", "gateway"]);
+    terminal.expect("HostEntry deletion blocked");
+    terminal.expect("DELETE_REFERENCED");
+    terminal.send(b"\x1b");
+    assert_eq!(terminal.finish(), Some(2));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn host_delete_registry_safety_matches_each_record_and_rechecks_after_review() {
+    let selected = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let unrelated = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    let before = format!("##SSHX ID={selected}\nHost selected\n  HostName selected.example\n");
+    let (root, home, config) = host_edit_fixture("registry-delete", &before);
+    let registry = home.join(".config/sshx/tunnels/registry.json");
+    fs::create_dir_all(registry.parent().unwrap()).unwrap();
+    let delete = || Command::new(env!("CARGO_BIN_EXE_sshx"))
+        .arg("--config").arg(&config).args(["host", "delete", "selected", "--yes", "--no-input"])
+        .env("HOME", &home).output().unwrap();
+    for state in ["active", "starting", "stopping"] {
+        for role in ["direct", "gateway", "vm"] {
+            let record = match role {
+                "gateway" => serde_json::json!({"state": state, "entry_id": unrelated,
+                    "pair": {"gateway_entry_id": selected, "vm_entry_id": unrelated}}),
+                "vm" => serde_json::json!({"state": state, "entry_id": unrelated,
+                    "pair": {"gateway_entry_id": unrelated, "vm_entry_id": selected}}),
+                _ => serde_json::json!({"state": state, "entry_id": selected}),
+            };
+            fs::write(&registry, serde_json::json!({"version": 1, "tunnels": [record]}).to_string()).unwrap();
+            let output = delete();
+            assert_eq!(output.status.code(), Some(2), "{state} {role}");
+            assert!(String::from_utf8_lossy(&output.stderr).contains("DELETE_ACTIVE"), "{output:?}");
+            assert_eq!(fs::read_to_string(&config).unwrap(), before);
+        }
+    }
+    for invalid in ["{malformed", "{}", r#"{"version":1,"tunnels":[{"entry_id":"unknown"}]}"#] {
+        fs::write(&registry, invalid).unwrap();
+        let output = delete();
+        assert_eq!(output.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("DELETE_REGISTRY_INVALID"), "{output:?}");
+        assert_eq!(fs::read_to_string(&config).unwrap(), before);
+    }
+    fs::write(&registry, serde_json::json!({"version": 1, "tunnels": [
+        {"state": "stopped", "entry_id": selected},
+        {"state": "active", "entry_id": unrelated}
+    ]}).to_string()).unwrap();
+    let mut terminal = HostEditTerminal::open(&home, &config,
+        &["tui", "host", "delete", "selected"]);
+    terminal.expect("Review HostEntry mutation");
+    fs::write(&registry, serde_json::json!({"version": 1, "tunnels": [
+        {"state": "starting", "entry_id": selected}
+    ]}).to_string()).unwrap();
+    terminal.send(b"\r");
+    terminal.expect("DELETE_ACTIVE");
+    assert_eq!(terminal.finish(), Some(2));
+    assert_eq!(fs::read_to_string(&config).unwrap(), before);
+    fs::write(&registry, serde_json::json!({"version": 1, "tunnels": [
+        {"state": "stopped", "entry_id": selected,
+         "pair": {"gateway_entry_id": selected, "vm_entry_id": unrelated,
+                  "gateway_id": selected, "vm_id": unrelated}},
+        {"state": "active", "entry_id": unrelated}
+    ]}).to_string()).unwrap();
+    let output = delete();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(fs::read_to_string(&config).unwrap(), "");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn host_delete_complete_cli_keeps_consent_and_exact_selector_errors() {
+    let before = "Host prod secondary\n  HostName old.example\nHost prod\n  HostName duplicate.example\n";
+    let (root, home, config) = host_edit_fixture("cli-delete", before);
+    for (arguments, error) in [
+        (vec!["host", "delete", "--no-input"], "HOST_REQUIRED"),
+        (vec!["host", "delete", "--format", "json"], "HOST_REQUIRED"),
+        (vec!["host", "delete", "secondary", "--no-input"], "CONSENT_REQUIRED"),
+        (vec!["host", "delete", "secondary", "--format", "yaml"], "CONSENT_REQUIRED"),
+        (vec!["tui", "host", "delete", "pro"], "HOST_NOT_FOUND"),
+        (vec!["tui", "host", "delete", "prod"], "HOST_AMBIGUOUS"),
+        (vec!["tui", "host", "delete", "secondary"], "TUI_REQUIRED"),
+        (vec!["host", "delete", "--user", "alice"], "MUTATION_FIELDS"),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_sshx")).arg("--config").arg(&config)
+            .args(&arguments).env("HOME", &home).output().unwrap();
+        assert_eq!(output.status.code(), Some(2), "{arguments:?}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains(error), "{output:?}");
+        assert!(!output.stderr.contains(&0x1b));
+        assert_eq!(fs::read_to_string(&config).unwrap(), before);
+    }
+    let mut terminal = HostEditTerminal::open(&home, &config, &["host", "delete", "secondary"]);
+    terminal.expect("Apply changes? [y/N]");
+    terminal.send(b"n\r");
+    assert_eq!(terminal.finish(), Some(2));
+    assert!(contains_tui_text(&terminal.output, "MUTATION_DECLINED"));
+    assert_eq!(fs::read_to_string(&config).unwrap(), before);
+    let output = Command::new(env!("CARGO_BIN_EXE_sshx")).arg("--config").arg(&config)
+        .args(["host", "delete", "secondary", "--preview", "--format", "json", "--no-input"])
+        .env("HOME", &home).output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let preview: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(preview["applied"], false);
+    assert_eq!(fs::read_to_string(&config).unwrap(), before);
+    let mut terminal = HostEditTerminal::open(&home, &config,
+        &["host", "delete", "secondary", "--yes"]);
+    assert_eq!(terminal.finish(), Some(0));
+    assert!(!contains_tui_text(&terminal.output, "Review HostEntry mutation"));
+    assert_eq!(fs::read_to_string(&config).unwrap(), "Host prod\n  HostName duplicate.example\n");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn host_delete_selectorless_reviews_exact_duplicate_before_apply() {
+    let before = "Host duplicate\n  HostName first.example\n  ##PASSWORD stored-secret\nHost duplicate\n  HostName second.example\nHost other\n  HostName untouched.example\n";
+    let (root, home, config) = host_edit_fixture("delete-duplicate", before);
+    let mut terminal = HostEditTerminal::open(&home, &config, &["host", "delete", "--yes"]);
+    terminal.expect("host delete");
+    terminal.send(b"duplicate\x1b[B\r");
+    terminal.expect("Review HostEntry mutation");
+    terminal.expect("-  HostName second.example");
+    assert_eq!(fs::read_to_string(&config).unwrap(), before);
+    terminal.send(b"\x1b");
+    assert_eq!(terminal.finish(), Some(130));
+    assert_eq!(fs::read_to_string(&config).unwrap(), before);
+    let mut terminal = HostEditTerminal::open(&home, &config, &["host", "delete", "--yes"]);
+    terminal.expect("host delete");
+    terminal.send(b"duplicate\x1b[B\r");
+    terminal.expect("Review HostEntry mutation");
+    terminal.send(b"\r");
+    assert_eq!(terminal.finish(), Some(0));
+    assert_eq!(fs::read_to_string(&config).unwrap(),
+        "Host duplicate\n  HostName first.example\n  ##PASSWORD stored-secret\nHost other\n  HostName untouched.example\n");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn partial_host_update_reviews_prefilled_values_before_apply() {
     let root = std::env::temp_dir().join(format!("sshx-edit-{}-{}", std::process::id(),
         SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
