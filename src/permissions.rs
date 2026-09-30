@@ -5,7 +5,184 @@
 use serde::Serialize;
 use std::fmt;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+
+#[cfg(unix)]
+use std::ffi::CString;
+use std::io;
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+
+#[cfg(unix)]
+fn open_directory_at(dir: i32, name: &std::ffi::CStr) -> io::Result<OwnedFd> {
+    let fd = unsafe {
+        libc::openat(
+            dir,
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+}
+
+#[cfg(unix)]
+fn open_repair_target(path: &Path, target: PermissionTarget, mode: u32) -> io::Result<u32> {
+    let start = CString::new(if path.is_absolute() { "/" } else { "." }).unwrap();
+    let fd = unsafe {
+        libc::open(
+            start.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut dir = unsafe { OwnedFd::from_raw_fd(fd) };
+    let mut components = path.components().peekable();
+    while let Some(component) = components.next() {
+        let is_final = components.peek().is_none();
+        match component {
+            Component::RootDir | Component::CurDir if !is_final => {}
+            Component::RootDir | Component::CurDir => {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "path has no filename"));
+            }
+            Component::ParentDir if !is_final => {
+                let parent = CString::new("..").unwrap();
+                dir = open_directory_at(dir.as_raw_fd(), &parent)?;
+            }
+            Component::Normal(part) if !is_final => {
+                let part = CString::new(part.as_bytes())?;
+                dir = open_directory_at(dir.as_raw_fd(), &part)?;
+            }
+            Component::ParentDir | Component::Normal(_) => {
+                let name = CString::new(component.as_os_str().as_bytes())?;
+                return repair_opened_target(&dir, &name, path, target, mode);
+            }
+            Component::Prefix(_) => unreachable!("prefix components are not Unix paths"),
+        }
+    }
+    Err(io::Error::new(io::ErrorKind::InvalidInput, "path has no filename"))
+}
+
+#[cfg(unix)]
+fn repair_opened_target(
+    dir: &OwnedFd,
+    name: &CString,
+    path: &Path,
+    target: PermissionTarget,
+    mode: u32,
+) -> io::Result<u32> {
+    use std::os::unix::fs::PermissionsExt;
+
+    #[cfg(target_os = "linux")]
+    let target_file = open_target_fd(
+        dir,
+        name,
+        libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+    )?;
+    #[cfg(target_os = "linux")]
+    let metadata = target_file.metadata()?;
+    #[cfg(not(target_os = "linux"))]
+    let metadata = fs::symlink_metadata(path)?;
+    check_metadata(&metadata, target)?;
+    let current = metadata.permissions().mode() & 0o7777;
+    if current == mode {
+        return Ok(current);
+    }
+
+    #[cfg(target_os = "linux")]
+    let changed = unsafe {
+        libc::syscall(
+            libc::SYS_fchmodat2,
+            target_file.as_raw_fd(),
+            b"\0".as_ptr(),
+            mode,
+            libc::AT_EMPTY_PATH,
+        )
+    };
+    // Darwin cannot open mode-000 targets for fchmod; no-follow fchmodat avoids
+    // changing a symlink referent if the final entry races after inspection.
+    #[cfg(not(target_os = "linux"))]
+    let changed = unsafe {
+        libc::fchmodat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            mode as libc::mode_t,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if changed < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    #[cfg(target_os = "linux")]
+    let verified = target_file.metadata()?;
+    #[cfg(not(target_os = "linux"))]
+    let verified = fs::symlink_metadata(path)?;
+    check_metadata(&verified, target)?;
+    #[cfg(not(target_os = "linux"))]
+    if metadata.dev() != verified.dev() || metadata.ino() != verified.ino() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "target changed during repair"));
+    }
+    let verified_mode = verified.permissions().mode() & 0o7777;
+    if verified_mode != mode {
+        return Err(io::Error::other(format!(
+            "mode is {:o}, expected {:o}",
+            verified_mode, mode
+        )));
+    }
+    Ok(current)
+}
+
+#[cfg(target_os = "linux")]
+fn open_target_fd(dir: &OwnedFd, name: &CString, flags: i32) -> io::Result<std::fs::File> {
+    let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags) };
+    if fd < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) }))
+    }
+}
+
+#[cfg(unix)]
+fn check_metadata(metadata: &fs::Metadata, target: PermissionTarget) -> io::Result<()> {
+    if metadata.file_type().is_symlink()
+        || (target.is_file() && !metadata.is_file())
+        || (!target.is_file() && !metadata.is_dir())
+    {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "target type changed"));
+    }
+    if metadata.uid() != unsafe { libc::geteuid() } as u32 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "target is owned by another user",
+        ));
+    }
+    if target.is_file() && metadata.nlink() > 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "target is a shared file",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn open_repair_target(_path: &Path, _target: PermissionTarget, _mode: u32) -> io::Result<u32> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "race-resistant permission repair is unavailable on this platform",
+    ))
+}
+
 
 pub const PRIVATE_FILE_MODE: u32 = 0o600;
 pub const PRIVATE_DIR_MODE: u32 = 0o700;
@@ -116,9 +293,13 @@ fn symlink_component(path: &Path) -> Option<PathBuf> {
     })
 }
 
-/// Apply one planned repair: re-check eligibility at apply time, set the exact
-/// `0600`/`0700` mode, and verify. Never changes ownership or replaces paths.
+/// Re-check eligibility, then repair through no-follow directory descriptors.
+/// Never changes ownership or replaces paths.
 pub fn apply(candidate: &RepairCandidate) -> RepairResult {
+    apply_with(candidate, || {})
+}
+
+fn apply_with(candidate: &RepairCandidate, before_repair: impl FnOnce()) -> RepairResult {
     let target_mode = candidate.target.private_mode();
     let denied = |outcome: RepairOutcome, detail: String| RepairResult {
         candidate: candidate.clone(),
@@ -136,40 +317,25 @@ pub fn apply(candidate: &RepairCandidate) -> RepairResult {
             detail: format!("already {:o}", target_mode),
         };
     }
-    let set = fs::set_permissions(
-        &candidate.path,
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::Permissions::from_mode(target_mode)
-        },
-        #[cfg(not(unix))]
-        {
-            fs::permissions(&candidate.path).unwrap_or_default()
-        },
-    );
-    if let Err(error) = set {
-        return denied(
-            RepairOutcome::Failed,
-            format!("cannot chmod {}: {error}", candidate.path.display()),
-        );
-    }
-    match assess(&candidate.path, candidate.target) {
-        Ok(mode) if mode == target_mode => RepairResult {
-            candidate: candidate.clone(),
-            outcome: RepairOutcome::Fixed,
-            detail: format!("{:o} -> {:o}", current, target_mode),
-        },
-        Ok(mode) => denied(
-            RepairOutcome::Failed,
-            format!(
-                "{} is {:o}, expected {:o}",
-                candidate.path.display(),
-                mode,
-                target_mode
-            ),
-        ),
-        Err(reason) => denied(RepairOutcome::Failed, reason),
+    before_repair();
+    let repaired_from = match open_repair_target(&candidate.path, candidate.target, target_mode) {
+        Ok(mode) => mode,
+        Err(error) => {
+            let outcome = if assess(&candidate.path, candidate.target).is_err() {
+                RepairOutcome::Skipped
+            } else {
+                RepairOutcome::Failed
+            };
+            return denied(
+                outcome,
+                format!("cannot safely chmod {}: {error}", candidate.path.display()),
+            );
+        }
+    };
+    RepairResult {
+        candidate: candidate.clone(),
+        outcome: RepairOutcome::Fixed,
+        detail: format!("{:o} -> {:o}", repaired_from, target_mode),
     }
 }
 
@@ -184,4 +350,77 @@ pub fn manual_chmod_command(path: &Path, target: PermissionTarget) -> String {
     let mode = target.private_mode();
     let quoted = path.display().to_string().replace('\'', "'\\''");
     format!("chmod {:o} '{quoted}'", mode)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn apply_rejects_symlink_replacement_between_check_and_repair() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("sshx-permission-race-{unique}"));
+        fs::create_dir_all(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let path = root.join("secret");
+        let outside = root.join("outside");
+        fs::write(&path, "private").unwrap();
+        fs::write(&outside, "outside secret").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o644)).unwrap();
+        let candidate = RepairCandidate {
+            kind: "password_file".to_string(),
+            path: path.clone(),
+            target: PermissionTarget::File,
+            current_mode: 0o644,
+            reason: "test".to_string(),
+        };
+
+        let result = apply_with(&candidate, || {
+            fs::remove_file(&path).unwrap();
+            symlink(&outside, &path).unwrap();
+        });
+
+        assert_eq!(result.outcome, RepairOutcome::Skipped);
+        assert!(fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
+        assert_eq!(fs::metadata(&outside).unwrap().permissions().mode() & 0o7777, 0o644);
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "outside secret");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn apply_repairs_private_mode_and_skips_shared_file() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("sshx-permission-apply-{unique}"));
+        fs::create_dir_all(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let path = root.join("secret");
+        fs::write(&path, "private").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let candidate = RepairCandidate {
+            kind: "password_file".to_string(),
+            path: path.clone(),
+            target: PermissionTarget::File,
+            current_mode: 0o644,
+            reason: "test".to_string(),
+        };
+        let result = apply(&candidate);
+        assert_eq!(result.outcome, RepairOutcome::Fixed, "{}", result.detail);
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o7777, 0o600);
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::hard_link(&path, root.join("shared")).unwrap();
+        let result = apply(&candidate);
+        assert_eq!(result.outcome, RepairOutcome::Skipped);
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o7777, 0o644);
+        fs::remove_dir_all(root).unwrap();
+    }
 }

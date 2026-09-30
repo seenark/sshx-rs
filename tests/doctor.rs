@@ -570,6 +570,51 @@ fn apply_all_repairs_exact_modes_and_continues_after_failure() {
 }
 
 #[test]
+fn apply_permissions_does_not_follow_replacement_symlink() {
+    let (root, home) = fixture();
+    let path = home.join(".ssh/password");
+    let outside = root.join("outside");
+    write(&path, "private");
+    write(&outside, "outside secret");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    fs::set_permissions(&outside, fs::Permissions::from_mode(0o644)).unwrap();
+    let candidate = permissions::RepairCandidate {
+        kind: "password_file".to_string(),
+        path: path.clone(),
+        target: permissions::PermissionTarget::File,
+        current_mode: permissions::PRIVATE_FILE_MODE,
+        reason: "test repair".to_string(),
+    };
+
+    fs::remove_file(&path).unwrap();
+    std::os::unix::fs::symlink(&outside, &path).unwrap();
+    let result = permissions::apply(&candidate);
+
+    assert_eq!(result.outcome, permissions::RepairOutcome::Skipped);
+    assert!(fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
+    assert_eq!(mode_of(&outside), 0o644);
+    assert_eq!(fs::read_to_string(&outside).unwrap(), "outside secret");
+
+    let outside_dir = root.join("outside-dir");
+    fs::create_dir(&outside_dir).unwrap();
+    let outside_child = outside_dir.join("password");
+    write(&outside_child, "outside directory secret");
+    fs::set_permissions(&outside_child, fs::Permissions::from_mode(0o644)).unwrap();
+    fs::remove_file(&path).unwrap();
+    fs::remove_dir_all(home.join(".ssh")).unwrap();
+    std::os::unix::fs::symlink(&outside_dir, home.join(".ssh")).unwrap();
+    let result = permissions::apply(&candidate);
+
+    assert_eq!(result.outcome, permissions::RepairOutcome::Skipped);
+    assert!(fs::symlink_metadata(home.join(".ssh")).unwrap().file_type().is_symlink());
+    assert_eq!(mode_of(&outside_child), 0o644);
+    assert_eq!(
+        fs::read_to_string(&outside_child).unwrap(),
+        "outside directory secret"
+    );
+}
+
+#[test]
 fn settings_save_creates_private_modes_regardless_of_umask() {
     let (root, home) = fixture();
     let roots = vec![RegisteredRoot {
@@ -654,4 +699,99 @@ fn doctor_never_plans_shared_files_or_paths_through_symlink_parents() {
         report.repairs
     );
     fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn human_doctor_groups_severity_and_stage_with_actionable_evidence() {
+    let report = sshx::doctor::DoctorReport {
+        version: 1,
+        validation: sshx::doctor::ValidationInfo {
+            local: "fixture".to_string(),
+            remote_servers: "not_run".to_string(),
+        },
+        roots: vec![sshx::doctor::RootReport {
+            scope: "user".to_string(),
+            path: "/home/user/.ssh/config".to_string(),
+            project: None,
+            status: "readable".to_string(),
+            evidence: "fixture root".to_string(),
+        }],
+        known_hosts: vec![sshx::doctor::KnownHostReport {
+            scope: "user".to_string(),
+            path: "/home/user/.ssh/known_hosts".to_string(),
+            status: "readable".to_string(),
+            evidence: "fixture inventory".to_string(),
+        }],
+        state: Vec::new(),
+        runtime: Vec::new(),
+        findings: vec![
+            sshx::doctor::Finding {
+                code: "include_missing".to_string(),
+                severity: "error".to_string(),
+                stage: "config".to_string(),
+                message: "included file is missing".to_string(),
+                guidance: "restore the referenced file".to_string(),
+                path: Some("/home/user/.ssh/config".to_string()),
+                evidence: "Include target does not exist".to_string(),
+            },
+            sshx::doctor::Finding {
+                code: "root_unreadable".to_string(),
+                severity: "error".to_string(),
+                stage: "config".to_string(),
+                message: "config root cannot be read".to_string(),
+                guidance: "check file access".to_string(),
+                path: Some("/home/user/.ssh/other.conf".to_string()),
+                evidence: "read returned permission denied".to_string(),
+            },
+            sshx::doctor::Finding {
+                code: "private_mode".to_string(),
+                severity: "error".to_string(),
+                stage: "permissions".to_string(),
+                message: "private file has broad permissions".to_string(),
+                guidance: "review chmod repair".to_string(),
+                path: Some("/home/user/.ssh/id_key".to_string()),
+                evidence: "mode is 0644".to_string(),
+            },
+            sshx::doctor::Finding {
+                code: "stale_runtime".to_string(),
+                severity: "warning".to_string(),
+                stage: "runtime".to_string(),
+                message: "runtime record is stale".to_string(),
+                guidance: "inspect runtime state".to_string(),
+                path: Some("/home/user/.config/sshx/run".to_string()),
+                evidence: "control socket is absent".to_string(),
+            },
+            sshx::doctor::Finding {
+                code: "remote_unchecked".to_string(),
+                severity: "info".to_string(),
+                stage: "config".to_string(),
+                message: "remote server check was not run".to_string(),
+                guidance: "validate in an authorized environment".to_string(),
+                path: None,
+                evidence: "remote access is outside this report".to_string(),
+            },
+        ],
+        repairs: Vec::new(),
+    };
+    let rendered =
+        sshx::output::render_doctor(&report, sshx::output::OutputFormat::Human).unwrap();
+
+    let config = rendered.find("[error] config\n").unwrap();
+    let first = rendered.find("include_missing:").unwrap();
+    let second = rendered.find("root_unreadable:").unwrap();
+    let permissions = rendered.find("[error] permissions\n").unwrap();
+    let warning = rendered.find("[warning] runtime\n").unwrap();
+    let info = rendered.find("[info] config\n").unwrap();
+    let root_inventory = rendered.find("root user: /home/user/.ssh/config").unwrap();
+    let known_hosts = rendered
+        .find("known-hosts user: /home/user/.ssh/known_hosts")
+        .unwrap();
+    assert!(config < permissions && permissions < warning);
+    assert!(warning < root_inventory && root_inventory < known_hosts && known_hosts < info);
+    assert!(config < first && first < second && second < permissions);
+    assert!(permissions < warning && warning < info);
+    assert_eq!(rendered.matches("[error] config\n").count(), 1);
+    assert!(rendered.contains("Path: /home/user/.ssh/config"));
+    assert!(rendered.contains("Evidence: Include target does not exist"));
+    assert!(rendered.contains("Next: restore the referenced file"));
 }

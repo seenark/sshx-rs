@@ -376,32 +376,54 @@ pub fn render_doctor(
     rendered.push_str(
         "Evidence: local and fixture checks only; remote server validation: not run.\n\n",
     );
-    for root in &report.roots {
-        rendered.push_str(&format!(
-            "root {}: {} ({})\n",
-            root.scope, root.path, root.status
-        ));
-    }
-    for known_hosts in &report.known_hosts {
-        rendered.push_str(&format!(
-            "known-hosts {}: {} ({})\n",
-            known_hosts.scope, known_hosts.path, known_hosts.status
-        ));
-    }
-    for finding in &report.findings {
-        rendered.push_str(&format!(
-            "[{}] {} {}: {}\n  Next: {}\n",
-            finding.severity, finding.stage, finding.code, finding.message, finding.guidance
-        ));
+    for severity in ["error", "warning", "info"] {
+        if severity == "info" {
+            for root in &report.roots {
+                rendered.push_str(&format!(
+                    "root {}: {} ({})\n",
+                    root.scope, root.path, root.status
+                ));
+            }
+            for known_hosts in &report.known_hosts {
+                rendered.push_str(&format!(
+                    "known-hosts {}: {} ({})\n",
+                    known_hosts.scope, known_hosts.path, known_hosts.status
+                ));
+            }
+        }
+        let stages = report
+            .findings
+            .iter()
+            .filter(|finding| finding.severity == severity)
+            .map(|finding| finding.stage.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        for stage in stages {
+            rendered.push_str(&format!("[{severity}] {stage}\n"));
+            for finding in report
+                .findings
+                .iter()
+                .filter(|finding| finding.severity == severity && finding.stage == stage)
+            {
+                rendered.push_str(&format!("  {}: {}\n", finding.code, finding.message));
+                if let Some(path) = &finding.path {
+                    rendered.push_str(&format!("    Path: {path}\n"));
+                }
+                rendered.push_str(&format!(
+                    "    Evidence: {}\n    Next: {}\n",
+                    finding.evidence, finding.guidance
+                ));
+            }
+        }
     }
     if !report.repairs.is_empty() {
-        rendered.push_str("Repair plan:\n");
+        rendered.push_str("Eligible permission repairs (not applied):\n");
         for candidate in &report.repairs {
             rendered.push_str(&format!(
-                "  {} {}: {}\n",
+                "  {} {}: {:04o} -> {:04o}\n",
                 candidate.kind,
                 candidate.path.display(),
-                candidate.reason
+                candidate.current_mode,
+                candidate.target.private_mode()
             ));
         }
     }
