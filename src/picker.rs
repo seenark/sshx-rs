@@ -1532,6 +1532,7 @@ pub fn doctor_workspace(
             let mut selected = 0usize;
             let mut expanded = true;
             let mut reviewing = false;
+            let mut repair_plan = None;
             let mut detail_scroll = 0u16;
             let mut status_scroll = 0u16;
             let mut detail_page_rows = 1u16;
@@ -1589,20 +1590,25 @@ pub fn doctor_workspace(
                         );
                         if reviewing {
                             detail_page_rows = chunks[1].height.saturating_sub(2).max(1);
-                            let mut plan = String::from(
-                                "Only listed eligible paths will be changed. No ownership changes or host-key enrollment.\n\n",
-                            );
-                            for candidate in repairs {
-                                plan.push_str(&format!(
-                                    "{}\n  {:04o} -> {:04o} ({})\n\n",
-                                    candidate.path.display(),
-                                    candidate.current_mode,
-                                    candidate.target.private_mode(),
-                                    candidate.kind,
-                                ));
-                            }
+                            let plan = repair_plan.get_or_insert_with(|| {
+                                let mut plan = String::from(
+                                    "Only listed eligible paths will be changed. No ownership changes or host-key enrollment.\n\n",
+                                );
+                                for candidate in repairs {
+                                    use std::fmt::Write;
+                                    let _ = writeln!(
+                                        plan,
+                                        "{}\n  {:04o} -> {:04o} ({})\n",
+                                        candidate.path.display(),
+                                        candidate.current_mode,
+                                        candidate.target.private_mode(),
+                                        candidate.kind,
+                                    );
+                                }
+                                plan
+                            });
                             frame.render_widget(
-                                Paragraph::new(plan)
+                                Paragraph::new(plan.as_str())
                                     .block(block(" Permission repair plan ", Color::Cyan))
                                     .wrap(Wrap { trim: false })
                                     .scroll((detail_scroll, 0)),
