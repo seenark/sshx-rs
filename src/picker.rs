@@ -1531,15 +1531,20 @@ pub fn doctor_workspace(
         |terminal, input| {
             let mut selected = 0usize;
             let mut expanded = true;
+            let mut reviewing = false;
             let mut detail_scroll = 0u16;
             let mut status_scroll = 0u16;
+            let mut detail_page_rows = 1u16;
+            let mut status_page_rows = 1u16;
             let mut scroll_status = false;
             loop {
                 let finding = order.get(selected).map(|index| &findings[*index]);
                 terminal
                     .draw(|frame| {
                         let area = frame.area();
-                        let footer = if area.width < 24 {
+                        let footer = if reviewing {
+                            "PgUp/Dn scroll plan · Y apply · N/Esc cancel"
+                        } else if area.width < 24 {
                             if repairs.is_empty() {
                                 "↑↓ Enter\nTab · PgUp/Dn\nEsc exit"
                             } else {
@@ -1574,68 +1579,97 @@ pub fn doctor_workspace(
                             ])
                             .split(area);
                         frame.render_widget(
-                            Paragraph::new("Doctor · report only")
+                            Paragraph::new(if reviewing {
+                                "Doctor · review eligible permission repairs"
+                            } else {
+                                "Doctor · report only"
+                            })
                                 .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
                             chunks[0],
                         );
-                        let detail_height = chunks[1].height.max(1) / 2;
-                        let panes = Layout::default()
-                            .direction(Direction::Vertical)
-                            .constraints([Constraint::Length(detail_height), Constraint::Min(1)])
-                            .split(chunks[1]);
-                        let mut group = None;
-                        let rows = order
-                            .iter()
-                            .map(|index| {
-                                let finding = &findings[*index];
-                                let next_group = (finding.severity.as_str(), finding.stage.as_str());
-                                let mut lines = Vec::new();
-                                if group != Some(next_group) {
-                                    lines.push(Line::from(format!(
-                                        "[{}] {}",
-                                        finding.severity, finding.stage
-                                    )));
-                                    group = Some(next_group);
-                                }
-                                lines.push(Line::from(format!("  {}", finding.message)));
-                                ListItem::new(lines)
-                            })
-                            .collect::<Vec<_>>();
-                        let mut list = ListState::default();
-                        if !rows.is_empty() {
-                            list.select(Some(selected));
-                        }
-                        frame.render_stateful_widget(
-                            List::new(rows)
-                                .block(block(" Findings ", Color::Cyan))
-                                .highlight_symbol("> ")
-                                .highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White)),
-                            panes[0],
-                            &mut list,
-                        );
-                        let detail = if let Some(finding) = finding.filter(|_| expanded) {
-                            format!(
-                                "{} [{} / {}]\nPath: {}\nEvidence: {}\nGuidance: {}",
-                                finding.message,
-                                finding.severity,
-                                finding.stage,
-                                finding.path.as_deref().unwrap_or("(not applicable)"),
-                                finding.evidence,
-                                finding.guidance
-                            )
-                        } else if finding.is_some() {
-                            "Finding collapsed. Press Enter to show evidence and guidance.".to_string()
+                        if reviewing {
+                            detail_page_rows = chunks[1].height.saturating_sub(2).max(1);
+                            let mut plan = String::from(
+                                "Only listed eligible paths will be changed. No ownership changes or host-key enrollment.\n\n",
+                            );
+                            for candidate in repairs {
+                                plan.push_str(&format!(
+                                    "{}\n  {:04o} -> {:04o} ({})\n\n",
+                                    candidate.path.display(),
+                                    candidate.current_mode,
+                                    candidate.target.private_mode(),
+                                    candidate.kind,
+                                ));
+                            }
+                            frame.render_widget(
+                                Paragraph::new(plan)
+                                    .block(block(" Permission repair plan ", Color::Cyan))
+                                    .wrap(Wrap { trim: false })
+                                    .scroll((detail_scroll, 0)),
+                                chunks[1],
+                            );
                         } else {
-                            "No findings.".to_string()
-                        };
-                        frame.render_widget(
-                            Paragraph::new(detail)
-                                .block(block(" Evidence and guidance ", Color::Cyan))
-                                .wrap(Wrap { trim: false })
-                                .scroll((detail_scroll, 0)),
-                            panes[1],
-                        );
+                            let detail_height = chunks[1].height.max(1) / 2;
+                            let panes = Layout::default()
+                                .direction(Direction::Vertical)
+                                .constraints([Constraint::Length(detail_height), Constraint::Min(1)])
+                                .split(chunks[1]);
+                            detail_page_rows = panes[1].height.saturating_sub(2).max(1);
+                            let mut group = None;
+                            let rows = order
+                                .iter()
+                                .map(|index| {
+                                    let finding = &findings[*index];
+                                    let next_group = (finding.severity.as_str(), finding.stage.as_str());
+                                    let mut lines = Vec::new();
+                                    if group != Some(next_group) {
+                                        lines.push(Line::from(format!(
+                                            "[{}] {}",
+                                            finding.severity, finding.stage
+                                        )));
+                                        group = Some(next_group);
+                                    }
+                                    lines.push(Line::from(format!("  {}", finding.message)));
+                                    ListItem::new(lines)
+                                })
+                                .collect::<Vec<_>>();
+                            let mut list = ListState::default();
+                            if !rows.is_empty() {
+                                list.select(Some(selected));
+                            }
+                            frame.render_stateful_widget(
+                                List::new(rows)
+                                    .block(block(" Findings ", Color::Cyan))
+                                    .highlight_symbol("> ")
+                                    .highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White)),
+                                panes[0],
+                                &mut list,
+                            );
+                            let detail = if let Some(finding) = finding.filter(|_| expanded) {
+                                format!(
+                                    "{} [{} / {}]\nPath: {}\nEvidence: {}\nGuidance: {}",
+                                    finding.message,
+                                    finding.severity,
+                                    finding.stage,
+                                    finding.path.as_deref().unwrap_or("(not applicable)"),
+                                    finding.evidence,
+                                    finding.guidance
+                                )
+                            } else if finding.is_some() {
+                                "Finding collapsed. Press Enter to show evidence and guidance.".to_string()
+                            } else {
+                                "No findings.".to_string()
+                            };
+                            frame.render_widget(
+                                Paragraph::new(detail)
+                                    .block(block(" Evidence and guidance ", Color::Cyan))
+                                    .wrap(Wrap { trim: false })
+                                    .scroll((detail_scroll, 0)),
+                                panes[1],
+                            );
+                        }
                         if status.is_some() {
+                            status_page_rows = chunks[2].height.saturating_sub(footer_rows).max(1);
                             frame.render_widget(
                                 Paragraph::new(status.unwrap_or(""))
                                     .wrap(Wrap { trim: false })
@@ -1660,41 +1694,51 @@ pub fn doctor_workspace(
                     })
                     .map_err(|error| format!("DOCTOR_REQUIRED: cannot render Doctor: {error}"))?;
                 match read_key(input, "DOCTOR_REQUIRED")? {
+                    KeyEvent { code: KeyCode::Esc | KeyCode::Char('n' | 'N'), .. }
+                        if reviewing =>
+                    {
+                        reviewing = false;
+                        detail_scroll = 0;
+                    }
+                    KeyEvent { code: KeyCode::Char('y' | 'Y'), .. } if reviewing => {
+                        return Ok(DoctorAction::Repair);
+                    }
                     KeyEvent { code: KeyCode::Esc, .. } => return Ok(DoctorAction::Exit),
                     KeyEvent { code: KeyCode::Char('c'), modifiers, .. }
                         if modifiers.contains(KeyModifiers::CONTROL) =>
                     {
                         return Ok(DoctorAction::Exit);
                     }
-                    KeyEvent { code: KeyCode::Up, .. } => {
+                    KeyEvent { code: KeyCode::Up, .. } if !reviewing => {
                         selected = selected.saturating_sub(1);
                         expanded = true;
                         detail_scroll = 0;
                     }
-                    KeyEvent { code: KeyCode::Down, .. } if selected + 1 < order.len() => {
+                    KeyEvent { code: KeyCode::Down, .. } if !reviewing && selected + 1 < order.len() => {
                         selected += 1;
                         expanded = true;
                         detail_scroll = 0;
                     }
-                    KeyEvent { code: KeyCode::Enter, .. } if finding.is_some() => {
+                    KeyEvent { code: KeyCode::Enter, .. } if !reviewing && finding.is_some() => {
                         expanded = !expanded;
                         detail_scroll = 0;
                     }
-                    KeyEvent { code: KeyCode::Tab, .. } => scroll_status = !scroll_status,
-                    KeyEvent { code: KeyCode::PageUp, .. } if scroll_status => {
-                        status_scroll = status_scroll.saturating_sub(8);
+                    KeyEvent { code: KeyCode::Tab, .. } if !reviewing => scroll_status = !scroll_status,
+                    KeyEvent { code: KeyCode::PageUp, .. } if !reviewing && scroll_status => {
+                        status_scroll = status_scroll.saturating_sub(status_page_rows);
                     }
-                    KeyEvent { code: KeyCode::PageDown, .. } if scroll_status => {
-                        status_scroll = status_scroll.saturating_add(8);
+                    KeyEvent { code: KeyCode::PageDown, .. } if !reviewing && scroll_status => {
+                        status_scroll = status_scroll.saturating_add(status_page_rows);
                     }
                     KeyEvent { code: KeyCode::PageUp, .. } => {
-                        detail_scroll = detail_scroll.saturating_sub(8);
+                        detail_scroll = detail_scroll.saturating_sub(detail_page_rows);
                     }
                     KeyEvent { code: KeyCode::PageDown, .. } => {
-                        detail_scroll = detail_scroll.saturating_add(8);
+                        detail_scroll = detail_scroll.saturating_add(detail_page_rows);
                     }
-                    KeyEvent { code: KeyCode::Char('r' | 'R'), .. } if !repairs.is_empty() => {
-                        return Ok(DoctorAction::Repair);
+                    KeyEvent { code: KeyCode::Char('r' | 'R'), .. } if !reviewing && !repairs.is_empty() => {
+                        reviewing = true;
+                        detail_scroll = 0;
                     }
                     _ => {}
                 }

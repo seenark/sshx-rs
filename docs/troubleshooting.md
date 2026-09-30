@@ -67,10 +67,12 @@ Do not replace a Pair route with `ProxyJump`. The approved route uses separate O
 - Key-only inventory and connections do not require `sshpass`. Install it only for password authentication:
   - macOS: `brew install sshpass` from the maintained Homebrew formula.
   - Ubuntu CI/local: `sudo apt-get install --no-install-recommends -y openssh-client sshpass`.
-- Keep password-bearing config files owned by the user with mode `0600`. `doctor` warns about unsafe permissions and never changes them automatically.
+- Keep password-bearing config files owned by the user with mode `0600`. `doctor` reports unsafe permissions without changes by default. Use `sshx doctor --fix-permissions` or Hosts → Doctor → Repair eligible permissions to review one path-and-mode plan and confirm once. Wrong-owner, symlink, shared, and otherwise ineligible paths remain unchanged.
 - Keep app-owned runtime and registry directories user-owned with mode `0700`. Do not replace a control socket with a symlink or manually adopt a process.
 - Use `IdentityFile`, `ssh-agent`, or an inherited password file descriptor. Passwords must not appear in argv, environment, runtime config, logs, JSON/YAML, or previews.
 - A wrong configured password is not retried silently. Supply a corrected secret and run the command again.
+
+In the Doctor TUI, press `R` to display eligible paths with their current and target modes. Press `Y` once to apply that plan, or `N`/`Esc` to cancel without changes. Results remain in Doctor; use `Tab` and `PgUp`/`PgDn` to scroll every result, then `Esc` to return to Hosts. `sshx tui doctor` opens the same workspace directly. CLI permission repair still requires an interactive confirmation; `--yes`, piped input, and `--no-input` do not authorize unattended chmod.
 
 ## Host keys
 

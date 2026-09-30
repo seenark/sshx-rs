@@ -583,13 +583,7 @@ fn run_hosts(
                 continue;
             }
             Err(action) if action == "DOCTOR_TAB" => {
-                let (doctor_roots, error) = doctor_roots(cli, home);
-                let report = doctor_report(cli, home, &doctor_roots, error.as_deref());
-                status = match picker::doctor_workspace(&report.findings, &report.repairs, None) {
-                    Ok(picker::DoctorAction::Exit) => None,
-                    Ok(picker::DoctorAction::Repair) => run_doctor_fix(cli, home, report).err(),
-                    Err(error) => Some(error),
-                };
+                status = run_doctor_workspace(cli, home).err();
                 continue;
             }
             Err(error) => return Err(error),
@@ -800,12 +794,7 @@ fn run_tui_operation(cli: &Cli) -> Result<(), String> {
         return run_hosts(cli, &home, &settings::load(&home)?, Some("Config root registered.".to_string()));
     }
     if matches!(cli.command, Command::Doctor) {
-        let (roots, settings_error) = doctor_roots(cli, &home);
-        let report = doctor_report(cli, &home, &roots, settings_error.as_deref());
-        return match picker::doctor_workspace(&report.findings, &report.repairs, None)? {
-            picker::DoctorAction::Exit => Ok(()),
-            picker::DoctorAction::Repair => run_doctor_fix(cli, &home, report),
-        };
+        return run_doctor_workspace(cli, &home);
     }
     if let Command::TunnelChoose { action, route } = cli.command {
         return run_tunnels_workspace(cli, &home, 0, Some((action, route)));
@@ -2185,6 +2174,21 @@ fn doctor_report(
             alias: cli.alias.clone(),
         },
     )
+}
+
+fn run_doctor_workspace(cli: &Cli, home: &Path) -> Result<(), String> {
+    let mut status = None;
+    loop {
+        let (roots, settings_error) = doctor_roots(cli, home);
+        let report = doctor_report(cli, home, &roots, settings_error.as_deref());
+        match picker::doctor_workspace(&report.findings, &report.repairs, status.as_deref())? {
+            picker::DoctorAction::Exit => return Ok(()),
+            picker::DoctorAction::Repair => {
+                let results = sshx::permissions::apply_all(&report.repairs);
+                status = Some(render_repairs(&results, OutputFormat::Human)?);
+            }
+        }
+    }
 }
 
 fn run_doctor_fix(
