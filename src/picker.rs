@@ -296,7 +296,7 @@ pub fn browse_hosts<'a>(
                 route_selection = current_route;
             }
             let empty_message = if entries.is_empty() && state.query.is_empty() {
-                "No HostEntries found. Run `sshx setup` to register a config root."
+                "No HostEntries found. Ctrl+S opens Setup to register a config root; Ctrl+D opens Doctor."
             } else {
                 "No matching HostEntry aliases."
             };
@@ -1367,7 +1367,7 @@ pub fn setup_workspace(
         "Setup",
         "SETUP_REQUIRED: Setup requires usable stdin and stderr terminals".to_string(),
         |terminal, input| {
-            let mut selected = 0usize;
+            let mut selected = if fields[0].is_empty() { 0 } else if fields[2].is_empty() { 2 } else { 0 };
             let mut root_scroll = 0u16;
             loop {
                 terminal

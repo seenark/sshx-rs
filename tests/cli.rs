@@ -4,6 +4,7 @@ use std::net::TcpListener;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::fs::symlink;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -4808,5 +4809,612 @@ fn pair_action_menu_limits_actions_and_copy_password_rejects() {
     assert!(unavailable.stdout.is_empty());
     assert!(!root.join("runtime-config").exists());
     assert!(!root.join("clipboard-content").exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+
+fn run_with_pty_interactions(
+    home: &Path,
+    args: &[&str],
+    bin: &Path,
+    root: &Path,
+    interactions: &[(&[u8], &[u8])],
+    inherited_path: Option<&str>,
+    size: Option<(u16, u16)>,
+) -> (std::process::ExitStatus, String) {
+    run_with_pty_interactions_with_hook(
+        home,
+        args,
+        bin,
+        root,
+        interactions,
+        inherited_path,
+        size,
+        |_| {},
+    )
+}
+
+
+fn contains_tui_text(output: &[u8], expected: &[u8]) -> bool {
+    let output = strip_ansi(output)
+        .into_iter()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect::<Vec<_>>();
+    let expected = expected
+        .iter()
+        .copied()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect::<Vec<_>>();
+    !expected.is_empty()
+        && output
+            .windows(expected.len())
+            .any(|window| window == expected)
+}
+
+
+fn strip_ansi(input: &[u8]) -> Vec<u8> {
+    let mut output = Vec::with_capacity(input.len());
+    let mut index = 0;
+    while index < input.len() {
+        if input[index] == 0x1b {
+            index += 1;
+            match input.get(index) {
+                Some(b'[') => {
+                    index += 1;
+                    while index < input.len() {
+                        let byte = input[index];
+                        index += 1;
+                        if (0x40..=0x7e).contains(&byte) {
+                            break;
+                        }
+                    }
+                }
+                Some(b']' | b'P' | b'_' | b'^') => {
+                    index += 1;
+                    while index < input.len() {
+                        if input[index] == 0x07 {
+                            index += 1;
+                            break;
+                        }
+                        if input[index] == 0x1b && input.get(index + 1) == Some(&b'\\') {
+                            index += 2;
+                            break;
+                        }
+                        index += 1;
+                    }
+                }
+                Some(_) => index += 1,
+                None => {}
+            }
+        } else {
+            if input[index] != b'\r' {
+                output.push(input[index]);
+            }
+            index += 1;
+        }
+    }
+    output
+}
+
+
+fn run_with_pty_interactions_with_hook(
+    home: &Path,
+    args: &[&str],
+    bin: &Path,
+    root: &Path,
+    interactions: &[(&[u8], &[u8])],
+    inherited_path: Option<&str>,
+    size: Option<(u16, u16)>,
+    mut after_render: impl FnMut(usize),
+) -> (std::process::ExitStatus, String) {
+    let mut master = -1;
+    let mut slave = -1;
+    let mut dimensions = unsafe { std::mem::zeroed::<libc::winsize>() };
+    if let Some((width, height)) = size {
+        dimensions.ws_col = width;
+        dimensions.ws_row = height;
+    }
+    let window: *mut libc::winsize = if size.is_some() {
+        &mut dimensions
+    } else {
+        std::ptr::null_mut()
+    };
+    let result = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            window,
+        )
+    };
+    assert_eq!(result, 0, "openpty should succeed");
+    let slave = unsafe { std::fs::File::from_raw_fd(slave) };
+    let stdin = slave.try_clone().expect("pty stdin should clone");
+    let stdout = slave.try_clone().expect("pty stdout should clone");
+    let inherited_path = inherited_path
+        .map(str::to_owned)
+        .unwrap_or_else(|| std::env::var("PATH").unwrap_or_default());
+    let path = if inherited_path.is_empty() {
+        bin.display().to_string()
+    } else {
+        format!("{}:{inherited_path}", bin.display())
+    };
+    let close_stdout = root.join("close-stdout").exists();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_sshx"));
+    command
+        .env("HOME", home)
+        .env("PATH", path)
+        .env("SSHX_CAPTURE", root.join("runtime-config"))
+        .env("SSHX_STARTED", root.join("master-started"))
+        .env("SSHX_CLIPBOARD_CAPTURE", root.join("clipboard-content"))
+        .env("SSHX_CLIPBOARD_ARGS", root.join("clipboard-args"))
+        .env("SSHX_CLIPBOARD_ENV", root.join("clipboard-env"))
+        .env("SSHX_CLOSED", root.join("master-closed"))
+        .env("SSHX_FAIL_ONCE", root.join("fail-once"))
+        .env(
+            "SSHX_AUTH_FAIL",
+            if root.join("auth-fail").exists() {
+                "1"
+            } else {
+                ""
+            },
+        )
+        .env(
+            "SSHX_HOST_KEY_CHANGED",
+            if root.join("host-key-changed").exists() {
+                "1"
+            } else {
+                ""
+            },
+        )
+        .args(args)
+        .stdin(Stdio::from(stdin))
+        .stdout(if close_stdout || root.join("redirect-stdout").exists() {
+            Stdio::null()
+        } else {
+            Stdio::from(stdout)
+        })
+        .stderr(Stdio::from(slave));
+    if close_stdout {
+        unsafe {
+            command.pre_exec(|| {
+                if libc::close(libc::STDOUT_FILENO) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    let mut child = command.spawn().expect("sshx should start in pty");
+    let mut master = unsafe { std::fs::File::from_raw_fd(master) };
+    let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+    assert!(flags >= 0, "pty flags should be readable");
+    assert_eq!(
+        unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0,
+        "pty should become nonblocking"
+    );
+    let mut output = Vec::new();
+    for (index, (header, input)) in interactions.iter().enumerate() {
+        let stage_start = output.len();
+        let startup_deadline = Instant::now() + Duration::from_secs(5);
+        let connection_workspace = contains_tui_text(header, b"Connection workspace");
+        let action_menu_interaction = !connection_workspace
+            && [
+            b"Choose host action".as_slice(),
+            b"Connect".as_slice(),
+            b"Copy SSH".as_slice(),
+            b"Copy sshx".as_slice(),
+            b"Copy password".as_slice(),
+            b"Update".as_slice(),
+            b"Rename".as_slice(),
+            b"Delete".as_slice(),
+        ]
+        .iter()
+        .any(|action| contains_tui_text(header, action));
+        let mut selected_connect = false;
+        loop {
+            let mut buffer = [0u8; 4096];
+            let bytes_before_read = output.len();
+            match master.read(&mut buffer) {
+                Ok(size) => output.extend_from_slice(&buffer[..size]),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => panic!("picker PTY read failed before startup: {error}"),
+            }
+            let stage = &output[stage_start..];
+            let expected = if connection_workspace {
+                b"Mode:".as_slice()
+            } else {
+                header
+            };
+            if output.len() > bytes_before_read && contains_tui_text(stage, expected) {
+                break;
+            }
+            if output.len() > bytes_before_read
+                && !action_menu_interaction
+                && !selected_connect
+                && (contains_tui_text(stage, b"Choose host action")
+                    || contains_tui_text(stage, b"> Connect"))
+            {
+                master.write_all(b"\n").expect("Connect selection should write");
+                selected_connect = true;
+            }
+            assert!(
+                Instant::now() < startup_deadline,
+                "sshx picker did not render interaction {index} {header:?}: {}",
+                String::from_utf8_lossy(&strip_ansi(&output))
+            );
+            assert!(
+                child
+                    .try_wait()
+                    .expect("sshx status should be readable")
+                    .is_none(),
+                "sshx picker exited before interaction {index} {header:?}: {}",
+                String::from_utf8_lossy(&strip_ansi(&output))
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        after_render(index);
+        master.write_all(input).expect("pty input should write");
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        let mut buffer = [0u8; 4096];
+        match master.read(&mut buffer) {
+            Ok(size) => output.extend_from_slice(&buffer[..size]),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => break child.wait().expect("sshx should exit"),
+        }
+        if let Some(status) = child.try_wait().expect("sshx status should be readable") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            child.kill().expect("sshx picker should stop after timeout");
+            break child.wait().expect("sshx picker should exit after timeout");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    for _ in 0..10 {
+        let mut buffer = [0u8; 4096];
+        match master.read(&mut buffer) {
+            Ok(size) if size > 0 => output.extend_from_slice(&buffer[..size]),
+            _ => break,
+        }
+    }
+    (status, String::from_utf8_lossy(&strip_ansi(&output)).into_owned())
+}
+
+
+#[cfg(unix)]
+#[test]
+fn empty_hosts_setup_registers_selected_config() {
+    let (root, home) = fixture_root();
+    write(&home.join(".ssh/config"), "# no HostEntries\n");
+    let config = home.join("configs/ssh_config");
+    write(&config, "Host registered\n  HostName registered.example\n");
+    let bin = fake_ssh(&root);
+    let original = fs::read(&config).unwrap();
+    let mut setup_input = b"\x15".to_vec();
+    setup_input.extend_from_slice(config.to_string_lossy().as_bytes());
+    setup_input.extend_from_slice(b"\x13");
+    let (status, output) = run_with_pty_interactions(
+        &home,
+        &[],
+        &bin,
+        &root,
+        &[
+            (b"No HostEntries", b"\x13"),
+            (b"SSH config file path:", &setup_input),
+            (b"Config root registered.", b"\x1b"),
+        ],
+        None,
+        Some((100, 36)),
+    );
+    assert!(status.success(), "status={status:?} output={output}");
+    assert_eq!(fs::read(&config).unwrap(), original);
+    let hosts = run(&home, &["host", "list", "--format", "json"]);
+    assert!(hosts.status.success(), "{hosts:?}");
+    let hosts: serde_json::Value = serde_json::from_slice(&hosts.stdout).unwrap();
+    assert_eq!(hosts["entries"][0]["aliases"][0], "registered");
+    let settings = fs::read_to_string(home.join(".config/sshx/config.json")).unwrap();
+    assert!(
+        settings.contains(config.to_str().unwrap()),
+        "settings={settings}"
+    );
+    assert!(!root.join("master-started").exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+
+#[cfg(unix)]
+#[test]
+fn setup_under_explicit_config_preserves_other_registered_roots() {
+    let (root, home) = fixture_root();
+    let root_a = home.join("configs/a");
+    let root_b = home.join("configs/b");
+    let root_c = home.join("configs/c");
+    write(&root_a, "# no HostEntries\n");
+    write(&root_b, "# registered root B\n");
+    write(&root_c, "# saved root C\n");
+    fs::create_dir_all(home.join(".config/sshx")).unwrap();
+    write(
+        &home.join(".config/sshx/config.json"),
+        &format!(
+            "{{\"version\":1,\"roots\":[{{\"scope\":\"personal\",\"path\":\"{}\",\"project\":null}}]}}",
+            root_c.display()
+        ),
+    );
+    let bin = fake_ssh(&root);
+    let mut input = b"\x1b[B\x1b[B\x15".to_vec();
+    input.extend_from_slice(root_b.to_string_lossy().as_bytes());
+    input.extend_from_slice(b"\x13");
+    let (status, output) = run_with_pty_interactions(
+        &home,
+        &["--config", root_a.to_str().unwrap()],
+        &bin,
+        &root,
+        &[
+            (b"No HostEntries", b"\x13"),
+            (b"SSH config file path:", &input),
+            (b"Config root registered.", b"\x1b"),
+        ],
+        None,
+        Some((100, 36)),
+    );
+    assert!(status.success(), "status={status:?} output={output}");
+    let settings = fs::read_to_string(home.join(".config/sshx/config.json")).unwrap();
+    assert!(settings.contains(root_c.to_str().unwrap()), "{settings}");
+    assert!(settings.contains(root_b.to_str().unwrap()), "{settings}");
+    assert!(!settings.contains(root_a.to_str().unwrap()), "{settings}");
+    fs::remove_dir_all(root).unwrap();
+}
+
+
+#[cfg(unix)]
+#[test]
+fn setup_workspace_keeps_invalid_path_unregistered_until_explicit_register() {
+    let (root, home) = fixture_root();
+    let bin = fake_ssh(&root);
+    let (status, output) = run_with_pty_interactions(
+        &home,
+        &["setup", "--scope", "work", "--project", "payments"],
+        &bin,
+        &root,
+        &[
+            (b"SSH config file path:", b"\x15missing\x13"),
+            (b"SETUP_ROOT_NOT_FOUND", b"\x1b"),
+        ],
+        None,
+        Some((100, 36)),
+    );
+    assert_eq!(status.code(), Some(130), "status={status:?} output={output}");
+    assert!(output.contains("SETUP_ROOT_NOT_FOUND"), "output={output}");
+    assert!(!home.join(".config/sshx/config.json").exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+
+#[cfg(unix)]
+#[test]
+fn partial_setup_prefills_scope_and_project_before_registering() {
+    let (root, home) = fixture_root();
+    write(&home.join(".ssh/config"), "Host personal\n  HostName personal.example\n");
+    let config = home.join("configs/ssh_config");
+    write(&config, "Host work-host\n  HostName work.example\n");
+    let bin = fake_ssh(&root);
+    let mut setup_input = b"\x15".to_vec();
+    setup_input.extend_from_slice(config.to_string_lossy().as_bytes());
+    setup_input.extend_from_slice(b"\x13");
+    let (status, output) = run_with_pty_interactions(
+        &home,
+        &["setup", "--scope", "work", "--project", "payments"],
+        &bin,
+        &root,
+        &[
+            (b"SSH config file path:", &setup_input),
+            (b"Config root registered.", b"\x1b"),
+        ],
+        None,
+        Some((100, 36)),
+    );
+    assert!(status.success(), "status={status:?} output={output}");
+    let settings = fs::read_to_string(home.join(".config/sshx/config.json")).unwrap();
+    let document: serde_json::Value = serde_json::from_str(&settings).unwrap();
+    assert_eq!(document["roots"][0]["scope"], "work");
+    assert_eq!(document["roots"][0]["project"], "payments");
+    assert_eq!(document["roots"][0]["path"], config.to_str().unwrap());
+    fs::remove_dir_all(root).unwrap();
+}
+
+
+#[cfg(unix)]
+#[test]
+fn explicit_tui_setup_prefills_config_path() {
+    let (root, home) = fixture_root();
+    let config = home.join("configs/ssh_config");
+    write(&config, "Host personal-host\n  HostName personal.example\n");
+    let bin = fake_ssh(&root);
+    let (status, output) = run_with_pty_interactions(
+        &home,
+        &["tui", "setup", "--config", config.to_str().unwrap(), "--project", "demo"],
+        &bin,
+        &root,
+        &[
+            (b"SSH config file path:", b"\x13"),
+            (b"Config root registered.", b"\x1b"),
+        ],
+        None,
+        Some((100, 36)),
+    );
+    assert!(status.success(), "status={status:?} output={output}");
+    let settings = fs::read_to_string(home.join(".config/sshx/config.json")).unwrap();
+    let document: serde_json::Value = serde_json::from_str(&settings).unwrap();
+    assert_eq!(document["roots"][0]["project"], "demo");
+    assert_eq!(document["roots"][0]["path"], config.to_str().unwrap());
+    fs::remove_dir_all(root).unwrap();
+}
+
+
+#[cfg(unix)]
+#[test]
+fn empty_hosts_doctor_report_stays_visible_until_acknowledged() {
+    let (root, home) = fixture_root();
+    write(&root.join("redirect-stdout"), "");
+    let bin = fake_ssh(&root);
+    let (status, output) = run_with_pty_interactions(
+        &home,
+        &[],
+        &bin,
+        &root,
+        &[
+            (b"No HostEntries", b"\x04"),
+            (b"Evidence and guidance", b"\x1b"),
+            (b"No HostEntries", b"\x1b"),
+        ],
+        None,
+        None,
+    );
+    assert!(status.success(), "status={status:?} output={output}");
+    assert!(!home.join(".config/sshx/config.json").exists());
+    assert!(!root.join("master-started").exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+
+#[cfg(unix)]
+#[test]
+fn setup_cancel_preserves_config_and_registered_roots() {
+    let (root, home) = fixture_root();
+    let config = home.join("configs/pending");
+    let original = "Host pending\n  HostName pending.example\n";
+    write(&config, original);
+    let registered = home.join("configs/registered");
+    write(&registered, "# registered root\n");
+    let saved = format!(
+        "{{\"version\":1,\"roots\":[{{\"scope\":\"personal\",\"path\":\"{}\",\"project\":null}}]}}\n",
+        registered.display()
+    );
+    let settings = home.join(".config/sshx/config.json");
+    write(&settings, &saved);
+    let bin = fake_ssh(&root);
+    let (status, output) = run_with_pty_interactions(
+        &home,
+        &["tui", "setup", "--work", config.to_str().unwrap(), "--project", "payments"],
+        &bin,
+        &root,
+        &[(b"SSH config file path:", b"\x1b")],
+        None,
+        Some((100, 36)),
+    );
+    assert_eq!(status.code(), Some(130), "status={status:?} output={output}");
+    assert_eq!(fs::read_to_string(&settings).unwrap(), saved);
+    assert_eq!(fs::read_to_string(&config).unwrap(), original);
+    assert!(!root.join("master-started").exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+
+#[cfg(unix)]
+#[test]
+fn setup_rejects_missing_config_without_registering_it() {
+    let (root, home) = fixture_root();
+    let missing = home.join("configs/missing");
+    let output = run(
+        &home,
+        &["setup", "--personal", missing.to_str().unwrap(), "--format", "json"],
+    );
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("SETUP_ROOT_NOT_FOUND"));
+
+    assert!(!home.join(".config/sshx/config.json").exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+
+#[cfg(unix)]
+#[test]
+fn setup_rejects_symlinked_root_without_registering_it() {
+    let (root, home) = fixture_root();
+    let target = home.join("configs/ssh_config");
+    let link = home.join("configs/ssh_link");
+    write(&target, "Host valid\n  HostName valid.example\n");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    let output = run(
+        &home,
+        &["setup", "--personal", link.to_str().unwrap(), "--format", "json"],
+    );
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("CONFIG_ROOT_SYMLINK"));
+    assert!(!home.join(".config/sshx/config.json").exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+
+#[cfg(unix)]
+#[test]
+fn complete_setup_cli_registers_root_without_interactive_continuation() {
+    let (root, home) = fixture_root();
+    let config = home.join("configs/ssh_config");
+    write(&config, "Host direct\n  HostName direct.example\n");
+    let output = run(
+        &home,
+        &[
+            "setup",
+            "--project",
+            "payments",
+            "--personal",
+            config.to_str().unwrap(),
+            "--format",
+            "json",
+        ],
+    );
+    assert!(output.status.success(), "{output:?}");
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(document["roots"][0]["scope"], "personal");
+    assert_eq!(document["roots"][0]["project"], "payments");
+    assert_eq!(document["roots"][0]["path"], config.to_str().unwrap());
+    fs::remove_dir_all(root).unwrap();
+}
+
+
+#[cfg(unix)]
+#[test]
+fn empty_hosts_setup_cancel_keeps_explicit_config_available_for_create() {
+    let (root, home) = fixture_root();
+    let config = root.join("unregistered.conf");
+    write(&config, "");
+    let bin = root.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let (status, output) = run_with_pty_interactions(
+        &home,
+        &["--config", config.to_str().unwrap(), "tui"],
+        &bin,
+        &root,
+        &[
+            (b"No HostEntries", b"\x13"),
+            (b"Setup", b"\x1b"),
+            (b"No HostEntries", b"\x0e"),
+            (
+                b"Destination file:",
+                b"unregistered.conf\tsaved\tendpoint.example\x13",
+            ),
+            (b"Review HostEntry changes", b"\n"),
+            (b"Search:", b"\x1b"),
+        ],
+        None,
+        Some((100, 40)),
+    );
+    assert!(status.success(), "status={status:?} output={output}");
+    assert!(
+        fs::read_to_string(&config)
+            .unwrap()
+            .contains("Host saved\n  HostName endpoint.example\n"),
+        "{output}"
+    );
     fs::remove_dir_all(root).unwrap();
 }

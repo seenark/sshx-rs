@@ -562,8 +562,8 @@ fn run_hosts(
                 continue;
             }
             Err(action) if action == "SETUP_TAB" => {
-                status = match run_setup_workspace(home) {
-                    Ok(()) => None,
+                status = match run_setup_workspace(cli, home) {
+                    Ok(()) => Some("Config root registered.".to_string()),
                     Err(error) if error == picker::CANCELLED => None,
                     Err(error) => Some(error),
                 };
@@ -740,34 +740,41 @@ fn run_tunnels_workspace(
     }
 }
 
-fn run_setup_workspace(home: &Path) -> Result<(), String> {
-    let mut fields = [String::new(), String::new(), String::new()];
+fn run_setup_workspace(cli: &Cli, home: &Path) -> Result<(), String> {
+    let mut pending = requested_setup_roots(cli, home).into_iter();
+    let initial = pending.next();
+    let mut fields = [
+        initial.as_ref().map(|root| root.scope.clone())
+            .or_else(|| cli.scopes.first().cloned()).unwrap_or_else(|| "personal".to_string()),
+        initial.as_ref().and_then(|root| root.project.clone())
+            .or_else(|| cli.projects.first().cloned()).unwrap_or_default(),
+        initial.as_ref().map(|root| root.path.to_string_lossy().into_owned()).unwrap_or_default(),
+    ];
     let mut status = None;
     loop {
         let roots = settings::load(home)?;
         let (edited, submit) = picker::setup_workspace(&roots, fields, status.as_deref())?;
         fields = edited;
         if !submit {
-            return Ok(());
+            return Err(picker::CANCELLED.to_string());
         }
         let path = settings::normalize_path(Path::new(fields[2].trim()), home);
-        if !path.is_file() {
-            status = Some(format!("SETUP_ROOT_NOT_FOUND: config root is not a file: {}", path.display()));
-            continue;
-        }
         let scope = fields[0].trim();
-        if !matches!(scope, "personal" | "work") {
-            status = Some("SCOPE_INVALID: select personal or work".to_string());
-            continue;
-        }
-        let mut roots = roots;
-        settings::merge(&mut roots, vec![RegisteredRoot {
+        let addition = RegisteredRoot {
             scope: scope.to_string(),
             project: (!fields[1].trim().is_empty()).then(|| fields[1].trim().to_string()),
             path,
-        }]);
-        settings::save(home, &roots)?;
-        return Ok(());
+        };
+        if let Err(error) = register_setup_roots(home, vec![addition]) {
+            status = Some(error);
+            continue;
+        }
+        if let Some(next) = pending.next() {
+            fields = [next.scope, next.project.unwrap_or_default(), next.path.to_string_lossy().into_owned()];
+            status = Some("Config root registered; review the next supplied root.".to_string());
+        } else {
+            return Ok(());
+        }
     }
 }
 
@@ -777,7 +784,8 @@ fn run_tui_operation(cli: &Cli) -> Result<(), String> {
         return run_pair(cli, &registered_roots(cli)?);
     }
     if matches!(cli.command, Command::Setup) {
-        return run_setup_workspace(&home);
+        run_setup_workspace(cli, &home)?;
+        return run_hosts(cli, &home, &registered_roots(cli)?, Some("Config root registered.".to_string()));
     }
     if matches!(cli.command, Command::Doctor) {
         let (roots, settings_error) = doctor_roots(cli, &home);
@@ -2048,58 +2056,63 @@ fn resolve_relative_path(value: &str, base: &std::path::Path) -> PathBuf {
     }
 }
 
-fn run_setup(cli: &Cli) -> Result<(), String> {
-    let home = home_dir()?;
-    let mut roots = settings::load(&home)?;
-    let mut additions = Vec::new();
-    for request in &cli.roots {
-        let path = settings::normalize_path(&request.path, &home);
-        if !path.is_file() {
-            return Err(format!(
-                "SETUP_ROOT_NOT_FOUND: config root is not a file: {}",
-                path.display()
-            ));
-        }
+fn requested_setup_roots(cli: &Cli, home: &Path) -> Vec<RegisteredRoot> {
+    let mut additions = cli.roots.iter().map(|request| RegisteredRoot {
+        scope: request.scope.clone(),
+        path: settings::normalize_path(&request.path, home),
+        project: request.project.clone().or_else(|| cli.projects.first().cloned()),
+    }).collect::<Vec<_>>();
+    if let Some(config) = &cli.config {
+        let path = settings::normalize_path(config, home);
         additions.push(RegisteredRoot {
-            scope: request.scope.clone(),
+            scope: cli.scopes.first().cloned().unwrap_or_else(|| scope_for_path(&path)),
             path,
-            project: request
-                .project
-                .clone()
-                .or_else(|| cli.projects.first().cloned()),
+            project: cli.projects.first().cloned(),
         });
     }
-    if additions.is_empty() {
+    additions
+}
+
+fn register_setup_roots(home: &Path, additions: Vec<RegisteredRoot>) -> Result<Vec<RegisteredRoot>, String> {
+    for root in &additions {
+        if root.scope.trim().is_empty() {
+            return Err("SCOPE_INVALID: enter a scope such as personal or work".to_string());
+        }
+        if !root.path.is_file() {
+            return Err(format!("SETUP_ROOT_NOT_FOUND: config root is not a file: {}", root.path.display()));
+        }
+    }
+    mutation::validate_mutation_roots(&settings::discovery_roots(&additions))?;
+    let mut roots = settings::load(home)?;
+    settings::merge(&mut roots, additions);
+    settings::save(home, &roots)?;
+    Ok(roots)
+}
+
+fn run_setup(cli: &Cli) -> Result<(), String> {
+    let home = home_dir()?;
+    let mut additions = Vec::new();
+    if cli.roots.is_empty() {
         additions = settings::auto_detect(&home);
+        if cli.config.is_none() {
+            additions.retain(|root| cli.scopes.is_empty() || cli.scopes.contains(&root.scope));
+        }
         if let Some(project) = cli.projects.first() {
             for root in &mut additions {
                 root.project = Some(project.clone());
             }
         }
     }
-    if let Some(config) = &cli.config {
-        let path = settings::normalize_path(config, &home);
-        if !path.is_file() {
-            return Err(format!(
-                "SETUP_ROOT_NOT_FOUND: config root is not a file: {}",
-                path.display()
-            ));
-        }
-        additions.push(RegisteredRoot {
-            scope: cli
-                .scopes
-                .first()
-                .cloned()
-                .unwrap_or_else(|| scope_for_path(&path)),
-            path,
-            project: cli.projects.first().cloned(),
-        });
-    }
+    additions.extend(requested_setup_roots(cli, &home));
     if additions.is_empty() {
-        return Err("SETUP_ROOT_REQUIRED: no existing config roots found".to_string());
+        if !cli.no_input && !cli.format.is_machine() && !cli.password_stdin
+            && io::stdin().is_terminal() && io::stderr().is_terminal()
+        {
+            return run_tui_operation(cli);
+        }
+        return Err("SETUP_ROOT_REQUIRED: provide --personal PATH, --work PATH, or --config PATH; no existing config roots found".to_string());
     }
-    settings::merge(&mut roots, additions);
-    settings::save(&home, &roots)?;
+    let roots = register_setup_roots(&home, additions)?;
     render_roots(&roots, cli.format)
 }
 
