@@ -1,9 +1,10 @@
 use serde_json::Value;
 use std::fs;
 use std::net::TcpListener;
+use std::os::fd::FromRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -302,6 +303,60 @@ fn standalone_direct_tunnel_survives_launcher_and_stops_by_id() {
         "stopped"
     );
     fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn tunnel_bind_machine_output_rejects_terminal_input_without_prompting() {
+    let (root, home, bin) = fixture();
+    let config = home.join(".ssh/config");
+    fs::write(&config, "Host direct\n  HostName direct.example\n  ##PORT 5432\n").unwrap();
+    let mut master = -1;
+    let mut slave = -1;
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        },
+        0
+    );
+    let _master = unsafe { fs::File::from_raw_fd(master) };
+    let slave = unsafe { fs::File::from_raw_fd(slave) };
+    let marker = root.join("master.started");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sshx"))
+        .env("HOME", &home)
+        .env("PATH", format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()))
+        .env("SSHX_TUNNEL_MARKER", &marker)
+        .args([
+            "--config", config.to_str().unwrap(), "tunnel", "direct", "start",
+            "direct", "--bind", "--format", "json",
+        ])
+        .stdin(slave)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(!marker.exists());
+    assert!(!home.join(".config/sshx/tunnels/registry.json").exists());
+    fs::remove_dir_all(root).unwrap();
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("FORWARD_INTERACTIVE_REQUIRED"),
+        "{output:?}"
+    );
 }
 
 

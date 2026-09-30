@@ -1196,9 +1196,12 @@ fn requested_forwards(
     entry: &HostEntry,
     cli: &Cli,
 ) -> Result<Vec<sshx::session::ServiceForward>, String> {
-    if cli.bind && cli.no_input {
+    if cli.bind
+        && (cli.no_input || cli.format.is_machine() || cli.password_stdin
+            || !io::stdin().is_terminal() || !io::stderr().is_terminal())
+    {
         return Err(
-            "FORWARD_INTERACTIVE_REQUIRED: --bind cannot be used with --no-input".to_string(),
+            "FORWARD_INTERACTIVE_REQUIRED: --bind requires usable stdin and stderr terminals without --no-input, piped input, or machine output".to_string(),
         );
     }
     if cli.bind && !cli.forwards.is_empty() {
