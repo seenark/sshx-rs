@@ -247,9 +247,6 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
         if missing_host {
             return Err("HOST_REQUIRED: provide a HostEntry selector outside usable interactive terminals".to_string());
         }
-        if tunnel_incomplete {
-            return Err("FORWARD_REQUIRED: Tunnel requires at least one forwarding mapping outside usable interactive terminals".to_string());
-        }
     }
     if matches!(cli.command, Command::Setup) {
         return run_setup(&cli);

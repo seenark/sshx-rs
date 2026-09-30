@@ -179,7 +179,7 @@ fn standalone_direct_tunnel_survives_launcher_and_stops_by_id() {
     assert_eq!(unsafe_stop.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&unsafe_stop.stderr).contains("REGISTRY_UNSAFE"));
     assert!(marker.exists(), "unproved control reference must not stop master");
-    fs::write(&registry_path, original_registry).unwrap();
+    fs::write(&registry_path, &original_registry).unwrap();
 
     let wrong_route = run(
         &home,
@@ -196,7 +196,12 @@ fn standalone_direct_tunnel_survives_launcher_and_stops_by_id() {
         ],
     );
     assert_eq!(wrong_route.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&wrong_route.stderr).contains("TUNNEL_ROUTE_MISMATCH"));
+    assert!(
+        String::from_utf8_lossy(&wrong_route.stderr).contains("TUNNEL_ROUTE_MISMATCH"),
+        "{wrong_route:?}"
+    );
+    assert!(marker.exists(), "wrong-route start must not stop the master");
+    assert_eq!(fs::read(&registry_path).unwrap(), original_registry);
 
     for operation in ["status", "stop", "restart"] {
         let wrong_lifecycle_route = run(
@@ -214,6 +219,11 @@ fn standalone_direct_tunnel_survives_launcher_and_stops_by_id() {
             "{operation}: {wrong_lifecycle_route:?}"
         );
         assert!(marker.exists(), "wrong-route {operation} must not stop the master");
+        assert_eq!(
+            fs::read(&registry_path).unwrap(),
+            original_registry,
+            "wrong-route {operation} must not change persisted ownership"
+        );
     }
     let paired_list = run(
         &home, &bin, &marker, &["tunnel", "paired", "list", "--format", "json"],
