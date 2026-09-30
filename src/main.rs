@@ -197,7 +197,7 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
         }
         let home = home_dir()?;
         let roots = registered_roots(&cli)?;
-        return run_hosts(&cli, &home, &roots);
+        return run_hosts(&cli, &home, &roots, None);
     }
     if cli.action.is_some() && cli.format.is_machine() {
         return Err(
@@ -207,7 +207,17 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
     }
     validate_connect_without_catalog(&cli)?;
     if matches!(cli.command, Command::UpdateHost(_) | Command::RenameHost(_) | Command::DeleteHost(_)) {
-        return run_host_edit(&cli, &registered_roots(&cli)?);
+        let roots = registered_roots(&cli)?;
+        run_host_edit(&cli, &roots)?;
+        if cli.tui && matches!(cli.command, Command::DeleteHost(_)) {
+            let status = if cli.preview {
+                "HostEntry preview complete."
+            } else {
+                "HostEntry deleted."
+            };
+            return run_hosts(&cli, &home_dir()?, &roots, Some(status.to_string()));
+        }
+        return Ok(());
     }
     if cli.tui {
         let selector = match &cli.command {
@@ -495,11 +505,13 @@ fn start_direct_tunnel(
     )
 }
 
-fn run_hosts(cli: &Cli, home: &Path, roots: &[RegisteredRoot]) -> Result<(), String> {
+fn run_hosts(
+    cli: &Cli, home: &Path, roots: &[RegisteredRoot], initial_status: Option<String>,
+) -> Result<(), String> {
     let mut roots = roots.to_vec();
     let mut state = picker::HostsState::default();
     state.editing_enabled = true;
-    let mut status = None;
+    let mut status = initial_status;
     loop {
         let configured = settings::discovery_roots(&roots);
         let missing_default = cli.config.is_none()
@@ -1897,8 +1909,8 @@ fn has_active_reference(bytes: &[u8], id: &str) -> Result<bool, String> {
     }
     Ok(registry.tunnels.iter().any(|record| {
         matches!(record.state.as_str(), "active" | "starting" | "stopping")
-            && (record.entry_id == id || record.pair.as_ref().is_some_and(|pair| {
-                pair.gateway_entry_id == id || pair.vm_entry_id == id
+            && (record.entry_id.eq_ignore_ascii_case(id) || record.pair.as_ref().is_some_and(|pair| {
+                pair.gateway_entry_id.eq_ignore_ascii_case(id) || pair.vm_entry_id.eq_ignore_ascii_case(id)
             }))
     }))
 }

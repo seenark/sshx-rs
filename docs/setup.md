@@ -81,7 +81,7 @@ sshx doctor --format json
 
 A **HostEntry** is an exact `Host` block identified by source file and Host line. An alias is not a unique identity; duplicate aliases remain separate entries.
 
-To delete from Hosts, press `Ctrl+X` on the selected HostEntry. Review its exact source, Host line, byte span, redacted deletion diff, and Pair dependencies before pressing `Enter`; `Esc` cancels. Pair references and active managed use block deletion. Incomplete `sshx host delete` opens the exact picker and review, and `sshx tui host delete HOST` opens review explicitly. `--preview` never writes, and TUI review still requires confirmation with `--yes`. Fully specified CLI deletion retains its existing consent behavior.
+To delete from Hosts, press `Ctrl+X` on the selected HostEntry. Review its exact source, Host line, byte span, redacted deletion diff, and Pair dependencies before pressing `Enter`; `Esc` cancels. Pair references and active managed use block deletion. Incomplete `sshx host delete` opens the exact picker and review, and `sshx tui host delete HOST` opens review explicitly. After explicit TUI deletion or preview, Hosts shows the result and stays open until you quit. `--preview` never writes, and TUI review still requires confirmation with `--yes`. Fully specified CLI deletion retains its existing consent behavior.
 
 ```sh
 sshx host list

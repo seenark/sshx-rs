@@ -348,6 +348,39 @@ fn host_delete_hosts_shortcut_cancels_then_deletes_exact_duplicate_and_stays_ope
 }
 
 #[test]
+fn host_delete_explicit_tui_result_refreshes_hosts_and_stays_open() {
+    let before = "Host selected secondary\n  HostName old.example\n  ##PASSWORD stored-secret\nHost untouched\n  HostName untouched.example\n";
+    let (root, home, config) = host_edit_fixture("explicit-tui-delete", before);
+    for preview in [false, true] {
+        fs::write(&config, before).unwrap();
+        let mut arguments = vec!["tui", "host", "delete", "secondary", "--yes"];
+        if preview { arguments.push("--preview"); }
+        let mut terminal = HostEditTerminal::open(&home, &config, &arguments);
+        terminal.expect("Review HostEntry mutation");
+        terminal.expect("Alias: secondary");
+        assert!(!String::from_utf8_lossy(&terminal.output).contains("stored-secret"));
+        terminal.send(b"\r");
+        terminal.expect(if preview { "HostEntry preview complete." } else { "HostEntry deleted." });
+        terminal.expect("sshx Hosts");
+        assert!(!String::from_utf8_lossy(&terminal.output).contains("stored-secret"));
+        assert_eq!(fs::read_to_string(&config).unwrap(), if preview {
+            before
+        } else {
+            "Host untouched\n  HostName untouched.example\n"
+        });
+        assert!(terminal.child.try_wait().unwrap().is_none());
+        let size = libc::winsize { ws_row: 39, ws_col: 119, ws_xpixel: 0, ws_ypixel: 0 };
+        assert_eq!(unsafe { libc::ioctl(terminal.master.as_raw_fd(), libc::TIOCSWINSZ, &size) }, 0);
+        terminal.send(b"secondary");
+        terminal.expect(if preview { "old.example" } else { "No matching HostEntry aliases." });
+        assert!(terminal.child.try_wait().unwrap().is_none());
+        terminal.send(b"\x1b");
+        assert_eq!(terminal.finish(), Some(0));
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn host_delete_preview_and_review_cancellation_preserve_source() {
     let before = "Host prod secondary\n  HostName old.example\n  ##PASSWORD stored-secret\n";
     let (root, home, config) = host_edit_fixture("preview-delete", before);
@@ -373,11 +406,16 @@ fn host_delete_preview_and_review_cancellation_preserve_source() {
                 terminal.send(b"\x1b[6~");
             }
             terminal.expect("Enter finish preview");
+            if !hosts {
+                let size = libc::winsize { ws_row: 40, ws_col: 120, ws_xpixel: 0, ws_ypixel: 0 };
+                assert_eq!(unsafe { libc::ioctl(terminal.master.as_raw_fd(), libc::TIOCSWINSZ, &size) }, 0);
+            }
         }
         terminal.send(key);
-        if hosts {
+        if arguments.contains(&"--preview") {
             terminal.expect("HostEntry preview complete.");
             assert!(!contains_tui_text(&terminal.output, "HostEntry deleted."));
+            assert!(terminal.child.try_wait().unwrap().is_none());
             terminal.send(b"\x1b");
         }
         assert_eq!(terminal.finish(), Some(exit));
@@ -461,6 +499,34 @@ fn host_delete_pair_blocker_shows_exact_sources_and_redacts_password() {
     terminal.expect("DELETE_REFERENCED");
     terminal.send(b"\x1b");
     assert_eq!(terminal.finish(), Some(2));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn host_delete_blocks_active_registry_uuid_with_different_case() {
+    let selected = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let unrelated = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    let before = format!("##SSHX ID={selected}\nHost selected\n  HostName selected.example\n");
+    let (root, home, config) = host_edit_fixture("registry-case-delete", &before);
+    let registry = home.join(".config/sshx/tunnels/registry.json");
+    fs::create_dir_all(registry.parent().unwrap()).unwrap();
+    let active_id = selected.to_ascii_uppercase();
+    for role in ["direct", "gateway", "vm"] {
+        let record = match role {
+            "gateway" => serde_json::json!({"state": "active", "entry_id": unrelated,
+                "pair": {"gateway_entry_id": active_id, "vm_entry_id": unrelated}}),
+            "vm" => serde_json::json!({"state": "active", "entry_id": unrelated,
+                "pair": {"gateway_entry_id": unrelated, "vm_entry_id": active_id}}),
+            _ => serde_json::json!({"state": "active", "entry_id": active_id}),
+        };
+        fs::write(&registry, serde_json::json!({"version": 1, "tunnels": [record]}).to_string()).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_sshx"))
+            .arg("--config").arg(&config).args(["host", "delete", "selected", "--yes", "--no-input"])
+            .env("HOME", &home).output().unwrap();
+        assert_eq!(output.status.code(), Some(2), "{role}: {output:?}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("DELETE_ACTIVE"), "{role}: {output:?}");
+        assert_eq!(fs::read_to_string(&config).unwrap(), before);
+    }
     fs::remove_dir_all(root).unwrap();
 }
 
