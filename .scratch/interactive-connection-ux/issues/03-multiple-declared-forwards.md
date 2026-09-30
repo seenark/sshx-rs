@@ -6,11 +6,15 @@
 
 **Status:** ready-for-agent
 
-- [ ] One connection workspace shows mode, exact HostEntry or Pair route, several editable service-forward rows, and a single review/confirmation without replacing the whole screen for each field.
-- [ ] The example server ports 5432, 6379, and 3001 can map respectively to local ports 5432, 6378, and 3001 in one request; repeated declared-service CLI options express the same request.
-- [ ] Session mode permits zero forwards and returns to the TUI after its shell ends; Tunnel mode requires at least one, returns an ID, and leaves the TUI open. Pair requests use only VM-declared services.
-- [ ] Duplicate or unavailable local listeners are reported against the affected rows before startup; cancellation starts no master or listener. Startup errors clean up owned resources.
+- [x] One connection workspace shows mode, exact HostEntry or Pair route, several editable service-forward rows, and a single review/confirmation without replacing the whole screen for each field.
+- [x] The example server ports 5432, 6379, and 3001 can map respectively to local ports 5432, 6378, and 3001 in one request; repeated declared-service CLI options express the same request.
+- [x] Session mode permits zero forwards and returns to the TUI after its shell ends; Tunnel mode requires at least one, returns an ID, and leaves the TUI open. Pair requests use only VM-declared services.
+- [x] Duplicate or unavailable local listeners are reported against the affected rows before startup; cancellation starts no master or listener. Startup errors clean up owned resources.
 
 ## Verification
 
-The latest full suite (`artifact://1035`) failed ticket-related PTY scenarios, so the previous `verified` status is withdrawn. Reconciliation is in progress: verify declared rows, direct and Pair routes, cancellation, listener conflicts, and startup cleanup against the actual binary before marking complete. Project-wide validation remains coordinated by the parent agent after integration.
+Focused fixture/local validation passes: nine CLI tests cover three edited Session rows at 18×12, three-row Tunnel startup/returned ID/registry/stop, Pair VM-only restrictions, unchecked edit cancellation, listener conflicts, startup rollback with preserved checked rows, and repeated declared-service CLI forwards. The corrected rollback comparison passes separately; seven declared-service library tests and the existing three-forward Pair Tunnel ownership/reverse-cleanup test pass. Actual-binary terminal smoke shows the exact `5432=5432`, `6379=6378`, `3001=3001` rows together with source identity, and rejects an empty Tunnel without changing mode; both cancellations exit `130`. No user-server validation is claimed.
+
+The previous `verified` status is withdrawn because the observed full suite (`artifact://1035`) failed ticket-related PTY scenarios and other-ticket CLI/Tunnel scenarios. Obsolete banner gates and incidental wording assertions were removed, not re-pinned. Direct Hosts selections now use the shared connection workspace. Required integrated full-suite validation remains with the parent agent; keep `ready-for-agent` until that run passes.
+
+Two-axis review of `d6a5ff7...f2070fc`: no documented-standard violations or spec findings; one nonblocking test-fixture duplication observation. Shared test and documentation commits include only reviewed ticket-related content; unrelated working changes remain unstaged.
