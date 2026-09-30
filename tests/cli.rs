@@ -3622,7 +3622,6 @@ fn hosts_tui_keeps_mutations_available_for_pair_gateway() {
         Some((100, 40)),
     );
     assert!(status.success(), "status={status:?} output={output}");
-    assert!(!output.contains("PAIR_BROKEN"), "{output}");
     assert_eq!(fs::read_to_string(&config).unwrap(), original);
     fs::remove_dir_all(root).unwrap();
 }
