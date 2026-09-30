@@ -443,10 +443,21 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
 
 fn run_hosts(cli: &Cli, home: &Path, roots: &[RegisteredRoot]) -> Result<(), String> {
     let configured = settings::discovery_roots(roots);
+    let missing_default = cli.config.is_none()
+        && configured.len() == 1
+        && configured[0].path == home.join(".ssh/config")
+        && !configured[0].path.exists();
     let mut state = picker::HostsState::default();
     let mut status = None;
     loop {
-        let catalog = discover_roots(&configured).map_err(|error| error.to_string())?;
+        let catalog = if missing_default {
+            Catalog {
+                entries: Vec::new(),
+                diagnostics: Vec::new(),
+            }
+        } else {
+            discover_roots(&configured).map_err(|error| error.to_string())?
+        };
         let filtered = filter_entries(&catalog.entries, cli);
         let mut sources = HashMap::new();
         for entry in &filtered {
