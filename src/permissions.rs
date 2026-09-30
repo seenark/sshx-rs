@@ -19,9 +19,27 @@ use std::os::unix::fs::MetadataExt;
 
 #[cfg(target_os = "linux")]
 const DIRECTORY_ACCESS: i32 = libc::O_PATH;
-#[cfg(target_vendor = "apple")]
+#[cfg(any(
+    target_vendor = "apple",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "solaris",
+    target_os = "illumos",
+    target_os = "aix",
+))]
 const DIRECTORY_ACCESS: i32 = libc::O_SEARCH;
-#[cfg(all(unix, not(any(target_os = "linux", target_vendor = "apple"))))]
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "solaris",
+        target_os = "illumos",
+        target_os = "aix",
+    ))
+))]
 const DIRECTORY_ACCESS: i32 = libc::O_RDONLY;
 
 #[cfg(unix)]
