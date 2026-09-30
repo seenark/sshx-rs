@@ -648,28 +648,15 @@ fn run_hosts(
                 Some("UNSUPPORTED_MATCH: Match prevents exact runtime configuration".to_string());
             continue;
         }
-        match sshx::pair::paired_route(&catalog.entries, entry) {
-            Ok(Some(_)) => {
-                status = match run_connection_workspace(
-                    cli, &catalog, selection, home, picker::ConnectionMode::Session, false,
-                ) {
-                    Ok(outcome) if outcome.completed => Some("Session ended.".to_string()),
-                    Ok(_) => None,
-                    Err(error) if error == picker::CANCELLED => None,
-                    Err(error) => Some(error),
-                };
-                continue;
-            }
-            Err(error) => {
-                status = Some(error);
-                continue;
-            }
-            Ok(None) => {}
-        }
-        status = Some(match sshx::connect::open(entry, home, false, alias) {
-            Ok(()) => "Session ended.".to_string(),
-            Err(error) => error,
-        });
+        status = match run_connection_workspace(
+            cli, &catalog, selection, home, picker::ConnectionMode::Session, false,
+        ) {
+            Ok(outcome) if outcome.quit => return Ok(()),
+            Ok(outcome) if outcome.completed => Some("Connection completed.".to_string()),
+            Ok(_) => None,
+            Err(error) if error == picker::CANCELLED => None,
+            Err(error) => Some(error),
+        };
     }
 }
 
@@ -1073,11 +1060,21 @@ fn run_connection_workspace(
             local_port: forward.local_port.unwrap_or(0),
         });
     }
-    let route_label = format!(
-        "{} at {}:{} ({})",
-        alias, entry.source.path, entry.source.line_start,
-        if route.is_some() { "Pair" } else { "Direct" }
+    let mut route_label = format!(
+        "{} · {alias}\nSource: {}:{}\nEntry ID: {}",
+        if route.is_some() { "Pair" } else { "Direct" },
+        entry.source.path, entry.source.line_start, entry.id,
     );
+    if let Some(route) = &route {
+        use std::fmt::Write;
+        let _ = write!(
+            route_label,
+            "\nGateway: {} at {}:{} ({})\nVM: {alias} at {}:{} ({})",
+            route.gateway.aliases.join(", "), route.gateway.source.path,
+            route.gateway.source.line_start, route.gateway.id,
+            route.vm.source.path, route.vm.source.line_start, route.vm.id,
+        );
+    }
     let mut restored = None;
     let mut status = forward_warning;
     let mut completed = false;

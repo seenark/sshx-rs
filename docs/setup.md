@@ -187,11 +187,14 @@ Gateway and VM passwords can be supplied separately with `--gateway-password-fd`
 
 ## Service forwards
 
-Normal shell connections do not ask about service forwarding. Request a service explicitly:
+Interactive TUI connections open a workspace for selecting declared services. CLI shell connections do not prompt. Repeat `--forward REMOTE[=LOCAL]` to request several declared services in one operation. The left port is the service port on the server; the right port is the local listener port, which binds to `127.0.0.1` by default:
 
 ```sh
-sshx connect vm-alias --forward 5432=15432 --forward 6379
+sshx connect vm-alias --forward 5432=5432 --forward 6379=6378 --forward 3001=3001
+sshx tunnel direct start db-prod --forward 5432=5432 --forward 6379=6378 --forward 3001=3001 --no-input
 ```
+
+From Hosts, press `Enter` on either a direct HostEntry or a Pair VM to open the same connection workspace. Select rows with `Space`, edit local ports with `E`, and switch Session/Tunnel mode with `M`. Review shows exact source identity and, for a Pair, both gateway and VM identities. `Enter` opens review; a second `Enter` starts the request. Session permits no selected services; Tunnel requires at least one. A failed start keeps edited rows available for correction, and `Esc` returns to Hosts without starting another request.
 
 `--forward REMOTE[=LOCAL]` keeps listeners on `127.0.0.1` by default. `--bind` selects declared `##PORT` services. A requested local port conflict returns a stage-specific error; sshx does not close an unrelated process or silently choose another port.
 
