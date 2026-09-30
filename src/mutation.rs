@@ -63,6 +63,39 @@ pub struct UpdateRequest {
     pub clear_port: bool,
     pub clear_password: bool,
 }
+
+#[derive(Clone, Debug, Default)]
+pub struct CurrentValues {
+    pub hostname: Option<String>,
+    pub user: Option<String>,
+    pub port: Option<u16>,
+    pub has_password: bool,
+}
+
+pub fn current_values(request: &UpdateRequest) -> Result<CurrentValues, String> {
+    let loaded = load_block(request)?;
+    let mut values = CurrentValues::default();
+    for index in loaded.host_line + 1..loaded.block_end_line {
+        let line = loaded.lines[index];
+        let raw = &loaded.before[line.start..line.content_end];
+        if values.hostname.is_none() && directive_matches(raw, "HostName") {
+            values.hostname = argument_span(raw, "HostName")
+                .map(|(start, end)| decode_token(&raw[start..end]));
+        }
+        if values.user.is_none() && directive_matches(raw, "User") {
+            values.user = argument_span(raw, "User")
+                .map(|(start, end)| decode_token(&raw[start..end]));
+        }
+        if values.port.is_none()
+            && directive_matches(raw, "Port")
+            && let Some((start, end)) = argument_span(raw, "Port")
+        {
+            values.port = String::from_utf8_lossy(&raw[start..end]).parse().ok();
+        }
+        values.has_password |= password_line(raw);
+    }
+    Ok(values)
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MutationKind {
@@ -175,36 +208,62 @@ struct Fingerprint {
 }
 
 struct WriterLock {
-    path: PathBuf,
     _file: File,
+    #[cfg(not(unix))]
+    path: PathBuf,
 }
 
 impl WriterLock {
+    #[cfg(unix)]
     fn acquire(path: &Path) -> Result<Self, String> {
         let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        options.mode(0o600);
+        options.read(true).write(true).create(true).truncate(false);
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
         let file = options.open(path).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::AlreadyExists {
-                format!(
-                    "MUTATION_BUSY: another host mutation owns {}",
-                    path.display()
-                )
-            } else {
-                format!(
-                    "MUTATION_LOCK_FAILED: cannot lock {}: {error}",
-                    path.display()
-                )
-            }
+            format!(
+                "MUTATION_LOCK_FAILED: cannot open lock {}: {error}",
+                path.display()
+            )
         })?;
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result != 0 {
+            let error = std::io::Error::last_os_error();
+            let code = if error.kind() == std::io::ErrorKind::WouldBlock {
+                "MUTATION_BUSY"
+            } else {
+                "MUTATION_LOCK_FAILED"
+            };
+            return Err(format!(
+                "{code}: cannot lock {}: {error}",
+                path.display()
+            ));
+        }
+        Ok(Self { _file: file })
+    }
+
+    #[cfg(not(unix))]
+    fn acquire(path: &Path) -> Result<Self, String> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|error| {
+                let code = if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    "MUTATION_BUSY"
+                } else {
+                    "MUTATION_LOCK_FAILED"
+                };
+                format!("{code}: cannot open lock {}: {error}", path.display())
+            })?;
         Ok(Self {
-            path: path.to_path_buf(),
             _file: file,
+            path: path.to_path_buf(),
         })
     }
 }
 
+#[cfg(not(unix))]
 impl Drop for WriterLock {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
@@ -237,6 +296,10 @@ pub fn plan_create(request: &CreateRequest) -> Result<CreatePlan, String> {
     } else {
         0o600
     };
+
+    if request.password.is_some() {
+        validate_password_file_mode(&target, target_mode)?;
+    }
     let target_eol = detect_line_ending(&target_bytes)
         .or_else(|| detect_line_ending(&root_bytes))
         .unwrap_or_else(|| "\n".to_string());
@@ -447,15 +510,20 @@ pub fn plan_pair(request: &PairMutationRequest) -> Result<PairPlan, String> {
 }
 
 pub fn apply_pair(plan: &PairPlan) -> Result<(), String> {
-    recover_pair_journal(&plan.lock_path)?;
     let _lock = WriterLock::acquire(&plan.lock_path)?;
+    let journal_path = pair_journal_path(&plan.lock_path);
+    if journal_path.is_file() {
+        return Err(format!(
+            "PAIR_RECOVERY_PENDING: {} requires explicit recovery before the next Pair mutation",
+            journal_path.display()
+        ));
+    }
     for write in &plan.writes {
         verify_snapshot(write)?;
     }
     if plan.writes.is_empty() {
         return Ok(());
     }
-    let journal_path = pair_journal_path(&plan.lock_path);
     let mut journal = PairJournal { writes: Vec::new() };
     for write in &plan.writes {
         let before = pair_temp(&write.path, "before", &write.before, write.mode)?;
@@ -499,15 +567,85 @@ pub fn apply_pair(plan: &PairPlan) -> Result<(), String> {
             )),
         };
     }
-    cleanup_pair_journal(&journal_path, &journal);
+    cleanup_pair_journal(&journal_path, &journal)?;
     Ok(())
 }
 
-pub fn recover_pair_journals(paths: &[PathBuf]) -> Result<(), String> {
-    for path in paths {
-        recover_pair_journal(&mutation_lock_path(path))?;
+pub fn recover_pair_journals(
+    paths: &[PathBuf],
+    approved_targets: &[PathBuf],
+) -> Result<(), String> {
+    let mut lock_paths = paths
+        .iter()
+        .map(|path| mutation_lock_path(path))
+        .filter(|lock_path| pair_journal_path(lock_path).is_file())
+        .collect::<Vec<_>>();
+    lock_paths.sort();
+    lock_paths.dedup();
+    let _locks = lock_paths
+        .iter()
+        .map(|path| WriterLock::acquire(path))
+        .collect::<Result<Vec<_>, _>>()?;
+    let journals = pair_journals_for_locks(&lock_paths);
+    let targets = pair_recovery_targets(&journals)?;
+    let mut approved_targets = approved_targets.to_vec();
+    approved_targets.sort();
+    approved_targets.dedup();
+    if targets != approved_targets {
+        return Err(
+            "PAIR_RECOVERY_CHANGED: affected files changed after review; review before recovery"
+                .to_string(),
+        );
+    }
+    for lock_path in &lock_paths {
+        recover_pair_journal(lock_path)?;
     }
     Ok(())
+}
+
+pub fn pending_pair_journals(paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut lock_paths = paths
+        .iter()
+        .map(|path| mutation_lock_path(path))
+        .collect::<Vec<_>>();
+    lock_paths.sort();
+    lock_paths.dedup();
+    pair_journals_for_locks(&lock_paths)
+}
+
+fn pair_journals_for_locks(lock_paths: &[PathBuf]) -> Vec<PathBuf> {
+    lock_paths
+        .iter()
+        .map(|lock_path| pair_journal_path(lock_path))
+        .filter(|journal| journal.is_file())
+        .collect()
+}
+
+pub fn pair_recovery_targets(journals: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
+    let mut targets = HashSet::new();
+    for path in journals {
+        let bytes = fs::read(path).map_err(|error| {
+            format!(
+                "MUTATION_RECOVERY_FAILED: cannot read journal {}: {error}",
+                path.display()
+            )
+        })?;
+        let journal: PairJournal = serde_json::from_slice(&bytes).map_err(|error| {
+            format!(
+                "MUTATION_RECOVERY_FAILED: invalid journal {}: {error}",
+                path.display()
+            )
+        })?;
+        targets.extend(
+            journal
+                .writes
+                .into_iter()
+                .map(|write| PathBuf::from(write.path)),
+        );
+    }
+    let mut targets = targets.into_iter().collect::<Vec<_>>();
+    targets.sort();
+    Ok(targets)
 }
 
 fn pair_journal_path(lock_path: &Path) -> PathBuf {
@@ -521,11 +659,16 @@ fn pair_journal_path(lock_path: &Path) -> PathBuf {
 }
 
 fn pair_temp(path: &Path, kind: &str, bytes: &[u8], mode: u32) -> Result<PathBuf, String> {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
     let temporary = path.with_file_name(format!(
-        ".{}.sshx-pair-{kind}-{}",
+        ".{}.sshx-pair-{kind}-{}-{nonce}-{}",
         path.file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("config"),
+        std::process::id(),
         ID_COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
     let mut options = OpenOptions::new();
@@ -571,48 +714,62 @@ fn recover_pair_journal(lock_path: &Path) -> Result<(), String> {
         .map_err(|error| format!("MUTATION_RECOVERY_FAILED: cannot read journal: {error}"))?;
     let journal: PairJournal = serde_json::from_slice(&bytes)
         .map_err(|error| format!("MUTATION_RECOVERY_FAILED: invalid journal: {error}"))?;
-    let result = rollback_pair_journal(&journal_path, &journal);
-    let _ = fs::remove_file(lock_path);
-    result
+    rollback_pair_journal(&journal_path, &journal)
 }
 
 fn rollback_pair_journal(path: &Path, journal: &PairJournal) -> Result<(), String> {
-    let mut failure = None;
+    for write in &journal.writes {
+        let target = PathBuf::from(&write.path);
+        let current = fingerprint(&target)?;
+        if !current.exists
+            || (current.digest != write.before_digest && current.digest != write.after_digest)
+        {
+            return Err(format!(
+                "MUTATION_PARTIAL: refusing rollback after external change: {}",
+                target.display()
+            ));
+        }
+    }
     for write in journal.writes.iter().rev() {
         let target = PathBuf::from(&write.path);
         let current = fingerprint(&target)?;
-        if current.exists && current.digest == write.after_digest {
+        if current.digest == write.after_digest {
             let before = PathBuf::from(&write.before);
             if write.existed {
                 fs::rename(&before, &target).map_err(|error| error.to_string())?;
                 sync_parent(&target)?;
             } else {
                 fs::remove_file(&target).map_err(|error| error.to_string())?;
+                sync_parent(&target)?;
             }
-        } else if current.exists && current.digest == write.before_digest {
-            let _ = fs::remove_file(&write.before);
-        } else {
-            failure = Some(format!(
-                "MUTATION_PARTIAL: refusing rollback after external change: {}",
-                target.display()
-            ));
         }
-        let _ = fs::remove_file(&write.after);
     }
-    let _ = fs::remove_file(path);
-    if let Some(error) = failure {
-        Err(error)
-    } else {
-        Ok(())
-    }
-}
-
-fn cleanup_pair_journal(path: &Path, journal: &PairJournal) {
+    fs::remove_file(path)
+        .map_err(|error| format!("MUTATION_RECOVERY_FAILED: cannot remove journal: {error}"))?;
+    sync_parent(path)
+        .map_err(|error| format!("MUTATION_RECOVERY_FAILED: cannot sync journal removal: {error}"))?;
     for write in &journal.writes {
         let _ = fs::remove_file(&write.before);
         let _ = fs::remove_file(&write.after);
     }
-    let _ = fs::remove_file(path);
+    Ok(())
+}
+
+fn cleanup_pair_journal(path: &Path, journal: &PairJournal) -> Result<(), String> {
+    fs::remove_file(path).map_err(|error| {
+        format!(
+            "MUTATION_COMMIT_CLEANUP_FAILED: cannot remove journal {}: {error}",
+            path.display()
+        )
+    })?;
+    sync_parent(path).map_err(|error| {
+        format!("MUTATION_COMMIT_CLEANUP_FAILED: cannot sync journal removal: {error}")
+    })?;
+    for write in &journal.writes {
+        let _ = fs::remove_file(&write.before);
+        let _ = fs::remove_file(&write.after);
+    }
+    Ok(())
 }
 
 fn sync_parent(path: &Path) -> Result<(), String> {
@@ -720,6 +877,9 @@ pub fn validate_entry_paths(entry: &HostEntry) -> Result<(), String> {
 pub fn plan_update(request: &UpdateRequest) -> Result<EditPlan, String> {
     validate_update_request(request)?;
     let loaded = load_block(request)?;
+    if request.password.is_some() {
+        validate_password_file_mode(&loaded.path, loaded.mode)?;
+    }
     let mut changes = Vec::new();
     if let Some(alias) = &request.alias {
         changes.push(replace_alias(&loaded, &request.selected_alias, alias)?);
@@ -730,14 +890,12 @@ pub fn plan_update(request: &UpdateRequest) -> Result<EditPlan, String> {
         ("User", request.user.as_deref(), request.clear_user),
         ("Port", port_value.as_deref(), request.clear_port),
     ] {
-        if (value.is_some() || clear)
-            && let Some(change) = replace_directive(&loaded, keyword, value, clear)?
-        {
-            changes.push(change);
+        if value.is_some() || clear {
+            changes.extend(replace_directive(&loaded, keyword, value, clear)?);
         }
     }
     if request.password.is_some() || request.clear_password {
-        changes.push(replace_password(
+        changes.extend(replace_password(
             &loaded,
             request.password.as_deref(),
             request.clear_password,
@@ -1033,7 +1191,8 @@ fn replace_directive(
     keyword: &str,
     value: Option<&str>,
     clear: bool,
-) -> Result<Option<Change>, String> {
+) -> Result<Vec<Change>, String> {
+    let mut changes = Vec::new();
     for index in loaded.host_line + 1..loaded.block_end_line {
         let line = loaded.lines[index];
         let raw = &loaded.before[line.start..line.content_end];
@@ -1041,36 +1200,38 @@ fn replace_directive(
             continue;
         }
         if clear {
-            return Ok(Some(Change {
+            changes.push(Change {
                 start: line.start,
                 end: line.end,
                 replacement: Vec::new(),
-            }));
+            });
+            continue;
         }
         let Some((start, end)) = argument_span(raw, keyword) else {
             return Err(format!("CONFIG_CHANGED: {keyword} directive has no value"));
         };
-        return Ok(Some(Change {
+        return Ok(vec![Change {
             start: line.start + start,
             end: line.start + end,
             replacement: value.unwrap_or_default().as_bytes().to_vec(),
-        }));
+        }]);
     }
-    if clear {
-        return Ok(None);
+    if !changes.is_empty() || clear {
+        return Ok(changes);
     }
-    Ok(Some(insert_directive(
+    Ok(vec![insert_directive(
         loaded,
         keyword,
         value.unwrap_or_default(),
-    )))
+    )])
 }
 
 fn replace_password(
     loaded: &LoadedBlock,
     value: Option<&str>,
     clear: bool,
-) -> Result<Change, String> {
+) -> Result<Vec<Change>, String> {
+    let mut changes = Vec::new();
     for index in loaded.host_line + 1..loaded.block_end_line {
         let line = loaded.lines[index];
         let raw = &loaded.before[line.start..line.content_end];
@@ -1078,27 +1239,32 @@ fn replace_password(
             continue;
         }
         if clear {
-            return Ok(Change {
+            changes.push(Change {
                 start: line.start,
                 end: line.end,
                 replacement: Vec::new(),
             });
+            continue;
         }
         let start = password_value_start(raw);
-        return Ok(Change {
+        return Ok(vec![Change {
             start: line.start + start,
             end: line.content_end,
             replacement: value.unwrap_or_default().as_bytes().to_vec(),
-        });
+        }]);
     }
     if clear {
-        return Err("CONFIG_CHANGED: password metadata is already absent".to_string());
+        return if changes.is_empty() {
+            Err("CONFIG_CHANGED: password metadata is already absent".to_string())
+        } else {
+            Ok(changes)
+        };
     }
-    Ok(insert_directive(
+    Ok(vec![insert_directive(
         loaded,
         "##PASSWORD",
         value.unwrap_or_default(),
-    ))
+    )])
 }
 
 fn insert_directive(loaded: &LoadedBlock, keyword: &str, value: &str) -> Change {
@@ -1137,11 +1303,32 @@ fn apply_changes(before: &[u8], mut changes: Vec<Change>) -> Vec<u8> {
 
 fn delete_block(loaded: &LoadedBlock) -> Vec<u8> {
     let host = loaded.lines[loaded.host_line];
+    let selected_id = loaded.marker_range.and_then(|(start, end)| {
+        let text = String::from_utf8_lossy(&loaded.before[start..end]);
+        existing_id(&text)
+    });
+    let next_id_line = (loaded.host_line + 1..loaded.block_end_line).find_map(|index| {
+        let line = loaded.lines[index];
+        let text = String::from_utf8_lossy(&loaded.before[line.start..line.content_end]);
+        let id = existing_id(&text)?;
+        (selected_id.as_deref() != Some(id.as_str())).then_some(index)
+    });
+    let delete_end = next_id_line.map_or(loaded.block_end, |mut index| {
+        while index > loaded.host_line + 1 {
+            let line = loaded.lines[index - 1];
+            let text = String::from_utf8_lossy(&loaded.before[line.start..line.content_end]);
+            if !text.trim().starts_with("##SSHX") {
+                break;
+            }
+            index -= 1;
+        }
+        loaded.lines[index].start
+    });
     let mut after = Vec::with_capacity(
         loaded
             .before
             .len()
-            .saturating_sub(loaded.block_end.saturating_sub(host.start)),
+            .saturating_sub(delete_end.saturating_sub(host.start)),
     );
     if let Some((marker_start, marker_end)) = loaded.marker_range {
         after.extend_from_slice(&loaded.before[..marker_start]);
@@ -1149,7 +1336,7 @@ fn delete_block(loaded: &LoadedBlock) -> Vec<u8> {
     } else {
         after.extend_from_slice(&loaded.before[..host.start]);
     }
-    after.extend_from_slice(&loaded.before[loaded.block_end..]);
+    after.extend_from_slice(&loaded.before[delete_end..]);
     after
 }
 
@@ -1348,6 +1535,16 @@ fn validate_request(request: &CreateRequest) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_password_file_mode(path: &Path, mode: u32) -> Result<(), String> {
+    if mode & 0o077 != 0 {
+        return Err(format!(
+            "PASSWORD_FILE_INSECURE: destination must deny group and other access before storing a password: {}",
+            display_path(path)
+        ));
+    }
+    Ok(())
+}
+
 fn ensure_snapshot_bytes(snapshot: &Fingerprint, bytes: &[u8], path: &Path) -> Result<(), String> {
     if (!snapshot.exists && bytes.is_empty())
         || (snapshot.exists
@@ -1470,37 +1667,34 @@ fn edit_patch(path: &Path, before: &[u8], after: &[u8]) -> String {
     }
     let old_changed = &old_lines[prefix..old_end];
     let new_changed = &new_lines[prefix..new_end];
-    let secret = old_changed
-        .iter()
-        .any(|line| password_line(&before[line.start..line.content_end]))
-        || new_changed
-            .iter()
-            .any(|line| password_line(&after[line.start..line.content_end]));
     let mut patch = format!(
         "--- {}\n+++ {}\n@@\n",
         display_path(path),
         display_path(path)
     );
-    if secret {
-        if !old_changed.is_empty() {
-            patch.push_str("-<redacted secret-bearing block>\n");
-        }
-        if !new_changed.is_empty() {
-            patch.push_str("+<redacted secret-bearing block>\n");
-        }
-        return patch;
-    }
     for line in old_changed {
         patch.push('-');
-        patch.push_str(&display_line(before, *line));
+        patch.push_str(&display_edit_line(before, *line));
         patch.push('\n');
     }
     for line in new_changed {
         patch.push('+');
-        patch.push_str(&display_line(after, *line));
+        patch.push_str(&display_edit_line(after, *line));
         patch.push('\n');
     }
     patch
+}
+
+fn display_edit_line(bytes: &[u8], line: ByteLine) -> String {
+    let raw = &bytes[line.start..line.content_end];
+    if password_line(raw) {
+        format!(
+            "{}<redacted>",
+            String::from_utf8_lossy(&raw[..password_value_start(raw)])
+        )
+    } else {
+        display_line(bytes, line)
+    }
 }
 
 fn display_line(bytes: &[u8], line: ByteLine) -> String {
@@ -1832,4 +2026,297 @@ fn absolute_path(path: &Path) -> Result<PathBuf, String> {
 
 fn display_path(path: &Path) -> String {
     path.to_string_lossy().into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        PairJournal, PairJournalWrite, edit_patch, pair_recovery_targets, recover_pair_journals,
+    };
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn edit_review_shows_nonsecret_changes_and_redacts_password_values() {
+        let before = b"Host app\n  User old-user\n  ##PASSWORD old-secret\n";
+        let after = b"Host app\n  User new-user\n  ##PASSWORD new-secret\n";
+        let review = edit_patch(Path::new("config"), before, after);
+
+        assert!(review.contains("-  User old-user"));
+        assert!(review.contains("+  User new-user"));
+        assert!(review.contains("-  ##PASSWORD <redacted>"));
+        assert!(review.contains("+  ##PASSWORD <redacted>"));
+        assert!(!review.contains("old-secret"));
+        assert!(!review.contains("new-secret"));
+    }
+
+    #[test]
+    fn recovery_preview_lists_distinct_affected_files() {
+        let journal_path = std::env::temp_dir().join(format!(
+            "sshx-recovery-targets-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let gateway = PathBuf::from("/tmp/sshx-gateway-config");
+        let vm = PathBuf::from("/tmp/sshx-vm-config");
+        let write = |path: &Path| PairJournalWrite {
+            path: path.to_string_lossy().into_owned(),
+            before: String::new(),
+            after: String::new(),
+            before_digest: 0,
+            after_digest: 0,
+            existed: true,
+        };
+        let journal = PairJournal {
+            writes: vec![write(&vm), write(&gateway), write(&gateway)],
+        };
+        fs::write(&journal_path, serde_json::to_vec(&journal).unwrap()).unwrap();
+
+        let targets = pair_recovery_targets(std::slice::from_ref(&journal_path)).unwrap();
+        fs::remove_file(journal_path).unwrap();
+
+        assert_eq!(targets, [gateway, vm]);
+    }
+
+    #[test]
+    fn recovery_does_not_lock_roots_without_journals() {
+        let directory = std::env::temp_dir().join(format!(
+            "sshx-recovery-empty-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let target = directory.join("config");
+        let lock = super::mutation_lock_path(&target);
+
+        recover_pair_journals(&[target], &[]).unwrap();
+
+        assert!(!lock.exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn recovery_reuses_stale_crash_lock_and_keeps_lock_file() {
+        let directory = std::env::temp_dir().join(format!(
+            "sshx-recovery-stale-lock-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let target = directory.join("config");
+        let before = directory.join("before");
+        let after = directory.join("after");
+        let lock = super::mutation_lock_path(&target);
+        let journal_path = super::pair_journal_path(&lock);
+        fs::write(&target, b"after").unwrap();
+        fs::write(&before, b"before").unwrap();
+        fs::write(&after, b"after").unwrap();
+        fs::write(&lock, b"stale lock file from crashed writer").unwrap();
+        let journal = PairJournal {
+            writes: vec![PairJournalWrite {
+                path: target.to_string_lossy().into_owned(),
+                before: before.to_string_lossy().into_owned(),
+                after: after.to_string_lossy().into_owned(),
+                before_digest: super::digest(b"before"),
+                after_digest: super::digest(b"after"),
+                existed: true,
+            }],
+        };
+        fs::write(&journal_path, serde_json::to_vec(&journal).unwrap()).unwrap();
+
+        recover_pair_journals(
+            std::slice::from_ref(&target),
+            std::slice::from_ref(&target),
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(&target).unwrap(), b"before");
+        assert!(lock.is_file());
+        assert!(!journal_path.exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn recovery_requires_review_of_current_journal_targets() {
+        let directory = std::env::temp_dir().join(format!(
+            "sshx-recovery-review-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let target = directory.join("config");
+        let before = directory.join("before");
+        let after = directory.join("after");
+        let lock = super::mutation_lock_path(&target);
+        let journal_path = super::pair_journal_path(&lock);
+        fs::write(&target, b"after").unwrap();
+        fs::write(&before, b"before").unwrap();
+        fs::write(&after, b"after").unwrap();
+        let journal = PairJournal {
+            writes: vec![PairJournalWrite {
+                path: target.to_string_lossy().into_owned(),
+                before: before.to_string_lossy().into_owned(),
+                after: after.to_string_lossy().into_owned(),
+                before_digest: super::digest(b"before"),
+                after_digest: super::digest(b"after"),
+                existed: true,
+            }],
+        };
+        fs::write(&journal_path, serde_json::to_vec(&journal).unwrap()).unwrap();
+
+        let approved = [directory.join("different-config")];
+        let error =
+            recover_pair_journals(std::slice::from_ref(&target), &approved).unwrap_err();
+
+        assert!(error.starts_with("PAIR_RECOVERY_CHANGED"), "{error}");
+        assert!(journal_path.exists());
+        assert!(before.exists());
+        assert_eq!(fs::read(&target).unwrap(), b"after");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn failed_journal_removal_keeps_recovery_backups() {
+        let directory = std::env::temp_dir().join(format!(
+            "sshx-journal-cleanup-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let journal_path = directory.join("journal");
+        let before = directory.join("before");
+        let after = directory.join("after");
+        fs::create_dir(&journal_path).unwrap();
+        fs::write(&before, b"before").unwrap();
+        fs::write(&after, b"after").unwrap();
+        let journal = PairJournal {
+            writes: vec![PairJournalWrite {
+                path: directory.join("config").to_string_lossy().into_owned(),
+                before: before.to_string_lossy().into_owned(),
+                after: after.to_string_lossy().into_owned(),
+                before_digest: super::digest(b"before"),
+                after_digest: super::digest(b"after"),
+                existed: true,
+            }],
+        };
+
+        let error = super::cleanup_pair_journal(&journal_path, &journal).unwrap_err();
+
+        assert!(error.starts_with("MUTATION_COMMIT_CLEANUP_FAILED"), "{error}");
+        assert!(before.exists());
+        assert!(after.exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn recovery_refuses_external_changes_without_discarding_journal() {
+        let directory = std::env::temp_dir().join(format!(
+            "sshx-recovery-conflict-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let target = directory.join("external");
+        let before = directory.join("before");
+        let after = directory.join("after");
+        let safe_target = directory.join("safe");
+        let safe_before = directory.join("safe-before");
+        let safe_after = directory.join("safe-after");
+        let journal_path = directory.join("lock.journal");
+        fs::write(&target, b"external edit").unwrap();
+        fs::write(&before, b"before").unwrap();
+        fs::write(&after, b"after").unwrap();
+        fs::write(&safe_target, b"after-safe").unwrap();
+        fs::write(&safe_before, b"before-safe").unwrap();
+        fs::write(&safe_after, b"after-safe").unwrap();
+        let journal = PairJournal {
+            writes: vec![
+                PairJournalWrite {
+                    path: target.to_string_lossy().into_owned(),
+                    before: before.to_string_lossy().into_owned(),
+                    after: after.to_string_lossy().into_owned(),
+                    before_digest: super::digest(b"before"),
+                    after_digest: super::digest(b"after"),
+                    existed: true,
+                },
+                PairJournalWrite {
+                    path: safe_target.to_string_lossy().into_owned(),
+                    before: safe_before.to_string_lossy().into_owned(),
+                    after: safe_after.to_string_lossy().into_owned(),
+                    before_digest: super::digest(b"before-safe"),
+                    after_digest: super::digest(b"after-safe"),
+                    existed: true,
+                },
+            ],
+        };
+        fs::write(&journal_path, serde_json::to_vec(&journal).unwrap()).unwrap();
+
+        let error = super::rollback_pair_journal(&journal_path, &journal).unwrap_err();
+
+        assert!(error.contains("MUTATION_PARTIAL"));
+        assert!(journal_path.exists());
+        assert!(before.exists());
+        assert!(after.exists());
+        assert!(safe_before.exists());
+        assert!(safe_after.exists());
+        assert_eq!(fs::read(&target).unwrap(), b"external edit");
+        assert_eq!(fs::read(&safe_target).unwrap(), b"after-safe");
+        fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn successful_rollback_restores_target_and_removes_recovery_data() {
+        let directory = std::env::temp_dir().join(format!(
+            "sshx-recovery-success-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let target = directory.join("config");
+        let before = directory.join("before");
+        let after = directory.join("after");
+        let journal_path = directory.join("lock.journal");
+        fs::write(&target, b"after").unwrap();
+        fs::write(&before, b"before").unwrap();
+        fs::write(&after, b"after").unwrap();
+        let journal = PairJournal {
+            writes: vec![PairJournalWrite {
+                path: target.to_string_lossy().into_owned(),
+                before: before.to_string_lossy().into_owned(),
+                after: after.to_string_lossy().into_owned(),
+                before_digest: super::digest(b"before"),
+                after_digest: super::digest(b"after"),
+                existed: true,
+            }],
+        };
+        fs::write(&journal_path, serde_json::to_vec(&journal).unwrap()).unwrap();
+
+        super::rollback_pair_journal(&journal_path, &journal).unwrap();
+
+        assert_eq!(fs::read(&target).unwrap(), b"before");
+        assert!(!journal_path.exists());
+        assert!(!before.exists());
+        assert!(!after.exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
 }

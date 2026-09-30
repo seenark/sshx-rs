@@ -126,9 +126,12 @@ struct Runtime {
     socket: PathBuf,
     alias: String,
     known_hosts: PathBuf,
+    user_known_hosts_file_configured: bool,
+    strict_host_key_checking_configured: bool,
     entry: HostEntry,
     configured_password: Option<String>,
     forwards: Vec<ServiceForward>,
+    extra_listeners: Vec<(String, u16)>,
     preserve_dir: bool,
 }
 pub(crate) struct StandaloneRuntime {
@@ -228,19 +231,39 @@ impl Drop for SessionService {
 }
 
 impl Runtime {
-    fn create(
+    fn create_with_direct_forwards(
         entry: &HostEntry,
         home: &Path,
         selected_alias: &str,
         forwards: &[ServiceForward],
+        direct_forwards: &[session::ForwardSpec],
         no_input: bool,
     ) -> Result<Self, String> {
-        let content = if forwards.is_empty() {
+        let mut content = if forwards.is_empty() {
             compile_config(entry, selected_alias)?
         } else {
             compile_config_with_forwards(entry, selected_alias, forwards)?
         };
-        Self::create_with_content(entry, home, selected_alias, content, forwards, no_input)
+        for forward in direct_forwards {
+            let (directive, argument) = match forward.flag() {
+                'L' => ("LocalForward", local_forward_argument(forward)?),
+                'R' => ("RemoteForward", remote_forward_argument(forward)?),
+                'D' => ("DynamicForward", forward.effective.clone()),
+                _ => continue,
+            };
+            let index = content.rfind("Include ").ok_or_else(|| {
+                "CONFIG_INVALID: runtime config has no system Include boundary".to_string()
+            })?;
+            content.insert_str(index, &format!("  {directive} {argument}\n"));
+        }
+        let mut runtime =
+            Self::create_with_content(entry, home, selected_alias, content, forwards, no_input)?;
+        runtime.extra_listeners = direct_forwards
+            .iter()
+            .filter(|forward| matches!(forward.flag(), 'L' | 'D'))
+            .filter_map(session::ForwardSpec::listener)
+            .collect();
+        Ok(runtime)
     }
 
     fn create_with_content(
@@ -290,8 +313,19 @@ impl Runtime {
         let config = dir.join("config");
         let socket = dir.join("master.sock");
         let known_hosts = known_hosts_path(home, entry);
-        ensure_known_hosts_parent(&known_hosts)?;
-
+        let user_known_hosts_file_configured = content.lines().any(|raw| {
+            let line = strip_inline_comment(raw.trim()).trim();
+            split_directive(line)
+                .is_ok_and(|(keyword, _)| keyword.eq_ignore_ascii_case("userknownhostsfile"))
+        });
+        let strict_host_key_checking_configured = content.lines().any(|raw| {
+            let line = strip_inline_comment(raw.trim()).trim();
+            split_directive(line)
+                .is_ok_and(|(keyword, _)| keyword.eq_ignore_ascii_case("stricthostkeychecking"))
+        });
+        if !user_known_hosts_file_configured {
+            ensure_known_hosts_parent(&known_hosts)?;
+        }
         write_private_file(&config, content.as_bytes())?;
         Ok(Self {
             dir,
@@ -299,9 +333,12 @@ impl Runtime {
             socket,
             alias: selected_alias.to_string(),
             known_hosts,
+            strict_host_key_checking_configured,
+            user_known_hosts_file_configured,
             entry: entry.clone(),
             configured_password,
             forwards: forwards.to_vec(),
+            extra_listeners: Vec::new(),
             preserve_dir,
         })
     }
@@ -429,11 +466,75 @@ pub fn open_with_password_fd_and_forwards(
     password_fd: Option<i32>,
     forwards: &[ServiceForward],
 ) -> Result<(), String> {
+    open_with_password_fd_and_all_forwards(
+        entry, home, no_input, selected_alias, password_fd, forwards, &[],
+    )
+}
+
+pub fn open_with_password_fd_and_all_forwards(
+    entry: &HostEntry,
+    home: &Path,
+    no_input: bool,
+    selected_alias: &str,
+    password_fd: Option<i32>,
+    forwards: &[ServiceForward],
+    direct_forwards: &[session::ForwardSpec],
+) -> Result<(), String> {
     SIGNAL.store(0, Ordering::Relaxed);
     install_signal_handlers();
-    let result = open_session(entry, home, no_input, selected_alias, password_fd, forwards);
+    let result = open_session(
+        entry,
+        home,
+        no_input,
+        selected_alias,
+        password_fd,
+        forwards,
+        direct_forwards,
+    );
     reset_signal_handlers();
     result
+}
+
+fn preflight_direct_listeners(
+    forwards: &[ServiceForward],
+    direct_forwards: &[session::ForwardSpec],
+) -> Result<(), String> {
+    let mut addresses = Vec::with_capacity(forwards.len() + direct_forwards.len());
+    for forward in forwards {
+        addresses.push(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            forward.local_port,
+        )));
+    }
+    let mut listeners = Vec::new();
+    for forward in direct_forwards
+        .iter()
+        .filter(|forward| matches!(forward.flag(), 'L' | 'D'))
+    {
+        let (bind, port) = forward.listener().ok_or_else(|| {
+            format!(
+                "FORWARD_INVALID: -{} requires a local listener",
+                forward.flag()
+            )
+        })?;
+        let address = if bind == "localhost" {
+            "127.0.0.1".parse()
+        } else {
+            bind.parse()
+        }
+        .map(|ip| std::net::SocketAddr::new(ip, port))
+        .map_err(|_| format!("FORWARD_BIND_INVALID: cannot parse bind address {bind}"))?;
+        if addresses.contains(&address) {
+            return Err(format!(
+                "FORWARD_DUPLICATE: local listener {bind}:{port} was requested more than once"
+            ));
+        }
+        listeners.push(TcpListener::bind(address).map_err(|error| {
+            format!("SERVICE_BIND_FAILED: cannot reserve local listener {bind}:{port}: {error}")
+        })?);
+        addresses.push(address);
+    }
+    Ok(())
 }
 
 fn open_session(
@@ -443,9 +544,18 @@ fn open_session(
     selected_alias: &str,
     password_fd: Option<i32>,
     forwards: &[ServiceForward],
+    direct_forwards: &[session::ForwardSpec],
 ) -> Result<(), String> {
     session::preflight(forwards)?;
-    let runtime = Runtime::create(entry, home, selected_alias, forwards, no_input)?;
+    preflight_direct_listeners(forwards, direct_forwards)?;
+    let runtime = Runtime::create_with_direct_forwards(
+        entry,
+        home,
+        selected_alias,
+        forwards,
+        direct_forwards,
+        no_input,
+    )?;
     let mut attempt = match password_fd {
         Some(fd) => Some(read_password_fd(fd)?),
         None => runtime
@@ -455,12 +565,12 @@ fn open_session(
     };
     let mut enrolled = false;
     let master = loop {
-        let mut master = spawn_master(&runtime, no_input, attempt.as_ref(), !forwards.is_empty())?;
+        let mut master = spawn_master(&runtime, no_input, attempt.as_ref(), !forwards.is_empty() || !direct_forwards.is_empty())?;
         match wait_for_master(
             &runtime,
             &mut master,
             no_input,
-            if forwards.is_empty() {
+            if forwards.is_empty() && direct_forwards.is_empty() {
                 ForwardStage::None
             } else {
                 ForwardStage::Service
@@ -509,7 +619,6 @@ fn open_session(
         Err(format!("SESSION_EXIT: {status}"))
     }
 }
-
 pub fn open_paired(
     route: &PairedRoute,
     home: &Path,
@@ -698,7 +807,7 @@ fn authenticate_paired_master(
 }
 
 fn paired_stage_error(role: &str, error: String) -> String {
-    if error.starts_with("SESSION_INTERRUPTED") {
+    if error.starts_with("SESSION_INTERRUPTED") || error.starts_with("SESSION_START_INTERRUPTED") {
         return error;
     }
     if role.eq_ignore_ascii_case("gateway")
@@ -1077,17 +1186,81 @@ fn wait_for_standalone_ready(
 
 fn local_listeners_ready(listeners: &[(String, u16)]) -> bool {
     listeners.iter().all(|(host, port)| {
-        let address = host
-            .parse::<std::net::IpAddr>()
-            .map(|address| std::net::SocketAddr::new(address, *port))
-            .or_else(|_| format!("{host}:{port}").parse())
-            .ok();
+        let address = if host == "localhost" {
+            Some(std::net::SocketAddr::from((
+                std::net::Ipv4Addr::LOCALHOST,
+                *port,
+            )))
+        } else {
+            host.parse::<std::net::IpAddr>()
+                .map(|address| std::net::SocketAddr::new(address, *port))
+                .or_else(|_| format!("{host}:{port}").parse())
+                .ok()
+        };
         address
             .and_then(|address| {
                 TcpStream::connect_timeout(&address, Duration::from_millis(100)).ok()
             })
             .is_some()
     })
+}
+fn remote_forward_argument(forward: &session::ForwardSpec) -> Result<String, String> {
+    let fields = split_forward_fields(&forward.effective);
+    let [bind, port, _, _] = fields.as_slice() else {
+        return Err("FORWARD_INVALID: remote forward has invalid effective value".to_string());
+    };
+    let host = forward.remote_host.as_deref().ok_or_else(|| {
+        "FORWARD_INVALID: remote forward has no destination host".to_string()
+    })?;
+    let remote_port = forward.remote_port.ok_or_else(|| {
+        "FORWARD_INVALID: remote forward has no destination port".to_string()
+    })?;
+    Ok(format!("{bind}:{port} {}:{remote_port}", forward_host(host)))
+}
+fn local_forward_argument(forward: &session::ForwardSpec) -> Result<String, String> {
+    let (bind, port) = forward.listener().ok_or_else(|| {
+        "FORWARD_INVALID: local forward requires a local listener".to_string()
+    })?;
+    let host = forward
+        .remote_host
+        .as_deref()
+        .ok_or_else(|| "FORWARD_INVALID: local forward has no destination host".to_string())?;
+    let remote_port = forward.remote_port.ok_or_else(|| {
+        "FORWARD_INVALID: local forward has no destination port".to_string()
+    })?;
+    Ok(format!(
+        "{}:{port} {}:{remote_port}",
+        forward_host(&bind),
+        forward_host(host)
+    ))
+}
+
+
+fn split_forward_fields(value: &str) -> Vec<&str> {
+    let mut fields = Vec::new();
+    let mut start = 0;
+    let mut bracketed = false;
+    for (index, character) in value.char_indices() {
+        match character {
+            '[' => bracketed = true,
+            ']' => bracketed = false,
+            ':' if !bracketed => {
+                fields.push(&value[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    fields.push(&value[start..]);
+    fields
+}
+
+fn forward_host(host: &str) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    }
 }
 
 pub(crate) fn standalone_master_ready(runtime: &StandaloneRuntime) -> bool {
@@ -1171,7 +1344,8 @@ fn spawn_shell(runtime: &Runtime, no_input: bool) -> Result<Child, String> {
 }
 
 fn enroll_host_key(runtime: &Runtime) -> Result<(), String> {
-    let before = fs::read(&runtime.known_hosts).unwrap_or_default();
+    let known_hosts = effective_known_hosts(runtime)?;
+    let before = known_hosts_snapshot(&known_hosts)?;
     let mut command = ssh_command(runtime, false, false);
     command.args([
         "-o",
@@ -1200,12 +1374,60 @@ fn enroll_host_key(runtime: &Runtime) -> Result<(), String> {
         .stderr(Stdio::inherit())
         .status()
         .map_err(|error| format!("HOST_KEY_TRUST_REQUIRED: cannot enroll host key: {error}"))?;
-    let after = fs::read(&runtime.known_hosts).unwrap_or_default();
-    if after != before {
+    verify_host_key_enrollment(&known_hosts, &before)
+}
+
+fn verify_host_key_enrollment(paths: &[PathBuf], before: &[Option<Vec<u8>>]) -> Result<(), String> {
+    if known_hosts_snapshot(paths)? != before {
         Ok(())
     } else {
         Err("HOST_KEY_TRUST_REQUIRED: host key requires interactive confirmation".to_string())
     }
+}
+fn effective_known_hosts(runtime: &Runtime) -> Result<Vec<PathBuf>, String> {
+    if !runtime.user_known_hosts_file_configured {
+        return Ok(vec![runtime.known_hosts.clone()]);
+    }
+    let mut command = ssh_command(runtime, false, false);
+    command.args(["-G", "-o", "ControlMaster=no", "-o", "ControlPath=none"]);
+    command.arg(&runtime.alias);
+    let output = command.output().map_err(|error| {
+        format!("HOST_KEY_TRUST_REQUIRED: cannot read effective SSH config: {error}")
+    })?;
+    if !output.status.success() {
+        return Err("HOST_KEY_TRUST_REQUIRED: cannot read effective SSH config".to_string());
+    }
+    parse_effective_known_hosts(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_effective_known_hosts(text: &str) -> Result<Vec<PathBuf>, String> {
+    let paths = text
+        .lines()
+        .find_map(|line| line.strip_prefix("userknownhostsfile "))
+        .into_iter()
+        .flat_map(str::split_whitespace)
+        .filter(|path| *path != "none")
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
+        return Err(
+            "HOST_KEY_TRUST_REQUIRED: effective SSH config has no known-hosts file".to_string(),
+        );
+    }
+    Ok(paths)
+}
+fn known_hosts_snapshot(paths: &[PathBuf]) -> Result<Vec<Option<Vec<u8>>>, String> {
+    paths
+        .iter()
+        .map(|path| match fs::read(path) {
+            Ok(contents) => Ok(Some(contents)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(format!(
+                "HOST_KEY_TRUST_REQUIRED: cannot inspect {}: {error}",
+                path.display()
+            )),
+        })
+        .collect()
 }
 #[cfg(unix)]
 struct PasswordPipe {
@@ -1348,26 +1570,21 @@ fn append_ssh_args(
         } else {
             "BatchMode=yes"
         },
-        "-o",
-        if strict {
-            "StrictHostKeyChecking=yes"
-        } else {
-            "StrictHostKeyChecking=ask"
-        },
-        "-o",
-        "NoHostAuthenticationForLocalhost=no",
-        "-o",
-        "CheckHostIP=no",
-        "-o",
-        "GlobalKnownHostsFile=/dev/null",
-        "-o",
-        "KnownHostsCommand=none",
-        "-o",
-        "VerifyHostKeyDNS=no",
-        "-o",
-        "UpdateHostKeys=no",
-        "-o",
-        known_hosts.as_str(),
+    ]);
+    if !runtime.strict_host_key_checking_configured {
+        command.args([
+            "-o",
+            if strict {
+                "StrictHostKeyChecking=yes"
+            } else {
+                "StrictHostKeyChecking=ask"
+            },
+        ]);
+    }
+    if !runtime.user_known_hosts_file_configured {
+        command.args(["-o", known_hosts.as_str()]);
+    }
+    command.args([
         "-o",
         if password {
             "PreferredAuthentications=password"
@@ -1400,7 +1617,7 @@ fn wait_for_master(
     let started = SystemTime::now();
     loop {
         if let Some(signal) = received_signal() {
-            return Err(format!("SESSION_INTERRUPTED: signal {signal}"));
+            return Err(format!("SESSION_START_INTERRUPTED: signal {signal}"));
         }
         if let Some(status) = master
             .try_wait()
@@ -1425,7 +1642,7 @@ fn wait_for_master(
                     .ge(&FORWARD_READY_TIMEOUT)
                 {
                     return Err(
-                        "SERVICE_BIND_FAILED: timed out waiting for requested service listener"
+                        "SERVICE_BIND_FAILED: timed out waiting for requested local listener"
                             .to_string(),
                     );
                 }
@@ -1449,7 +1666,7 @@ fn service_forwards_ready(runtime: &Runtime) -> bool {
             Duration::from_millis(100),
         )
         .is_ok()
-    })
+    }) && local_listeners_ready(&runtime.extra_listeners)
 }
 
 fn wait_for_shell(shell: &mut Child) -> Result<ExitStatus, String> {
@@ -2048,6 +2265,7 @@ fn compile_config_with_transform(
             );
         }
         let proxy_command = keyword.eq_ignore_ascii_case("proxycommand");
+        let user_known_hosts_file = keyword.eq_ignore_ascii_case("userknownhostsfile");
         if proxy_command
             && matches!(
                 transform,
@@ -2059,7 +2277,7 @@ fn compile_config_with_transform(
                     .to_string(),
             );
         }
-        if argument.contains('%') && !proxy_command {
+        if argument.contains('%') && !proxy_command && !user_known_hosts_file {
             return Err(format!(
                 "UNSUPPORTED_TOKEN_SEMANTICS: {keyword} contains token expansion"
             ));
@@ -2289,6 +2507,7 @@ fn supported_directive(keyword: &str) -> bool {
             | "identityagent"
             | "identityfile"
             | "usekeychain"
+            | "userknownhostsfile"
             | "ignoreunknown"
             | "ipqos"
             | "kbdinteractiveauthentication"
@@ -2313,6 +2532,7 @@ fn supported_directive(keyword: &str) -> bool {
             | "sendenv"
             | "serveralivecountmax"
             | "serveraliveinterval"
+            | "sessiontype"
             | "setenv"
             | "streamlocalbindunlink"
             | "stricthostkeychecking"
@@ -2485,8 +2705,8 @@ fn set_mode(path: &Path, mode: u32) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Runtime, compile_config, compile_config_with_forwards, known_hosts_path,
-        paired_stage_error, service_forwards_ready,
+        Runtime, compile_config, compile_config_with_forwards, effective_known_hosts,
+        known_hosts_path, paired_stage_error, service_forwards_ready,
     };
     use crate::discovery::{HostEntry, Provenance, SourceIdentity};
     use crate::session::ServiceForward;
@@ -2538,6 +2758,55 @@ mod tests {
     }
 
     #[test]
+    fn explicit_host_key_directives_are_not_overridden() {
+        let directory = tempfile_directory();
+        let source = directory.join("config");
+        let mut selected = entry(source.clone(), &["exact"]);
+        let content = concat!(
+            "Host exact\n",
+            "  HostName example.test\n",
+            "  StrictHostKeyChecking no\n",
+            "  UserKnownHostsFile /dev/null\n",
+        )
+        .to_string();
+        fs::write(&source, &content).expect("source should be written");
+        selected.source.byte_end = content.len();
+        let runtime =
+            Runtime::create_with_content(&selected, &directory, "exact", content, &[], false)
+                .expect("runtime should preserve host-key directives");
+        assert!(runtime.strict_host_key_checking_configured);
+        assert!(runtime.user_known_hosts_file_configured);
+        assert!(!runtime.known_hosts.exists());
+        let arguments = super::ssh_command(&runtime, false, true)
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(!arguments.iter().any(|argument| {
+            argument == "StrictHostKeyChecking=yes" || argument == "StrictHostKeyChecking=ask"
+        }));
+        assert!(
+            !arguments
+                .iter()
+                .any(|argument| argument.starts_with("UserKnownHostsFile="))
+        );
+        for option in [
+            "NoHostAuthenticationForLocalhost=no",
+            "CheckHostIP=no",
+            "GlobalKnownHostsFile=/dev/null",
+            "KnownHostsCommand=none",
+            "VerifyHostKeyDNS=no",
+            "UpdateHostKeys=no",
+        ] {
+            assert!(
+                !arguments.iter().any(|argument| argument == option),
+                "{option}"
+            );
+        }
+        drop(runtime);
+        fs::remove_dir_all(directory).expect("fixture should be removed");
+    }
+
+    #[test]
     fn runtime_config_adds_loopback_service_forwards_without_metadata_or_secrets() {
         let directory = tempfile_directory();
         let path = directory.join("config");
@@ -2572,7 +2841,28 @@ mod tests {
             ),
             "VM_SERVICE_BIND_FAILED: SERVICE_BIND_FAILED: requested service forward failed"
         );
+        assert_eq!(
+            paired_stage_error("VM", "SESSION_START_INTERRUPTED: signal 2".to_string()),
+            "SESSION_START_INTERRUPTED: signal 2"
+        );
         fs::remove_dir_all(directory).expect("fixture should be removed");
+    }
+
+    #[test]
+    fn remote_forward_uses_server_listener_and_user_side_destination() {
+        let forward = crate::session::ForwardSpec {
+            kind: "R".to_string(),
+            requested: "127.0.0.1:15432:db.internal:5432".to_string(),
+            effective: "127.0.0.1:15432:db.internal:5432".to_string(),
+            bind_address: "127.0.0.1".to_string(),
+            local_port: None,
+            remote_host: Some("db.internal".to_string()),
+            remote_port: Some(5432),
+        };
+        assert_eq!(
+            super::remote_forward_argument(&forward).unwrap(),
+            "127.0.0.1:15432 db.internal:5432"
+        );
     }
 
     #[test]
@@ -2586,6 +2876,8 @@ mod tests {
             socket: directory.join("master.sock"),
             alias: "exact".to_string(),
             known_hosts: directory.join("known_hosts"),
+            user_known_hosts_file_configured: false,
+            strict_host_key_checking_configured: false,
             entry: entry(directory.join("source"), &["exact"]),
             configured_password: None,
             forwards: vec![ServiceForward {
@@ -2594,6 +2886,7 @@ mod tests {
                 destination_host: "127.0.0.1".to_string(),
                 local_port: port,
             }],
+            extra_listeners: Vec::new(),
             preserve_dir: false,
         };
         assert!(service_forwards_ready(&runtime));
@@ -2650,6 +2943,161 @@ mod tests {
         let vm = super::compile_vm_config(&selected, "hop", 2200, "sshx-vm-test", &[])
             .expect_err("VM compilation should reject ProxyCommand");
         assert!(vm.contains("PAIR_ROUTE_UNSAFE"), "{vm}");
+        fs::remove_dir_all(directory).expect("fixture should be removed");
+    }
+
+    #[test]
+    fn dynamic_listener_preflight_compares_full_addresses() {
+        let probe = TcpListener::bind(("127.0.0.1", 0)).expect("port should be available");
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let dynamic = |bind: &str| crate::session::ForwardSpec {
+            kind: "D".to_string(),
+            requested: format!("{bind}:{port}"),
+            effective: format!("{bind}:{port}"),
+            bind_address: bind.to_string(),
+            local_port: Some(port),
+            remote_host: None,
+            remote_port: None,
+        };
+        let service = ServiceForward {
+            id: "service".to_string(),
+            remote_port: 5432,
+            destination_host: "db.internal".to_string(),
+            local_port: port,
+        };
+        let local = crate::session::ForwardSpec {
+            kind: "L".to_string(),
+            requested: format!("127.0.0.1:{port}:db.internal:5432"),
+            effective: format!("127.0.0.1:{port}:db.internal:5432"),
+            bind_address: "127.0.0.1".to_string(),
+            local_port: Some(port),
+            remote_host: Some("db.internal".to_string()),
+            remote_port: Some(5432),
+        };
+        assert!(super::preflight_direct_listeners(&[], std::slice::from_ref(&local)).is_ok());
+        assert!(
+            super::preflight_direct_listeners(
+                std::slice::from_ref(&service),
+                std::slice::from_ref(&local)
+            )
+            .unwrap_err()
+            .starts_with("FORWARD_DUPLICATE:")
+        );
+        assert!(super::preflight_direct_listeners(
+            std::slice::from_ref(&service),
+            &[dynamic("::1")]
+        )
+        .is_ok());
+        assert!(
+            super::preflight_direct_listeners(&[service], &[dynamic("127.0.0.1")])
+                .unwrap_err()
+                .starts_with("FORWARD_DUPLICATE:")
+        );
+        assert!(
+            super::preflight_direct_listeners(&[], &[dynamic("127.0.0.1"), dynamic("127.0.0.1")])
+                .unwrap_err()
+                .starts_with("FORWARD_DUPLICATE:")
+        );
+    }
+
+    #[test]
+    fn local_forward_runtime_preserves_specific_non_loopback_listener() {
+        let directory = tempfile_directory();
+        let source = directory.join("config");
+        let text = "Host exact\n  HostName example.test\n";
+        fs::write(&source, text).expect("source should be written");
+        let mut selected = entry(source, &["exact"]);
+        selected.source.byte_end = text.len();
+        let forward = crate::session::ForwardSpec {
+            kind: "L".to_string(),
+            requested: "192.0.2.10:15432:db.internal:5432".to_string(),
+            effective: "192.0.2.10:15432:db.internal:5432".to_string(),
+            bind_address: "192.0.2.10".to_string(),
+            local_port: Some(15432),
+            remote_host: Some("db.internal".to_string()),
+            remote_port: Some(5432),
+        };
+        let runtime = Runtime::create_with_direct_forwards(
+            &selected,
+            &directory,
+            "exact",
+            &[],
+            &[forward],
+            true,
+        )
+        .expect("specific listener should be preserved");
+        let config =
+            fs::read_to_string(&runtime.config).expect("runtime config should be readable");
+        assert!(config.contains("LocalForward 192.0.2.10:15432 db.internal:5432"));
+        drop(runtime);
+        fs::remove_dir_all(directory).expect("fixture should be removed");
+    }
+
+    #[test]
+    fn host_enrollment_uses_effective_known_hosts_paths() {
+        let paths = super::parse_effective_known_hosts(
+            "host example.test\nuserknownhostsfile /tmp/custom_hosts /tmp/other_hosts\n",
+        )
+        .expect("OpenSSH should report known-hosts paths");
+        assert_eq!(
+            paths,
+            [
+                PathBuf::from("/tmp/custom_hosts"),
+                PathBuf::from("/tmp/other_hosts")
+            ]
+        );
+        assert!(
+            super::parse_effective_known_hosts("userknownhostsfile none\n").is_err(),
+            "none must not be treated as a writable host-key file"
+        );
+    }
+
+    #[test]
+    fn host_enrollment_verifies_configured_known_hosts_change() {
+        let directory = tempfile_directory();
+        let custom = directory.join("custom_known_hosts");
+        let default = directory.join("known_hosts");
+        fs::write(&custom, b"before\n").expect("custom file should be written");
+        fs::write(&default, b"unchanged\n").expect("default file should be written");
+        let configured = super::parse_effective_known_hosts(&format!(
+            "userknownhostsfile {}\n",
+            custom.display()
+        ))
+        .expect("configured known-hosts path should parse");
+        let before = super::known_hosts_snapshot(&configured).expect("snapshot should read");
+        assert!(
+            super::verify_host_key_enrollment(&configured, &before).is_err(),
+            "unchanged configured file must not satisfy consent"
+        );
+        fs::write(&custom, b"after\n").expect("custom file should change");
+        super::verify_host_key_enrollment(&configured, &before)
+            .expect("configured file change should satisfy consent");
+        assert_eq!(
+            fs::read(&default).expect("default runtime file should remain readable"),
+            b"unchanged\n"
+        );
+        fs::remove_dir_all(directory).expect("fixture should be removed");
+    }
+    #[test]
+    fn host_enrollment_uses_runtime_store_without_host_override() {
+        let directory = tempfile_directory();
+        let known_hosts = directory.join("known_hosts");
+        let runtime = Runtime {
+            dir: directory.clone(),
+            config: directory.join("config"),
+            socket: directory.join("master.sock"),
+            alias: "exact".to_string(),
+            known_hosts: known_hosts.clone(),
+            user_known_hosts_file_configured: false,
+            strict_host_key_checking_configured: false,
+            entry: entry(directory.join("source"), &["exact"]),
+            configured_password: None,
+            forwards: Vec::new(),
+            extra_listeners: Vec::new(),
+            preserve_dir: true,
+        };
+        assert_eq!(effective_known_hosts(&runtime).unwrap(), vec![known_hosts]);
         fs::remove_dir_all(directory).expect("fixture should be removed");
     }
 

@@ -19,6 +19,136 @@ pub struct ServiceForward {
     pub local_port: u16,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct ForwardSpec {
+    pub kind: String,
+    pub requested: String,
+    pub effective: String,
+    pub bind_address: String,
+    pub local_port: Option<u16>,
+    pub remote_host: Option<String>,
+    pub remote_port: Option<u16>,
+}
+
+impl ForwardSpec {
+    pub fn flag(&self) -> char {
+        self.kind.chars().next().unwrap_or('L')
+    }
+
+    pub fn listener(&self) -> Option<(String, u16)> {
+        self.local_port
+            .filter(|port| *port != 0)
+            .map(|port| (self.bind_address.clone(), port))
+    }
+}
+
+pub fn write_local_forward_spec(output: &mut String, forward: &ServiceForward) {
+    use std::fmt::Write as _;
+    output.push_str("127.0.0.1:");
+    write!(output, "{}:", forward.local_port).expect("String writes cannot fail");
+    let bracket_host =
+        forward.destination_host.contains(':') && !forward.destination_host.starts_with('[');
+    if bracket_host {
+        output.push('[');
+    }
+    output.push_str(&forward.destination_host);
+    if bracket_host {
+        output.push(']');
+    }
+    write!(output, ":{}", forward.remote_port).expect("String writes cannot fail");
+}
+
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ForwardIssue {
+    pub service_id: String,
+    pub message: String,
+}
+
+
+pub fn resolve_custom_local_forwards(
+    specifications: &[String],
+    allow_bind: bool,
+) -> Result<Vec<ServiceForward>, String> {
+    let mut forwards = Vec::with_capacity(specifications.len());
+    for specification in specifications {
+        let mut fields = Vec::new();
+        let mut start = 0;
+        let mut bracketed = false;
+        for (index, character) in specification.char_indices() {
+            match character {
+                '[' => bracketed = true,
+                ']' => bracketed = false,
+                ':' if !bracketed => {
+                    fields.push(&specification[start..index]);
+                    start = index + 1;
+                }
+                _ => {}
+            }
+        }
+        fields.push(&specification[start..]);
+        let (bind, local, host, remote) = match fields.as_slice() {
+            [local, host, remote] => ("127.0.0.1", *local, *host, *remote),
+            [bind, local, host, remote] => (*bind, *local, *host, *remote),
+            _ => {
+                return Err(
+                    "FORWARD_INVALID: -L requires [bind_address:]port:host:hostport".to_string(),
+                );
+            }
+        };
+        let bind = match bind.strip_prefix('[') {
+            Some(bind) => bind
+                .strip_suffix(']')
+                .filter(|bind| !bind.contains(['[', ']']))
+                .ok_or_else(|| {
+                    "FORWARD_BIND_INVALID: bind address brackets must be balanced".to_string()
+                })?,
+            None if bind.contains(['[', ']']) => {
+                return Err(
+                    "FORWARD_BIND_INVALID: bind address brackets must be balanced".to_string(),
+                );
+            }
+            None => bind,
+        };
+        let address = if bind == "localhost" {
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        } else {
+            bind.parse::<std::net::IpAddr>().map_err(|_| {
+                "FORWARD_BIND_INVALID: bind address must be an IP address".to_string()
+            })?
+        };
+        if address.is_unspecified() || address.is_multicast() {
+            return Err("FORWARD_BIND_INVALID: bind address must be specific".to_string());
+        }
+        if !address.is_loopback() && !allow_bind {
+            return Err(
+                "FORWARD_BIND_UNSAFE: non-loopback bind requires --allow-bind".to_string(),
+            );
+        }
+        let local_port = local.parse::<u16>().map_err(|_| {
+            "FORWARD_INVALID: local port must be between 1 and 65535".to_string()
+        })?;
+        let remote_port = remote.parse::<u16>().map_err(|_| {
+            "FORWARD_INVALID: remote port must be between 1 and 65535".to_string()
+        })?;
+        validate_port(local_port, "SERVICE_BIND")?;
+        validate_port(remote_port, "SERVICE_REMOTE")?;
+        let destination_host = unbracket_ipv6_host(host)?.to_string();
+        validate_destination_host(&destination_host)?;
+        forwards.push(ServiceForward {
+            id: if matches!(bind, "127.0.0.1" | "localhost") {
+                format!("custom {bind}:{local_port} -> {destination_host}:{remote_port}")
+            } else {
+                format!("local:{specification}")
+            },
+            remote_port,
+            destination_host,
+            local_port,
+        });
+    }
+    Ok(forwards)
+}
+
 pub fn declared_services(entry: &HostEntry) -> Result<Vec<DeclaredService>, String> {
     let bytes = fs::read(&entry.source.path).map_err(|error| {
         format!(
@@ -88,10 +218,14 @@ pub fn resolve_forwards(
     let services = declared_services(entry)?;
     let mut forwards = Vec::with_capacity(specifications.len());
     for specification in specifications {
-        let (selector, local_override) = parse_specification(specification)?;
+        let (selector, remote_port, local_override) = parse_specification(specification)?;
+        let by_remote_port = !selector.contains('#');
         let matches = services
             .iter()
-            .filter(|service| service.id == selector || service.remote_port.to_string() == selector)
+            .filter(|service| {
+                service.id.as_str() == selector
+                    || (by_remote_port && service.remote_port == remote_port)
+            })
             .collect::<Vec<_>>();
         let service = match matches.as_slice() {
             [service] => *service,
@@ -127,29 +261,72 @@ pub fn resolve_forwards(
     Ok(forwards)
 }
 
-pub fn preflight(forwards: &[ServiceForward]) -> Result<(), String> {
-    let mut listeners = Vec::with_capacity(forwards.len());
-    for forward in forwards {
-        validate_port(forward.local_port, "SERVICE_BIND")?;
-        if listeners.iter().any(|listener: &TcpListener| {
-            listener
-                .local_addr()
-                .is_ok_and(|address| address.port() == forward.local_port)
-        }) {
-            return Err(format!(
-                "SERVICE_BIND_FAILED: local service port {} was requested more than once",
-                forward.local_port
-            ));
-        }
-        let listener = TcpListener::bind(("127.0.0.1", forward.local_port)).map_err(|error| {
-            format!(
-                "SERVICE_BIND_FAILED: cannot reserve local service port {}: {error}",
-                forward.local_port
-            )
-        })?;
-        listeners.push(listener);
+pub fn validate_forward_specifications(specifications: &[String]) -> Result<(), String> {
+    for specification in specifications {
+        parse_specification(specification)?;
     }
     Ok(())
+}
+
+pub fn preflight_issues(forwards: &[ServiceForward]) -> Vec<ForwardIssue> {
+    let mut issues = Vec::new();
+    let mut ports: Vec<(u16, Vec<usize>)> = Vec::new();
+    for (index, forward) in forwards.iter().enumerate() {
+        if let Err(message) = validate_port(forward.local_port, "SERVICE_BIND") {
+            issues.push(ForwardIssue {
+                service_id: forward.id.clone(),
+                message,
+            });
+        }
+        if let Some((_, indexes)) = ports
+            .iter_mut()
+            .find(|(port, _)| *port == forward.local_port)
+        {
+            indexes.push(index);
+        } else {
+            ports.push((forward.local_port, vec![index]));
+        }
+    }
+
+    let mut listeners = Vec::new();
+    for (port, indexes) in ports {
+        if indexes.len() > 1 {
+            for index in indexes {
+                issues.push(ForwardIssue {
+                    service_id: forwards[index].id.clone(),
+                    message: format!(
+                        "SERVICE_BIND_FAILED: local service port {port} is requested by multiple rows"
+                    ),
+                });
+            }
+        } else if port != 0
+            && let Some(forward) = forwards.get(indexes[0])
+        {
+            match TcpListener::bind(("127.0.0.1", port)) {
+                Ok(listener) => listeners.push(listener),
+                Err(error) => issues.push(ForwardIssue {
+                    service_id: forward.id.clone(),
+                    message: format!(
+                        "SERVICE_BIND_FAILED: cannot reserve local service port {port}: {error}"
+                    ),
+                }),
+            }
+        }
+    }
+    issues
+}
+
+pub fn preflight(forwards: &[ServiceForward]) -> Result<(), String> {
+    let issues = preflight_issues(forwards);
+    if issues.is_empty() {
+        Ok(())
+    } else {
+        Err(issues
+            .iter()
+            .map(|issue| format!("{} [{}]", issue.message, issue.service_id))
+            .collect::<Vec<_>>()
+            .join("; "))
+    }
 }
 
 pub fn interactive_forwards(entry: &HostEntry) -> Result<Vec<ServiceForward>, String> {
@@ -338,6 +515,29 @@ fn validate_port(port: u16, code: &str) -> Result<(), String> {
     Ok(())
 }
 
+pub(crate) fn unbracket_ipv6_host(host: &str) -> Result<&str, String> {
+    match host.strip_prefix('[') {
+        Some(host) => {
+            let host = host
+                .strip_suffix(']')
+                .filter(|host| !host.contains(['[', ']']))
+                .ok_or_else(|| {
+                    "FORWARD_INVALID: destination host brackets must be balanced".to_string()
+                })?;
+            if host.parse::<std::net::Ipv6Addr>().is_err() {
+                return Err(
+                    "FORWARD_INVALID: bracketed destination host must be an IPv6 address"
+                        .to_string(),
+                );
+            }
+            Ok(host)
+        }
+        None if host.contains(['[', ']']) => {
+            Err("FORWARD_INVALID: destination host brackets must be balanced".to_string())
+        }
+        None => Ok(host),
+    }
+}
 fn validate_destination_host(host: &str) -> Result<(), String> {
     if host.is_empty()
         || host.starts_with('-')
@@ -351,7 +551,7 @@ fn validate_destination_host(host: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn parse_specification(value: &str) -> Result<(String, Option<u16>), String> {
+fn parse_specification(value: &str) -> Result<(&str, u16, Option<u16>), String> {
     let (selector, local) = value
         .split_once('=')
         .map_or((value, None), |(left, right)| (left, Some(right)));
@@ -359,6 +559,21 @@ fn parse_specification(value: &str) -> Result<(String, Option<u16>), String> {
         return Err(
             "FORWARD_UNSAFE: forward selector must contain only a declared remote port".to_string(),
         );
+    }
+    let (remote, index) = selector
+        .split_once('#')
+        .map_or((selector, None), |(remote, index)| (remote, Some(index)));
+    let remote_port = remote.parse::<u16>().map_err(|_| {
+        "FORWARD_INVALID: forward selector must be REMOTE or REMOTE#INDEX".to_string()
+    })?;
+    validate_port(remote_port, "SERVICE_REMOTE")?;
+    if let Some(index) = index {
+        let index = index.parse::<usize>().map_err(|_| {
+            "FORWARD_INVALID: forward selector must be REMOTE or REMOTE#INDEX".to_string()
+        })?;
+        if index == 0 {
+            return Err("FORWARD_INVALID: service index must be greater than zero".to_string());
+        }
     }
     let local =
         match local {
@@ -370,10 +585,7 @@ fn parse_specification(value: &str) -> Result<(String, Option<u16>), String> {
     if let Some(port) = local {
         validate_port(port, "SERVICE_BIND")?;
     }
-    if selector.parse::<u16>().is_err() && !selector.contains('#') {
-        return Err("FORWARD_INVALID: forward selector must be REMOTE or REMOTE#INDEX".to_string());
-    }
-    Ok((selector.to_string(), local))
+    Ok((selector, remote_port, local))
 }
 
 fn parse_selection(value: &str, count: usize) -> Result<Vec<usize>, String> {
@@ -417,7 +629,10 @@ fn prompt_line(prompt: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ServiceForward, declared_services, preflight, resolve_forwards};
+    use super::{
+        ServiceForward, declared_services, preflight, preflight_issues,
+        resolve_custom_local_forwards, resolve_forwards,
+    };
     use crate::discovery::{HostEntry, Provenance, SourceIdentity};
     use std::fs;
     use std::net::TcpListener;
@@ -475,6 +690,62 @@ mod tests {
         fs::remove_file(path).expect("fixture should remove");
     }
 
+
+    #[test]
+    fn repeated_forward_specs_resolve_multiple_declared_services() {
+        let (path, entry) = entry(concat!(
+            "Host selected\n",
+            "  ##PORT 5432\n",
+            "  ##PORT 6379\n",
+            "  ##PORT 3001\n",
+        ));
+        let forwards = resolve_forwards(
+            &entry,
+            &[
+                "5432=5432".to_string(),
+                "6379=6378".to_string(),
+                "3001=3001".to_string(),
+            ],
+        )
+        .expect("all declared forwards should resolve");
+        assert_eq!(
+            forwards
+                .iter()
+                .map(|forward| (forward.remote_port, forward.local_port))
+                .collect::<Vec<_>>(),
+            [(5432, 5432), (6379, 6378), (3001, 3001)]
+        );
+        fs::remove_file(path).expect("fixture should remove");
+    }
+
+    #[test]
+    fn preflight_issues_identify_each_duplicate_row() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener should bind");
+        let busy_port = listener.local_addr().expect("listener address").port();
+        let issues = preflight_issues(&[
+            ServiceForward {
+                id: "5432#1".to_string(),
+                remote_port: 5432,
+                destination_host: "127.0.0.1".to_string(),
+                local_port: busy_port,
+            },
+            ServiceForward {
+                id: "6379#1".to_string(),
+                remote_port: 6379,
+                destination_host: "127.0.0.1".to_string(),
+                local_port: busy_port,
+            },
+        ]);
+        assert_eq!(
+            issues
+                .iter()
+                .map(|issue| issue.service_id.as_str())
+                .collect::<Vec<_>>(),
+            ["5432#1", "6379#1"]
+        );
+        assert!(issues.iter().all(|issue| issue.message.contains("multiple rows")));
+        assert!(listener.local_addr().is_ok());
+    }
     #[test]
     fn overrides_do_not_change_declared_defaults_and_preflight_rejects_duplicate_ports() {
         let (path, entry) = entry("Host selected\n  ##PORT 5432\n");
@@ -503,18 +774,108 @@ mod tests {
         fs::remove_file(path).expect("fixture should remove");
     }
     #[test]
-    fn preflight_reports_busy_port_without_touching_existing_listener() {
+    fn preflight_issues_identify_unavailable_listener_row() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener should bind");
         let local_port = listener.local_addr().expect("listener address").port();
-        let error = preflight(&[ServiceForward {
+        let forward = ServiceForward {
             id: "5432#1".to_string(),
             remote_port: 5432,
             destination_host: "127.0.0.1".to_string(),
             local_port,
-        }])
-        .expect_err("busy local port should fail");
+        };
+        let issues = preflight_issues(std::slice::from_ref(&forward));
+        assert_eq!(issues[0].service_id, "5432#1");
+        assert!(issues[0].message.starts_with("SERVICE_BIND_FAILED"));
+        let error = preflight(&[forward]).expect_err("busy local port should fail");
         assert!(error.starts_with("SERVICE_BIND_FAILED"), "{error}");
         assert!(listener.local_addr().is_ok());
+    }
+    #[test]
+    fn custom_local_rows_resolve_and_gate_non_loopback_binds() {
+        let forwards = resolve_custom_local_forwards(
+            &[
+                "127.0.0.1:15432:db.internal:5432".to_string(),
+                "127.0.0.1:6378:cache.internal:6379".to_string(),
+            ],
+            false,
+        )
+        .expect("loopback custom rows should parse");
+        assert_eq!(
+            forwards
+                .iter()
+                .map(|forward| (
+                    forward.local_port,
+                    forward.destination_host.as_str(),
+                    forward.remote_port
+                ))
+                .collect::<Vec<_>>(),
+            [
+                (15432, "db.internal", 5432),
+                (6378, "cache.internal", 6379)
+            ]
+        );
+        assert!(
+            resolve_custom_local_forwards(
+                &["192.0.2.10:15432:db.internal:5432".to_string()],
+                false
+            )
+            .unwrap_err()
+            .starts_with("FORWARD_BIND_UNSAFE")
+        );
+        let opted_in = resolve_custom_local_forwards(
+            &["192.0.2.10:15432:db.internal:5432".to_string()],
+            true,
+        )
+        .expect("explicit opt-in should allow a specific non-loopback bind");
+        assert_eq!(opted_in[0].local_port, 15432);
+        assert_eq!(opted_in[0].id, "local:192.0.2.10:15432:db.internal:5432");
+        for bind in ["0.0.0.0", "239.1.2.3"] {
+            assert!(
+                resolve_custom_local_forwards(
+                    &[format!("{bind}:15432:db.internal:5432")],
+                    true
+                )
+                .unwrap_err()
+                .starts_with("FORWARD_BIND_INVALID")
+            );
+        }
+        assert!(
+            resolve_custom_local_forwards(
+                &["127.0.0.1:15432:-host:5432".to_string()],
+                false
+            )
+            .unwrap_err()
+            .starts_with("FORWARD_UNSAFE")
+        );
+        assert!(
+            resolve_custom_local_forwards(
+                &["127.0.0.1:15432:db.internal]:5432".to_string()],
+                false
+            )
+            .unwrap_err()
+            .starts_with("FORWARD_INVALID")
+        );
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener should bind");
+        let busy_port = listener.local_addr().unwrap().port();
+        let busy = resolve_custom_local_forwards(
+            &[format!("127.0.0.1:{busy_port}:db.internal:5432")],
+            false,
+        )
+        .expect("custom row should parse");
+        assert!(
+            preflight(&busy)
+                .unwrap_err()
+                .starts_with("SERVICE_BIND_FAILED")
+        );
+        let duplicate = resolve_custom_local_forwards(
+            &[
+                "127.0.0.1:15432:db.internal:5432".to_string(),
+                "127.0.0.1:15432:cache.internal:6379".to_string(),
+            ],
+            false,
+        )
+        .expect("both custom rows should parse");
+        assert_eq!(preflight_issues(&duplicate).len(), 2);
     }
     #[test]
     fn metadata_scan_handles_unicode_and_rejects_ssh_tokens() {

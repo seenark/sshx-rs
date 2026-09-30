@@ -1141,7 +1141,11 @@ fn check_file_include(
                 );
             }
             _ => {
-                if argument.contains('%') || !supported_directive(keyword) {
+                let token_allowed = matches!(
+                    keyword_lower.as_str(),
+                    "proxycommand" | "userknownhostsfile"
+                );
+                if (argument.contains('%') && !token_allowed) || !supported_directive(keyword) {
                     builder.finding(
                         "unsupported_semantics",
                         "error",
@@ -1255,6 +1259,7 @@ fn supported_directive(keyword: &str) -> bool {
             | "revokedhostkeys"
             | "sendenv"
             | "serveralivecountmax"
+            | "sessiontype"
             | "serveraliveinterval"
             | "setenv"
             | "streamlocalbindunlink"
@@ -1265,6 +1270,7 @@ fn supported_directive(keyword: &str) -> bool {
             | "tunneldevice"
             | "updatehostkeys"
             | "user"
+            | "userknownhostsfile"
             | "verifyhostkeydns"
             | "versionaddendum"
             | "visualhostkey"

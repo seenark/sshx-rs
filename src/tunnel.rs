@@ -16,28 +16,8 @@ const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 const LOCK_POLL: Duration = Duration::from_millis(20);
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ForwardSpec {
-    pub kind: String,
-    pub requested: String,
-    pub effective: String,
-    pub bind_address: String,
-    pub local_port: Option<u16>,
-    pub remote_host: Option<String>,
-    pub remote_port: Option<u16>,
-}
+pub type ForwardSpec = session::ForwardSpec;
 
-impl ForwardSpec {
-    fn flag(&self) -> char {
-        self.kind.chars().next().unwrap_or('L')
-    }
-
-    fn listener(&self) -> Option<(String, u16)> {
-        self.local_port
-            .filter(|port| *port != 0)
-            .map(|port| (self.bind_address.clone(), port))
-    }
-}
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct PairedRegistry {
     gateway_entry_id: String,
@@ -188,21 +168,11 @@ pub fn start(
     let fingerprint = entry_fingerprint(entry)?;
     let signature = request_signature(entry, &fingerprint, selected_alias, &forwards);
 
-    for record in &registry.tunnels {
-        if record.state == "active"
-            && record.request_signature == signature
-            && record.source_path == entry.source.path
-            && validate_control_reference(&root, record).is_ok()
-            && connect::standalone_master_ready_at(
-                Path::new(&record.control_socket),
-                &record.selected_alias,
-            )
-        {
-            return Ok(TunnelResponse {
-                operation: "start".to_string(),
-                tunnels: vec![view(record)],
-            });
-        }
+    if let Some(record) = active_direct_record(&root, &registry, entry, &signature) {
+        return Ok(TunnelResponse {
+            operation: "start".to_string(),
+            tunnels: vec![view(record)],
+        });
     }
     reserve_forwards(&forwards)?;
 
@@ -306,7 +276,6 @@ pub fn start_paired(
             "TUNNEL_FORWARD_REQUIRED: provide at least one --forward or use --bind".to_string(),
         );
     }
-    session::preflight(forwards)?;
     let gateway_fingerprint = entry_fingerprint(&route.gateway)?;
     let vm_fingerprint = entry_fingerprint(&route.vm)?;
     let specs = forwards
@@ -325,14 +294,8 @@ pub fn start_paired(
     ensure_private_tree(&root)?;
     let _lock = RegistryLock::acquire(&root)?;
     let mut registry = read_registry(&root)?;
-    for record in &registry.tunnels {
-        if record.kind != "paired" || record.request_signature != signature {
-            continue;
-        }
-        if record.state == "active"
-            && validate_pair_control_reference(&root, record).is_ok()
-            && pair_masters_ready(record)
-        {
+    if let Some(record) = matching_paired_record(&root, &registry, &signature) {
+        if paired_tunnel_is_responsive(&root, record) {
             return Ok(TunnelResponse {
                 operation: "start".to_string(),
                 tunnels: vec![view(record)],
@@ -345,6 +308,7 @@ pub fn start_paired(
             ));
         }
     }
+    session::preflight(forwards)?;
     let id = next_id(&registry).replace("dt-", "pt-");
     let control_dir = root.join(&id);
     fs::create_dir(&control_dir)
@@ -453,8 +417,67 @@ pub fn start_paired(
     Ok(response)
 }
 
+pub fn has_active_direct_request(
+    entry: &HostEntry,
+    home: &Path,
+    selected_alias: &str,
+    forwards: &[ForwardSpec],
+) -> bool {
+    let Some((root, registry)) = existing_registry(home) else {
+        return false;
+    };
+    let Ok(fingerprint) = entry_fingerprint(entry) else {
+        return false;
+    };
+    let signature = request_signature(entry, &fingerprint, selected_alias, forwards);
+    active_direct_record(&root, &registry, entry, &signature).is_some()
+}
+
+pub fn has_active_paired_request(
+    route: &PairedRoute,
+    home: &Path,
+    gateway_alias: &str,
+    vm_alias: &str,
+    forwards: &[ServiceForward],
+) -> bool {
+    let Some((root, registry)) = existing_registry(home) else {
+        return false;
+    };
+    let Ok(gateway_fingerprint) = entry_fingerprint(&route.gateway) else {
+        return false;
+    };
+    let Ok(vm_fingerprint) = entry_fingerprint(&route.vm) else {
+        return false;
+    };
+    let signature = paired_service_request_signature(
+        route,
+        gateway_alias,
+        vm_alias,
+        &gateway_fingerprint,
+        &vm_fingerprint,
+        forwards,
+    );
+    matching_paired_record(&root, &registry, &signature)
+        .is_some_and(|record| paired_tunnel_is_responsive(&root, record))
+}
+
+fn existing_registry(home: &Path) -> Option<(PathBuf, RegistryFile)> {
+    let root = registry_root(home);
+    if !root.exists() || ensure_private_tree(&root).is_err() {
+        return None;
+    }
+    let registry = read_registry(&root).ok()?;
+    Some((root, registry))
+}
+
 pub fn list(home: &Path) -> Result<TunnelResponse, String> {
     let root = registry_root(home);
+    if matches!(fs::symlink_metadata(&root), Err(error) if error.kind() == std::io::ErrorKind::NotFound) {
+        return Ok(TunnelResponse {
+            operation: "list".to_string(),
+            tunnels: Vec::new(),
+        });
+    }
     ensure_private_tree(&root)?;
     let registry = read_registry(&root)?;
     Ok(TunnelResponse {
@@ -552,7 +575,9 @@ pub fn restart(
             "PAIR_BROKEN: selected VM no longer has an approved paired route".to_string()
         })?;
         validate_paired_record(&route, pair)?;
-        let _ = stop(home, id)?;
+        if record.state != "stopped" {
+            let _ = stop(home, id)?;
+        }
         let forwards = record
             .forwards
             .iter()
@@ -584,7 +609,9 @@ pub fn restart(
     if entry_fingerprint(entry)? != record.block_fingerprint {
         return Err("CONFIG_CHANGED: selected HostEntry changed on disk".to_string());
     }
-    let _ = stop(home, id)?;
+    if record.state != "stopped" {
+        let _ = stop(home, id)?;
+    }
     let mut local = Vec::new();
     let mut remote = Vec::new();
     let mut dynamic = Vec::new();
@@ -660,6 +687,61 @@ fn paired_request_signature(
     vm_fingerprint: &str,
     forwards: &[ForwardSpec],
 ) -> String {
+    paired_request_signature_with(
+        route,
+        gateway_alias,
+        vm_alias,
+        gateway_fingerprint,
+        vm_fingerprint,
+        |material| {
+            for forward in forwards {
+                material.push('\0');
+                material.push_str(&forward.kind);
+                material.push('=');
+                material.push_str(&forward.bind_address);
+                material.push('=');
+                material.push_str(&forward.effective);
+            }
+        },
+    )
+}
+
+fn paired_service_request_signature(
+    route: &PairedRoute,
+    gateway_alias: &str,
+    vm_alias: &str,
+    gateway_fingerprint: &str,
+    vm_fingerprint: &str,
+    forwards: &[ServiceForward],
+) -> String {
+    paired_request_signature_with(
+        route,
+        gateway_alias,
+        vm_alias,
+        gateway_fingerprint,
+        vm_fingerprint,
+        |material| {
+            use std::fmt::Write as _;
+            for forward in forwards {
+                write!(
+                    material,
+                    "\0L=127.0.0.1=127.0.0.1:{}:{}:{}",
+                    forward.local_port, forward.destination_host, forward.remote_port
+                )
+                .expect("String writes cannot fail");
+            }
+        },
+    )
+}
+
+fn paired_request_signature_with(
+    route: &PairedRoute,
+    gateway_alias: &str,
+    vm_alias: &str,
+    gateway_fingerprint: &str,
+    vm_fingerprint: &str,
+    append_forwards: impl FnOnce(&mut String),
+) -> String {
     let mut material = format!(
         "paired\0{}:{}:{}:{}\0{}:{}:{}:{}\0{}\0{}\0{}\0{}\0{}:{}",
         route.gateway.source.path,
@@ -677,14 +759,7 @@ fn paired_request_signature(
         route.transit_host,
         route.transit_port
     );
-    for forward in forwards {
-        material.push('\0');
-        material.push_str(&forward.kind);
-        material.push('=');
-        material.push_str(&forward.bind_address);
-        material.push('=');
-        material.push_str(&forward.effective);
-    }
+    append_forwards(&mut material);
     hash_hex(material.as_bytes())
 }
 
@@ -801,7 +876,7 @@ pub fn find_entry<'a>(entries: &'a [HostEntry], record: &TunnelView) -> Option<&
     })
 }
 
-fn parse_forwards(
+pub fn parse_forwards(
     local: &[String],
     remote: &[String],
     dynamic: &[String],
@@ -820,23 +895,20 @@ fn parse_forwards(
     Ok(forwards)
 }
 
-fn reserve_forwards(forwards: &[ForwardSpec]) -> Result<(), String> {
+pub fn reserve_forwards(forwards: &[ForwardSpec]) -> Result<(), String> {
     let mut reserved = Vec::new();
     for forward in forwards {
         if let Some((bind, port)) = forward.listener() {
-            if reserved
-                .iter()
-                .any(|(old_bind, old_port): &(String, u16)| old_bind == &bind && *old_port == port)
-            {
+            let address = listener_address(&bind, port)?;
+            if reserved.contains(&address) {
                 return Err(format!(
                     "FORWARD_DUPLICATE: local listener {bind}:{port} was requested more than once"
                 ));
             }
-            let address = listener_address(&bind, port)?;
             let listener = TcpListener::bind(address).map_err(|error| {
                 format!("SERVICE_BIND_FAILED: cannot reserve local listener {bind}:{port}: {error}")
             })?;
-            reserved.push((bind, port));
+            reserved.push(address);
             drop(listener);
         }
     }
@@ -959,7 +1031,20 @@ fn split_colons(value: &str) -> Result<Vec<&str>, String> {
 }
 
 fn normalize_bind(value: &str, allow_bind: bool) -> Result<String, String> {
-    let bind = value.trim_matches(['[', ']']);
+    let bind = match value.strip_prefix('[') {
+        Some(bind) => bind
+            .strip_suffix(']')
+            .filter(|bind| !bind.contains(['[', ']']))
+            .ok_or_else(|| {
+                "FORWARD_BIND_INVALID: bind address brackets must be balanced".to_string()
+            })?,
+        None if value.contains(['[', ']']) => {
+            return Err(
+                "FORWARD_BIND_INVALID: bind address brackets must be balanced".to_string(),
+            );
+        }
+        None => value,
+    };
     if bind.is_empty()
         || bind.starts_with('-')
         || bind.contains(['%', '*', '?', '\0', '\r', '\n'])
@@ -972,9 +1057,13 @@ fn normalize_bind(value: &str, allow_bind: bool) -> Result<String, String> {
         || bind
             .parse::<IpAddr>()
             .is_ok_and(|address| address.is_loopback());
-    let address = bind.parse::<IpAddr>().map_err(|_| {
-        "FORWARD_BIND_INVALID: bind address must be an IP address or localhost".to_string()
-    })?;
+    let address = if bind == "localhost" {
+        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+    } else {
+        bind.parse::<IpAddr>().map_err(|_| {
+            "FORWARD_BIND_INVALID: bind address must be an IP address or localhost".to_string()
+        })?
+    };
     if address.is_unspecified() || address.is_multicast() {
         return Err("FORWARD_BIND_INVALID: bind address must be specific".to_string());
     }
@@ -985,7 +1074,7 @@ fn normalize_bind(value: &str, allow_bind: bool) -> Result<String, String> {
 }
 
 fn normalize_host(value: &str) -> Result<&str, String> {
-    let host = value.trim_matches(['[', ']']);
+    let host = session::unbracket_ipv6_host(value)?;
     if host.is_empty() || host.starts_with('-') || host.contains(['%', '*', '?', '\0', '\r', '\n'])
     {
         return Err("FORWARD_UNSAFE: destination host is invalid".to_string());
@@ -1031,13 +1120,13 @@ fn view(record: &RegistryEntry) -> TunnelView {
 }
 
 fn view_at(root: &Path, record: &RegistryEntry) -> TunnelView {
-    let (master_status, gateway_master_status, vm_master_status, _control_safe, config_safe) =
+    let (master_status, gateway_master_status, vm_master_status, control_safe, config_safe) =
         if record.kind == "paired" {
             let control_safe = validate_pair_control_reference(root, record).is_ok();
             let config_safe = record.pair.as_ref().is_some_and(pair_config_current);
-            let (gateway, vm) = record.pair.as_ref().map_or(("down", "down"), |pair| {
-                if !control_safe || !config_safe {
-                    ("down", "down")
+            let (gateway, vm) = record.pair.as_ref().map_or(("unknown", "unknown"), |pair| {
+                if !control_safe {
+                    ("unknown", "unknown")
                 } else {
                     (
                         if connect::standalone_master_ready_at(
@@ -1087,7 +1176,9 @@ fn view_at(root: &Path, record: &RegistryEntry) -> TunnelView {
             };
             (master, None, None, control_safe, true)
         };
-    let listener_status = if master_status != "responsive" {
+    let listener_status = if master_status == "unknown" {
+        "unknown"
+    } else if master_status == "down" {
         "down"
     } else if record.forwards.iter().any(|forward| forward.kind == "R") {
         "unknown"
@@ -1101,7 +1192,9 @@ fn view_at(root: &Path, record: &RegistryEntry) -> TunnelView {
     } else {
         "down"
     };
-    let state = if record.state == "active" && (master_status == "down" || !config_safe) {
+    let state = if record.state == "active" && !control_safe {
+        "unknown".to_string()
+    } else if record.state == "active" && master_status == "down" {
         "down".to_string()
     } else {
         record.state.clone()
@@ -1445,6 +1538,23 @@ fn request_signature(
     selected_alias: &str,
     forwards: &[ForwardSpec],
 ) -> String {
+    request_signature_with(entry, fingerprint, selected_alias, |material| {
+        for forward in forwards {
+            material.push('\0');
+            material.push_str(&forward.kind);
+            material.push('=');
+            material.push_str(&forward.effective);
+        }
+    })
+}
+
+
+fn request_signature_with(
+    entry: &HostEntry,
+    fingerprint: &str,
+    selected_alias: &str,
+    append_forwards: impl FnOnce(&mut String),
+) -> String {
     let mut material = format!(
         "{}\0{}:{}\0{}\0{}\0{}",
         entry.source.path,
@@ -1454,13 +1564,70 @@ fn request_signature(
         selected_alias,
         fingerprint
     );
-    for forward in forwards {
-        material.push('\0');
-        material.push_str(&forward.kind);
-        material.push('=');
-        material.push_str(&forward.effective);
-    }
+    append_forwards(&mut material);
     hash_hex(material.as_bytes())
+}
+
+fn active_direct_record<'a>(
+    root: &Path,
+    registry: &'a RegistryFile,
+    entry: &HostEntry,
+    signature: &str,
+) -> Option<&'a RegistryEntry> {
+    registry.tunnels.iter().find(|record| {
+        active_direct_identity_matches(record, &entry.id, &entry.source.path, signature)
+            && validate_control_reference(root, record).is_ok()
+            && connect::standalone_master_ready_at(
+                Path::new(&record.control_socket),
+                &record.selected_alias,
+            )
+    })
+}
+
+fn active_direct_identity_matches(
+    record: &RegistryEntry,
+    entry_id: &str,
+    source_path: &str,
+    signature: &str,
+) -> bool {
+    record.state == "active"
+        && record.entry_id == entry_id
+        && record.request_signature == signature
+        && record.source_path == source_path
+}
+
+fn matching_paired_record<'a>(
+    root: &Path,
+    registry: &'a RegistryFile,
+    signature: &str,
+) -> Option<&'a RegistryEntry> {
+    registry
+        .tunnels
+        .iter()
+        .find(|record| {
+            record.kind == "paired"
+                && record.request_signature == signature
+                && paired_tunnel_is_responsive(root, record)
+        })
+        .or_else(|| {
+            registry.tunnels.iter().find(|record| {
+                record.kind == "paired"
+                    && record.request_signature == signature
+                    && matches!(record.state.as_str(), "active" | "starting" | "stopping")
+            })
+        })
+        .or_else(|| {
+            registry
+                .tunnels
+                .iter()
+                .find(|record| record.kind == "paired" && record.request_signature == signature)
+        })
+}
+
+fn paired_tunnel_is_responsive(root: &Path, record: &RegistryEntry) -> bool {
+    record.state == "active"
+        && validate_pair_control_reference(root, record).is_ok()
+        && pair_masters_ready(record)
 }
 
 fn same_entry(entry: &HostEntry, record: &RegistryEntry) -> bool {
@@ -1485,7 +1652,56 @@ fn redact_error(error: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_forwards, split_colons};
+    use super::{
+        RegistryEntry, active_direct_identity_matches, parse_forwards, reserve_forwards,
+        split_colons,
+    };
+    #[test]
+    fn active_direct_reuse_requires_entry_id_and_active_state_on_same_record() {
+        let record = |entry_id: &str, state: &str| RegistryEntry {
+            id: "tunnel".to_string(),
+            state: state.to_string(),
+            kind: "direct".to_string(),
+            entry_id: entry_id.to_string(),
+            aliases: vec!["app".to_string()],
+            selected_alias: "app".to_string(),
+            source_path: "/ssh/config".to_string(),
+            source_byte_start: 0,
+            source_byte_end: 10,
+            source_line_start: 1,
+            source_line_end: 2,
+            block_fingerprint: String::new(),
+            request_signature: "signature".to_string(),
+            control_dir: String::new(),
+            control_socket: String::new(),
+            runtime_config: String::new(),
+            forwards: Vec::new(),
+            pair: None,
+            error: None,
+        };
+        let wrong_entry_active = record("other-id", "active");
+        let correct_entry_stopped = record("entry-id", "stopped");
+        let matching_active = record("entry-id", "active");
+
+        assert!(!active_direct_identity_matches(
+            &wrong_entry_active,
+            "entry-id",
+            "/ssh/config",
+            "signature"
+        ));
+        assert!(!active_direct_identity_matches(
+            &correct_entry_stopped,
+            "entry-id",
+            "/ssh/config",
+            "signature"
+        ));
+        assert!(active_direct_identity_matches(
+            &matching_active,
+            "entry-id",
+            "/ssh/config",
+            "signature"
+        ));
+    }
 
     #[test]
     fn forwarding_specs_default_to_loopback_and_report_ephemeral_ports() {
@@ -1502,10 +1718,50 @@ mod tests {
     }
 
     #[test]
+    fn localhost_and_ipv4_loopback_are_duplicate_listeners() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .expect("temporary port should bind");
+        let port = listener.local_addr().expect("address should exist").port();
+        drop(listener);
+        let forwards = parse_forwards(
+            &[
+                format!("127.0.0.1:{port}:db.internal:5432"),
+                format!("localhost:{port}:cache.internal:5433"),
+            ],
+            &[],
+            &[],
+            false,
+        )
+        .expect("forwards should parse");
+        let error = reserve_forwards(&forwards).expect_err("loopback aliases conflict");
+        assert!(error.starts_with("FORWARD_DUPLICATE"), "{error}");
+    }
+
+    #[test]
     fn non_loopback_bind_requires_opt_in() {
         let error = parse_forwards(&["0.0.0.0:1234:db:5432".to_string()], &[], &[], false)
             .expect_err("unsafe bind should fail");
         assert!(error.starts_with("FORWARD_BIND_"));
+    }
+
+    #[test]
+    fn wildcard_bind_remains_forbidden_with_opt_in() {
+        let error = parse_forwards(&["0.0.0.0:1234:db:5432".to_string()], &[], &[], true)
+            .expect_err("wildcard bind remains forbidden");
+        assert!(error.starts_with("FORWARD_BIND_"));
+    }
+
+    #[test]
+    fn non_loopback_bind_accepts_explicit_opt_in() {
+        let forwards = parse_forwards(
+            &["192.0.2.1:1234:db.internal:5432".to_string()],
+            &[],
+            &[],
+            true,
+        )
+        .expect("explicit non-loopback bind should parse");
+        assert_eq!(forwards[0].bind_address, "192.0.2.1");
+        assert_eq!(forwards[0].local_port, Some(1234));
     }
 
     #[test]

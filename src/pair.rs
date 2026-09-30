@@ -15,6 +15,7 @@ struct LocalForward {
 #[derive(Clone, Debug)]
 struct ParsedEntry {
     id: Option<String>,
+    additional_ids: Vec<String>,
     id_markers: usize,
     gateway_id: Option<String>,
     gateway_marker: bool,
@@ -97,15 +98,31 @@ pub fn paired_route(
 
     let mut id_indexes = HashMap::new();
     for (index, data) in parsed.iter().enumerate() {
-        let Some(id) = data.id.as_deref().filter(|id| valid_id(id)) else {
-            continue;
-        };
-        if id_indexes.insert(id.to_ascii_lowercase(), index).is_some() {
-            return Err(format!("PAIR_INVALID: duplicate immutable ID `{id}`"));
+        for id in data
+            .id
+            .iter()
+            .chain(data.additional_ids.iter())
+            .filter(|id| valid_id(id))
+        {
+            let indexes = id_indexes
+                .entry(id.to_ascii_lowercase())
+                .or_insert_with(Vec::new);
+            if indexes.last() != Some(&index) {
+                indexes.push(index);
+            }
         }
     }
-    let gateway_index = id_indexes
-        .get(&gateway_id.to_ascii_lowercase())
+    let gateway_key = gateway_id.to_ascii_lowercase();
+    let vm_key = vm_id.to_ascii_lowercase();
+    let gateway_indexes = id_indexes.get(&gateway_key);
+    let vm_indexes = id_indexes.get(&vm_key);
+    if gateway_indexes.is_none_or(|indexes| indexes.len() != 1)
+        || vm_indexes.is_none_or(|indexes| indexes.len() != 1)
+    {
+        return Err("PAIR_INVALID: duplicate immutable ID prevents exact route resolution".to_string());
+    }
+    let gateway_index = gateway_indexes
+        .and_then(|indexes| indexes.first())
         .copied()
         .ok_or_else(|| "PAIR_BROKEN: gateway reference no longer exists".to_string())?;
     if gateway_index == vm_index {
@@ -166,7 +183,7 @@ pub fn diagnostics(entries: &[HostEntry]) -> Vec<Diagnostic> {
                 "broken_reference",
                 format!(
                     "cannot inspect pair metadata for {}",
-                    entries[index].source.path
+                    source_label(&entries[index])
                 ),
             );
             continue;
@@ -177,19 +194,22 @@ pub fn diagnostics(entries: &[HostEntry]) -> Vec<Diagnostic> {
                 "duplicate_id",
                 format!(
                     "HostEntry {} contains multiple ##SSHX ID markers",
-                    entries[index].source.path
+                    source_label(&entries[index])
                 ),
             );
         }
-        if let Some(id) = &entry.id {
-            ids.entry(id.to_ascii_lowercase()).or_default().push(index);
+        for id in entry.id.iter().chain(entry.additional_ids.iter()) {
+            let indexes = ids.entry(id.to_ascii_lowercase()).or_default();
+            if indexes.last() != Some(&index) {
+                indexes.push(index);
+            }
             if !valid_id(id) {
                 push_diagnostic(
                     &mut diagnostics,
                     "malformed_id",
                     format!(
                         "HostEntry {} has malformed ID `{id}`",
-                        entries[index].source.path
+                        source_label(&entries[index])
                     ),
                 );
             }
@@ -200,7 +220,7 @@ pub fn diagnostics(entries: &[HostEntry]) -> Vec<Diagnostic> {
                 "malformed_pair",
                 format!(
                     "HostEntry {} has an invalid Port directive",
-                    entries[index].source.path
+                    source_label(&entries[index])
                 ),
             );
         }
@@ -209,7 +229,7 @@ pub fn diagnostics(entries: &[HostEntry]) -> Vec<Diagnostic> {
         if indexes.len() > 1 {
             let sources = indexes
                 .iter()
-                .map(|index| entries[*index].source.path.as_str())
+                .map(|index| source_label(&entries[*index]))
                 .collect::<Vec<_>>()
                 .join(", ");
             push_diagnostic(
@@ -235,7 +255,7 @@ pub fn diagnostics(entries: &[HostEntry]) -> Vec<Diagnostic> {
                 "broken_reference",
                 format!(
                     "HostEntry {} has invalid transit metadata",
-                    entries[index].source.path
+                    source_label(&entries[index])
                 ),
             );
         }
@@ -246,7 +266,7 @@ pub fn diagnostics(entries: &[HostEntry]) -> Vec<Diagnostic> {
                     "broken_reference",
                     format!(
                         "HostEntry {} has an empty gateway reference",
-                        entries[index].source.path
+                        source_label(&entries[index])
                     ),
                 );
                 continue;
@@ -261,7 +281,7 @@ pub fn diagnostics(entries: &[HostEntry]) -> Vec<Diagnostic> {
                     "broken_reference",
                     format!(
                         "HostEntry {} references missing gateway `{gateway_id}`",
-                        entries[index].source.path
+                        source_label(&entries[index])
                     ),
                 );
                 continue;
@@ -274,7 +294,7 @@ pub fn diagnostics(entries: &[HostEntry]) -> Vec<Diagnostic> {
                     "broken_reference",
                     format!(
                         "HostEntry {} has pair metadata but no valid ID",
-                        entries[index].source.path
+                        source_label(&entries[index])
                     ),
                 );
             }
@@ -284,7 +304,7 @@ pub fn diagnostics(entries: &[HostEntry]) -> Vec<Diagnostic> {
                     "broken_reference",
                     format!(
                         "HostEntry {} has no valid transit destination",
-                        entries[index].source.path
+                        source_label(&entries[index])
                     ),
                 );
             }
@@ -297,9 +317,40 @@ pub fn diagnostics(entries: &[HostEntry]) -> Vec<Diagnostic> {
                     "broken_reference",
                     format!(
                         "HostEntry {} has no matching gateway pair reference",
-                        entries[index].source.path
+                        source_label(&entries[index])
                     ),
                 );
+            }
+            if let (Some(gateway), Some((transit_host, transit_port))) =
+                (gateway, entry.transit.as_ref())
+            {
+                let forward_count = gateway
+                    .forwards
+                    .iter()
+                    .filter(|forward| {
+                        forward.host == *transit_host && forward.port == *transit_port
+                    })
+                    .count();
+                if entry.invalid_port || entry.port != *transit_port || forward_count != 1 {
+                    push_diagnostic(
+                        &mut diagnostics,
+                        "PAIR_ROUTE_CHANGED",
+                        format!(
+                            "route changed between {} and {}: VM Port is {}; approved transit is {}:{}; gateway LocalForward match count is {forward_count}. Evidence: {} and {}. Guidance: restore VM Port and exactly one gateway LocalForward to the approved transit destination.",
+                            source_label(&entries[*gateway_index]),
+                            source_label(&entries[index]),
+                            if entry.invalid_port {
+                                "invalid".to_string()
+                            } else {
+                                entry.port.to_string()
+                            },
+                            transit_host,
+                            transit_port,
+                            source_label(&entries[*gateway_index]),
+                            source_label(&entries[index]),
+                        ),
+                    );
+                }
             }
         }
         if entry.paired_vm_marker {
@@ -309,7 +360,7 @@ pub fn diagnostics(entries: &[HostEntry]) -> Vec<Diagnostic> {
                     "broken_reference",
                     format!(
                         "HostEntry {} has an empty VM reference",
-                        entries[index].source.path
+                        source_label(&entries[index])
                     ),
                 );
                 continue;
@@ -320,7 +371,7 @@ pub fn diagnostics(entries: &[HostEntry]) -> Vec<Diagnostic> {
                     "broken_reference",
                     format!(
                         "HostEntry {} references missing VM `{vm_id}`",
-                        entries[index].source.path
+                        source_label(&entries[index])
                     ),
                 );
                 continue;
@@ -337,7 +388,7 @@ pub fn diagnostics(entries: &[HostEntry]) -> Vec<Diagnostic> {
                     "broken_reference",
                     format!(
                         "HostEntry {} has no matching VM pair reference",
-                        entries[index].source.path
+                        source_label(&entries[index])
                     ),
                 );
             }
@@ -357,20 +408,34 @@ pub fn diagnostics(entries: &[HostEntry]) -> Vec<Diagnostic> {
 
 pub fn records(entries: &[HostEntry]) -> Vec<PairRecord> {
     let parsed = entries.iter().map(parse_entry).collect::<Vec<_>>();
-    let by_id = parsed
-        .iter()
-        .enumerate()
-        .filter_map(|(index, result)| {
-            let entry = result.as_ref().ok()?;
-            let id = entry.id.as_deref()?;
-            (valid_id(id)).then_some((id.to_ascii_lowercase(), index))
-        })
+    let mut id_indexes: HashMap<String, Vec<usize>> = HashMap::new();
+    for (index, result) in parsed.iter().enumerate() {
+        if let Ok(entry) = result.as_ref() {
+            for id in entry
+                .id
+                .iter()
+                .chain(entry.additional_ids.iter())
+                .filter(|id| valid_id(id))
+            {
+                let indexes = id_indexes.entry(id.to_ascii_lowercase()).or_default();
+                if indexes.last() != Some(&index) {
+                    indexes.push(index);
+                }
+            }
+        }
+    }
+    let by_id = id_indexes
+        .into_iter()
+        .filter_map(|(id, indexes)| (indexes.len() == 1).then_some((id, indexes[0])))
         .collect::<HashMap<_, _>>();
     let mut records = Vec::new();
     for (index, result) in parsed.iter().enumerate() {
         let Ok(vm) = result else {
             continue;
         };
+        if vm.id_markers != 1 {
+            continue;
+        }
         let Some(gateway_id) = vm.gateway_id.as_deref() else {
             continue;
         };
@@ -380,6 +445,20 @@ pub fn records(entries: &[HostEntry]) -> Vec<PairRecord> {
         let Some(gateway_index) = by_id.get(&gateway_id.to_ascii_lowercase()) else {
             continue;
         };
+        let Some(vm_id) = vm.id.as_deref().filter(|id| valid_id(id)) else {
+            continue;
+        };
+        if !by_id.contains_key(&vm_id.to_ascii_lowercase())
+            || !parsed[*gateway_index].as_ref().is_ok_and(|gateway| {
+                gateway.id_markers == 1
+                    && gateway
+                        .paired_vm_id
+                        .as_deref()
+                        .is_some_and(|id| id.eq_ignore_ascii_case(vm_id))
+            })
+        {
+            continue;
+        }
         let gateway = &entries[*gateway_index];
         records.push(PairRecord {
             gateway_id: gateway.id.clone(),
@@ -482,6 +561,22 @@ pub fn plan_setup(
         (Some(host), Some(port)) => {
             validate_transit_host(host)?;
             validate_transit_port(port)?;
+            if vm_data.invalid_port || vm_data.port != port {
+                return Err(format!(
+                    "TRANSIT_MISMATCH: explicit transit port {port} must match VM Port {}",
+                    if vm_data.invalid_port { "invalid".to_string() } else { vm_data.port.to_string() }
+                ));
+            }
+            let matches = gateway_data
+                .forwards
+                .iter()
+                .filter(|candidate| candidate.host == host && candidate.port == port)
+                .count();
+            if matches != 1 {
+                return Err(format!(
+                    "TRANSIT_MISMATCH: explicit transit {host}:{port} matches {matches} gateway LocalForward directives"
+                ));
+            }
             (host.to_string(), port)
         }
         (Some(_), None) | (None, Some(_)) => {
@@ -510,6 +605,7 @@ pub fn plan_setup(
         }
     };
 
+
     mutation::plan_pair(&PairMutationRequest {
         gateway_path: gateway.source.path.clone().into(),
         gateway_expected_id: gateway.id.clone(),
@@ -525,6 +621,30 @@ pub fn plan_setup(
         vm_byte_end: vm.source.byte_end,
         transit_host,
         transit_port,
+    })
+}
+pub fn transit_candidates(
+    gateway: &HostEntry,
+    vm: &HostEntry,
+) -> Result<Vec<(String, u16)>, String> {
+    let gateway_data = parse_entry(gateway)?;
+    let vm_data = parse_entry(vm)?;
+    let gateway_port = if vm_data.invalid_port {
+        return Err("PORT_INVALID: VM Port must be a number".to_string());
+    } else {
+        vm_data.port
+    };
+    Ok(gateway_data
+        .forwards
+        .into_iter()
+        .filter(|candidate| candidate.port == gateway_port)
+        .map(|candidate| (candidate.host, candidate.port))
+        .collect())
+}
+
+pub fn setup_eligible(entry: &HostEntry) -> bool {
+    parse_entry(entry).is_ok_and(|entry| {
+        !entry.gateway_marker && !entry.paired_vm_marker && !entry.proxy_command && !entry.proxy_jump
     })
 }
 
@@ -596,8 +716,13 @@ fn parse_entry(entry: &HostEntry) -> Result<ParsedEntry, String> {
         .ok_or_else(|| format!("Host line moved in {}", entry.source.path))?;
     let block_start_line = (0..host_line)
         .rev()
-        .find(|index| is_boundary(&bytes, lines[*index]))
-        .map_or(0, |index| index + 1);
+        .take_while(|index| {
+            let text = String::from_utf8_lossy(&bytes[lines[*index].0..lines[*index].1]);
+            let trimmed = text.trim();
+            trimmed.is_empty() || trimmed.starts_with("##SSHX")
+        })
+        .last()
+        .unwrap_or(host_line);
     let next_boundary =
         ((host_line + 1)..lines.len()).find(|index| is_boundary(&bytes, lines[*index]));
     let mut parse_end_line = next_boundary.unwrap_or(lines.len());
@@ -627,6 +752,7 @@ fn parse_entry(entry: &HostEntry) -> Result<ParsedEntry, String> {
     });
     let mut result = ParsedEntry {
         id: None,
+        additional_ids: Vec::new(),
         id_markers: 0,
         gateway_id: None,
         gateway_marker: false,
@@ -655,8 +781,12 @@ fn parse_entry(entry: &HostEntry) -> Result<ParsedEntry, String> {
             match key.as_deref() {
                 Some("ID") => {
                     result.id_markers += 1;
-                    if result.id.is_none() {
-                        result.id = value.filter(|value| !value.is_empty());
+                    if let Some(value) = value.filter(|value| !value.is_empty()) {
+                        if result.id.is_none() {
+                            result.id = Some(value);
+                        } else {
+                            result.additional_ids.push(value);
+                        }
                     }
                 }
                 Some("GATEWAY") => {
@@ -718,6 +848,9 @@ fn same_entry(left: &HostEntry, right: &HostEntry) -> bool {
     left.source.path == right.source.path
         && left.source.byte_start == right.source.byte_start
         && left.source.byte_end == right.source.byte_end
+}
+fn source_label(entry: &HostEntry) -> String {
+    format!("{}:{}", entry.source.path, entry.source.line_start)
 }
 
 fn push_diagnostic(diagnostics: &mut Vec<Diagnostic>, code: &str, message: String) {
@@ -847,5 +980,181 @@ fn is_boundary(bytes: &[u8], line: (usize, usize, usize)) -> bool {
         Some(keyword) if keyword.eq_ignore_ascii_case("match") => true,
         Some(keyword) if keyword.eq_ignore_ascii_case("host") => tokens.len() > 1,
         _ => false,
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::{diagnostics, paired_route, records};
+    use crate::discovery::{DiscoveryRoot, HostEntry, SourceIdentity, discover_roots};
+    use std::fs;
+
+    #[test]
+    fn diagnostics_flag_changed_gateway_transit_route() {
+        let gateway_id = "123e4567-e89b-42d3-a456-426614174000";
+        let vm_id = "123e4567-e89b-42d3-a456-426614174001";
+        let config = format!(
+            "Host gateway\n  ##SSHX ID {gateway_id}\n  ##SSHX VM {vm_id}\n  LocalForward 2200 10.0.0.6:22\nHost vm\n  ##SSHX ID {vm_id}\n  ##SSHX GATEWAY {gateway_id}\n  ##SSHX TRANSIT 10.0.0.5 2200\n  Port 2200\n"
+        );
+        let path = std::env::temp_dir().join(format!(
+            "sshx-pair-diagnostics-{}-{}.conf",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, &config).unwrap();
+        let path_string = path.to_string_lossy().into_owned();
+        let host_entry = |alias: &str, byte_start: usize| HostEntry {
+            id: alias.to_string(),
+            aliases: vec![alias.to_string()],
+            source: SourceIdentity {
+                path: path_string.clone(),
+                byte_start,
+                byte_end: config.len(),
+                line_start: 1,
+                line_end: 1,
+            },
+            destination: None,
+            provenance: Vec::new(),
+            scopes: Vec::new(),
+            projects: Vec::new(),
+        };
+        let entries = vec![
+            host_entry("gateway", 0),
+            host_entry("vm", config.find("Host vm").unwrap()),
+        ];
+
+        let report = diagnostics(&entries);
+        let found = report
+            .iter()
+            .find(|diagnostic| diagnostic.code == "PAIR_ROUTE_CHANGED");
+        fs::remove_file(path).unwrap();
+        let Some(diagnostic) = found else {
+            panic!("changed gateway route must be reported: {report:?}");
+        };
+        assert!(diagnostic.message.contains(&path_string));
+        assert!(diagnostic.message.contains("Evidence:"));
+        assert!(diagnostic.message.contains("Guidance:"));
+        assert!(diagnostic.message.contains("LocalForward match count is 0"));
+    }
+    #[test]
+    fn unrelated_duplicate_id_does_not_block_pair_route() {
+        let gateway_id = "123e4567-e89b-42d3-a456-426614174000";
+        let vm_id = "123e4567-e89b-42d3-a456-426614174001";
+        let duplicate_id = "123e4567-e89b-42d3-a456-426614174002";
+        let config = format!(
+            concat!(
+                "##SSHX ID={gateway_id}\n",
+                "##SSHX VM={vm_id}\n",
+                "Host gateway\n",
+                "  LocalForward 2200 vm.internal:22\n",
+                "##SSHX ID={vm_id}\n",
+                "##SSHX GATEWAY={gateway_id}\n",
+                "##SSHX TRANSIT=vm.internal:22\n",
+                "Host vm\n",
+                "  HostName vm.internal\n",
+                "  Port 22\n",
+                "##SSHX ID={duplicate_id}\n",
+                "Host duplicate-one\n",
+                "##SSHX ID={duplicate_id}\n",
+                "Host duplicate-two\n",
+            ),
+            gateway_id = gateway_id,
+            vm_id = vm_id,
+            duplicate_id = duplicate_id,
+        );
+        let path = std::env::temp_dir().join(format!(
+            "sshx-pair-duplicate-id-{}-{}.conf",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, config).unwrap();
+        let catalog = discover_roots(&[DiscoveryRoot::new(&path, "personal", None)]).unwrap();
+        let vm = catalog
+            .entries
+            .iter()
+            .find(|entry| entry.aliases.iter().any(|alias| alias == "vm"))
+            .unwrap();
+        let route = paired_route(&catalog.entries, vm).unwrap();
+        fs::remove_file(path).unwrap();
+
+        assert_eq!(route.unwrap().gateway.aliases, ["gateway"]);
+    }
+    #[test]
+    fn repeated_id_marker_entry_cannot_hide_duplicate_pair_id() {
+        let gateway_id = "123e4567-e89b-42d3-a456-426614174000";
+        let vm_id = "123e4567-e89b-42d3-a456-426614174001";
+        let extra_id = "123e4567-e89b-42d3-a456-426614174002";
+        let config = format!(
+            concat!(
+                "##SSHX ID={gateway_id}\n",
+                "##SSHX VM={vm_id}\n",
+                "Host gateway\n",
+                "  LocalForward 2200 vm.internal:22\n",
+                "##SSHX ID={vm_id}\n",
+                "##SSHX GATEWAY={gateway_id}\n",
+                "##SSHX TRANSIT=vm.internal:22\n",
+                "Host vm\n",
+                "  Port 22\n",
+                "##SSHX ID={extra_id}\n",
+                "##SSHX ID={gateway_id}\n",
+                "Host duplicate\n",
+            ),
+            gateway_id = gateway_id,
+            vm_id = vm_id,
+            extra_id = extra_id,
+        );
+        let path = std::env::temp_dir().join(format!(
+            "sshx-pair-multiple-id-{}-{}.conf",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, config).unwrap();
+        let catalog = discover_roots(&[DiscoveryRoot::new(&path, "personal", None)]).unwrap();
+        let records = records(&catalog.entries);
+        fs::remove_file(path).unwrap();
+
+        assert!(
+            records.is_empty(),
+            "invalid duplicate identity must not expose a Pair: {records:?}"
+        );
+    }
+
+    #[test]
+    fn repeated_id_markers_do_not_claim_multiple_host_entries() {
+        let id = "123e4567-e89b-42d3-a456-426614174000";
+        let config = format!("##SSHX ID={id}\n##SSHX ID={id}\nHost repeated\n");
+        let path = std::env::temp_dir().join(format!(
+            "sshx-pair-repeated-id-{}-{}.conf",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, config).unwrap();
+        let catalog = discover_roots(&[DiscoveryRoot::new(&path, "personal", None)]).unwrap();
+        let findings = diagnostics(&catalog.entries);
+        fs::remove_file(path).unwrap();
+
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("contains multiple ##SSHX ID markers")),
+            "{findings:?}"
+        );
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.message.contains("used by multiple HostEntries")),
+            "{findings:?}"
+        );
     }
 }
