@@ -1532,6 +1532,7 @@ pub fn doctor_workspace(
             let mut selected = 0usize;
             let mut expanded = true;
             let mut reviewing = false;
+            let mut plan_visible = false;
             let mut repair_plan = None;
             let mut detail_scroll = 0u16;
             let mut status_scroll = 0u16;
@@ -1569,7 +1570,7 @@ pub fn doctor_workspace(
                             "↑↓ findings · Enter evidence · Tab status · PgUp/Dn scroll · R repair · Esc"
                         };
                         let footer_rows = if area.width < 48 { 3 } else if area.width < 96 { 2 } else { 1 };
-                        let footer_height = (if status.is_some() { footer_rows + 3 } else { footer_rows })
+                        let footer_height = (if status.is_some() && !reviewing { footer_rows + 3 } else { footer_rows })
                             .min(area.height.saturating_sub(3));
                         let chunks = Layout::default()
                             .direction(Direction::Vertical)
@@ -1579,6 +1580,12 @@ pub fn doctor_workspace(
                                 Constraint::Length(footer_height),
                             ])
                             .split(area);
+                        plan_visible = chunks[1].width > 2 && chunks[1].height > 2;
+                        let footer = if reviewing && !plan_visible {
+                            "Resize terminal to review plan · Esc cancel"
+                        } else {
+                            footer
+                        };
                         frame.render_widget(
                             Paragraph::new(if reviewing {
                                 "Doctor · review eligible permission repairs"
@@ -1674,7 +1681,7 @@ pub fn doctor_workspace(
                                 panes[1],
                             );
                         }
-                        if status.is_some() {
+                        if status.is_some() && !reviewing {
                             status_page_rows = chunks[2].height.saturating_sub(footer_rows).max(1);
                             frame.render_widget(
                                 Paragraph::new(status.unwrap_or(""))
@@ -1706,7 +1713,7 @@ pub fn doctor_workspace(
                         reviewing = false;
                         detail_scroll = 0;
                     }
-                    KeyEvent { code: KeyCode::Char('y' | 'Y'), .. } if reviewing => {
+                    KeyEvent { code: KeyCode::Char('y' | 'Y'), .. } if reviewing && plan_visible => {
                         return Ok(DoctorAction::Repair);
                     }
                     KeyEvent { code: KeyCode::Esc, .. } => return Ok(DoctorAction::Exit),
