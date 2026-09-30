@@ -176,7 +176,7 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
         return Ok(());
     }
 
-    let cli = Cli::parse(args.clone()).map_err(|error| {
+    let mut cli = Cli::parse(args.clone()).map_err(|error| {
         if error.contains("Usage:") {
             error
         } else {
@@ -215,6 +215,9 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
             } else {
                 "HostEntry deleted."
             };
+            cli.id = None;
+            cli.location = SourceLocation::default();
+            cli.command = Command::Hosts { explicit: true };
             return run_hosts(&cli, &home_dir()?, &roots, Some(status.to_string()));
         }
         return Ok(());

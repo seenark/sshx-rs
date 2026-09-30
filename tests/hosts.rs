@@ -381,6 +381,35 @@ fn host_delete_explicit_tui_result_refreshes_hosts_and_stays_open() {
 }
 
 #[test]
+fn host_delete_explicit_selectors_do_not_filter_refreshed_hosts() {
+    let id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let before = format!("##SSHX ID={id}\nHost selected\n  HostName old.example\nHost untouched\n  HostName untouched.example\n");
+    let (root, home, config) = host_edit_fixture("delete-selectors", &before);
+    let source = config.canonicalize().unwrap();
+    for by_id in [true, false] {
+        fs::write(&config, &before).unwrap();
+        let mut arguments = vec!["tui", "host", "delete"];
+        if by_id {
+            arguments.extend(["--id", id]);
+        } else {
+            arguments.extend(["selected", "--source", source.to_str().unwrap(), "--line", "2"]);
+        }
+        arguments.push("--yes");
+        let mut terminal = HostEditTerminal::open(&home, &config, &arguments);
+        terminal.expect("Review HostEntry mutation");
+        terminal.send(b"\r");
+        terminal.expect("HostEntry deleted.");
+        terminal.expect("untouched.example");
+        assert_eq!(fs::read_to_string(&config).unwrap(),
+            "Host untouched\n  HostName untouched.example\n");
+        assert!(terminal.child.try_wait().unwrap().is_none());
+        terminal.send(b"\x1b");
+        assert_eq!(terminal.finish(), Some(0));
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn host_delete_preview_and_review_cancellation_preserve_source() {
     let before = "Host prod secondary\n  HostName old.example\n  ##PASSWORD stored-secret\n";
     let (root, home, config) = host_edit_fixture("preview-delete", before);
