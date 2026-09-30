@@ -119,6 +119,19 @@ sshx connect db-prod --password-fd 3 --no-input 3<"$HOME/.ssh/password"
 
 The selected HostEntry's `IdentityFile`, agent options, and supported OpenSSH settings stay in effect. Host-key enrollment is separate from authentication. On first use, interactive mode shows the OpenSSH fingerprint and asks for explicit confirmation; non-interactive mode returns `HOST_KEY_TRUST_REQUIRED`.
 
+## Create HostEntries
+
+From Hosts, press `Ctrl+N` to open the editable HostEntry form. Run `sshx host create --alias prod` to open the same form with `prod` prefilled. The form selects an existing config root, destination file, alias, host destination, and optional fields. Password input stays masked. The destination file must deny group and other access before storing a password; new files use mode `0600`.
+
+Press `Ctrl+S` to review the filesystem change in the same workspace. Press `Enter` to apply with explicit consent, or `E`/`Esc` to return to the form. Validation errors keep entered values and focus the affected field. Short terminals scroll with the selected field. Press `Esc` in the form or `Ctrl+C` to cancel without changing SSH config. With `--preview`, `Enter` finishes review without applying.
+
+Use left/right arrows on the config-root field to select an existing root and prefill its scope, project, and folder. Supplied values remain editable. A scope conflicting with explicit `--config` fails before opening the form; incomplete creates without an explicit config can correct unmatched scope or project in the workspace. Creating from Hosts returns to Hosts with a completion result.
+Complete CLI commands run directly:
+
+```sh
+sshx host create --scope personal --file ~/.ssh/config --alias prod --hostname prod.example --yes
+```
+
 ## Pair setup and paired shell
 
 A **Pair** links exact gateway and VM HostEntries. The gateway OpenSSH master opens a temporary loopback transit forward. A separate VM OpenSSH master uses that port and its own host-key identity.

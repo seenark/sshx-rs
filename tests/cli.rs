@@ -5466,3 +5466,348 @@ fn setup_registration_stays_open_when_saved_root_is_missing() {
     assert!(!root.join("master-started").exists());
     fs::remove_dir_all(root).unwrap();
 }
+
+#[cfg(unix)]
+#[test]
+fn host_create_continuation_prefills_editable_fields_masks_password_and_applies() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    let original = "Host existing\n  HostName existing.example\n";
+    write(&config, original);
+    let mut permissions = fs::metadata(&config).unwrap().permissions();
+    permissions.set_mode(0o600);
+    fs::set_permissions(&config, permissions).unwrap();
+    let bin = root.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let config_arg = config.to_str().unwrap();
+    let (status, output) = run_with_pty_interactions(
+        &home,
+        &["--config", config_arg, "host", "create", "--alias", "prod"],
+        &bin,
+        &root,
+        &[
+            (b"Destination file:", b"config\t-new\tprod.example\t\t\tsecret\x13"),
+            (b"Review HostEntry changes", b"\n"),
+        ],
+        None,
+        Some((100, 40)),
+    );
+    assert!(status.success(), "status={status:?} output={output}");
+    assert!(output.contains("••••••"), "password was not masked: {output}");
+    assert!(output.contains("<redacted>"), "review did not redact password: {output}");
+    assert!(output.contains("Review HostEntry changes"), "{output}");
+    assert!(!output.contains("secret"), "password leaked to terminal: {output}");
+    let created = fs::read_to_string(&config).unwrap();
+    assert!(created.starts_with(original), "{created}");
+    assert!(created.contains("Host prod-new\n  HostName prod.example\n"), "{created}");
+    assert!(created.contains("  ##PASSWORD secret\n"), "{created}");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn host_create_compact_form_shows_destination_value_and_review_control() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(&config, "Host existing\n  HostName existing.example\n");
+    let bin = root.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let (status, output) = run_with_pty_interactions(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "host",
+            "create",
+            "--alias",
+            "compact",
+        ],
+        &bin,
+        &root,
+        &[
+            (b"Create HostEntry", b"compact.conf\t-new\tcompact.example\t\t\t\x13"),
+            (b"Review HostEntry", b"\n"),
+        ],
+        None,
+        Some((18, 30)),
+    );
+    assert!(status.success(), "status={status:?} output={output}");
+    assert!(contains_tui_text(output.as_bytes(), b"compact.conf"), "{output}");
+    assert!(contains_tui_text(output.as_bytes(), b"compact.example"), "{output}");
+    assert!(contains_tui_text(output.as_bytes(), b"^S review"), "{output}");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn host_create_retains_values_after_validation_error() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(&config, "Host existing\n  HostName existing.example\n");
+    let bin = root.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let config_arg = config.to_str().unwrap();
+    let (status, output) = run_with_pty_interactions(
+        &home,
+        &["--config", config_arg, "host", "create"],
+        &bin,
+        &root,
+        &[
+            (b"Destination file:", b"config\tprod\tprod.example\t\tx\x13"),
+            (b"PORT_INVALID", b"\x7f22\x13"),
+            (b"Review HostEntry changes", b"\n"),
+        ],
+        None,
+        Some((100, 40)),
+    );
+    assert!(status.success(), "status={status:?} output={output}");
+    assert!(output.contains("PORT_INVALID"), "{output}");
+    assert!(output.contains("Review HostEntry changes"), "{output}");
+    let created = fs::read_to_string(&config).unwrap();
+    assert!(created.contains("Host prod\n  HostName prod.example\n"), "{created}");
+    assert!(created.contains("  Port 22\n"), "{created}");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn host_create_rejects_explicit_scope_conflict_before_opening_workspace() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(&config, "Host existing\n  HostName existing.example\n");
+    let bin = root.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let (status, output) = run_with_pty_header(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "--scope",
+            "work",
+            "host",
+            "create",
+        ],
+        &bin,
+        &root,
+        b"\x1b",
+        b"SCOPE_ROOT_CONFLICT",
+    );
+    assert_eq!(status.code(), Some(2), "status={status:?} output={output}");
+    assert!(output.contains("SCOPE_ROOT_CONFLICT"), "{output}");
+    assert!(!output.contains("Create HostEntry"), "{output}");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn host_create_file_required_error_focuses_destination() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(&config, "Host existing\n  HostName existing.example\n");
+    let bin = root.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let (status, output) = run_with_pty_interactions(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "host",
+            "create",
+            "--alias",
+            "prod",
+        ],
+        &bin,
+        &root,
+        &[
+            (b"Destination file:", b"\x1b[B\x13"),
+            (b"FILE_REQUIRED", b"config\x13"),
+            (b"HOSTNAME_REQUIRED", b"prod.example\x13"),
+            (b"Review HostEntry changes", b"\n"),
+        ],
+        None,
+        Some((100, 40)),
+    );
+    assert!(status.success(), "status={status:?} output={output}");
+    assert!(output.contains("FILE_REQUIRED"), "{output}");
+    assert!(
+        fs::read_to_string(&config)
+            .unwrap()
+            .contains("Host prod\n  HostName prod.example\n"),
+        "{output}"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn host_create_scrolls_small_form_to_selected_password_field() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(&config, "Host existing\n  HostName existing.example\n");
+    let bin = root.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let (status, output) = run_with_pty_interactions(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "host",
+            "create",
+            "--alias",
+            "prod",
+        ],
+        &bin,
+        &root,
+        &[(b"Create HostEntry", b"\t\t\t\t\t"), (b"assword:", b"\x1b")],
+        None,
+        Some((100, 8)),
+    );
+    assert_eq!(status.code(), Some(130), "status={status:?} output={output}");
+    assert!(output.contains("assword:"), "{output}");
+    assert!(output.contains("Ctrl-S review"), "{output}");
+    assert_eq!(
+        fs::read_to_string(&config).unwrap(),
+        "Host existing\n  HostName existing.example\n"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn complete_host_create_does_not_prompt_for_optional_fields() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(&config, "Host existing\n  HostName existing.example\n");
+    let bin = root.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let config_arg = config.to_str().unwrap();
+    let (status, output) = run_with_pty_interactions(
+        &home,
+        &[
+            "--config",
+            config_arg,
+            "--scope",
+            "personal",
+            "--file",
+            "config",
+            "--alias",
+            "prod",
+            "--hostname",
+            "prod.example",
+            "--yes",
+            "host",
+            "create",
+        ],
+        &bin,
+        &root,
+        &[],
+        None,
+        Some((100, 40)),
+    );
+    assert!(status.success(), "status={status:?} output={output}");
+    assert!(output.contains("Applied host entry"), "{output}");
+    assert!(!output.contains("Create HostEntry"), "{output}");
+    assert!(!output.contains("[optional]"), "{output}");
+    assert!(
+        fs::read_to_string(&config)
+            .unwrap()
+            .contains("Host prod\n  HostName prod.example\n"),
+        "{output}"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn host_create_noninteractive_errors_and_invalid_target_leave_files_unchanged() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    let original = "Host existing\n  HostName existing.example\n";
+    let unrelated = home.join(".ssh/unrelated.conf");
+    write(&config, original);
+    write(&unrelated, "unrelated\n");
+    let config_arg = config.to_str().unwrap();
+
+    let missing = run(
+        &home,
+        &[
+            "--config",
+            config_arg,
+            "--scope",
+            "personal",
+            "host",
+            "create",
+            "--file",
+            "config",
+            "--alias",
+            "prod",
+            "--no-input",
+        ],
+    );
+    assert_eq!(missing.status.code(), Some(2), "{missing:?}");
+    assert!(
+        String::from_utf8_lossy(&missing.stderr).contains("HOSTNAME_REQUIRED"),
+        "{missing:?}"
+    );
+    assert_eq!(fs::read_to_string(&config).unwrap(), original);
+
+    let invalid_target = run(
+        &home,
+        &[
+            "--config",
+            config_arg,
+            "--scope",
+            "personal",
+            "--file",
+            ".",
+            "--alias",
+            "prod",
+            "--hostname",
+            "prod.example",
+            "--yes",
+            "host",
+            "create",
+        ],
+    );
+    assert_eq!(invalid_target.status.code(), Some(2), "{invalid_target:?}");
+    assert!(
+        String::from_utf8_lossy(&invalid_target.stderr).contains("TARGET_FILE_INVALID"),
+        "{invalid_target:?}"
+    );
+    assert_eq!(fs::read_to_string(&config).unwrap(), original);
+    assert_eq!(fs::read_to_string(&unrelated).unwrap(), "unrelated\n");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn host_create_tui_cancellation_leaves_files_unchanged() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    let original = "Host existing\n  HostName existing.example\n";
+    let unrelated = home.join(".ssh/unrelated.conf");
+    write(&config, original);
+    write(&unrelated, "unrelated\n");
+    let bin = root.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let (status, output) = run_with_pty_interactions(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "host",
+            "create",
+            "--alias",
+            "prod",
+        ],
+        &bin,
+        &root,
+        &[(b"Config root", b"\x1b")],
+        None,
+        Some((100, 40)),
+    );
+    assert_eq!(status.code(), Some(130), "status={status:?} output={output}");
+    assert_eq!(fs::read_to_string(&config).unwrap(), original);
+    assert_eq!(fs::read_to_string(&unrelated).unwrap(), "unrelated\n");
+    fs::remove_dir_all(root).unwrap();
+}
