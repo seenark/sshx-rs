@@ -90,7 +90,7 @@ pub fn current_values(request: &UpdateRequest) -> Result<CurrentValues, String> 
             && directive_matches(raw, "Port")
             && let Some((start, end)) = argument_span(raw, "Port")
         {
-            values.port = String::from_utf8_lossy(&raw[start..end]).parse().ok();
+            values.port = decode_token(&raw[start..end]).parse().ok();
         }
         values.has_password |= password_line(raw);
     }

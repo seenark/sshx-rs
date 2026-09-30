@@ -613,6 +613,69 @@ fn missing_host_selector_prefills_clear_flag_and_can_replace_that_field() {
     fs::remove_dir_all(root).unwrap();
 }
 
+#[test]
+fn hosts_rename_ignores_unrelated_root_cli_fields() {
+    let (root, home, config) = host_edit_fixture("rename-root-fields",
+        "Host prod secondary\n  HostName old.example\n  User alice\n  Port 2222\n  ##PASSWORD stored-secret\n");
+    let mut terminal = HostEditTerminal::open(&home, &config,
+        &["tui", "--hostname", "new.example", "--user", "bob", "--clear-port", "--clear-password"]);
+    terminal.expect("sshx Hosts");
+    terminal.send(b"secondary\x12");
+    terminal.expect("Rename HostEntry");
+    terminal.send(&[0x7f; 9]);
+    terminal.send(b"renamed\x13");
+    terminal.expect("Review HostEntry changes");
+    terminal.send(b"\r");
+    terminal.expect("HostEntry renamed.");
+    terminal.send(b"\x1b");
+    assert_eq!(terminal.finish(), Some(0));
+    assert_eq!(fs::read_to_string(&config).unwrap(),
+        "Host prod renamed\n  HostName old.example\n  User alice\n  Port 2222\n  ##PASSWORD stored-secret\n");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn host_update_prefills_quoted_port_and_preserves_it_when_kept() {
+    let (root, home, config) = host_edit_fixture("quoted-port",
+        "Host prod secondary\n  HostName old.example\n  User alice\n  Port \"2222\"\n");
+    let mut terminal = HostEditTerminal::open(&home, &config,
+        &["tui", "host", "update", "secondary", "--user", "bob"]);
+    terminal.expect("Edit HostEntry");
+    terminal.expect("Port [keep]: 2222");
+    terminal.send(b"\x13");
+    terminal.expect("Review HostEntry changes");
+    terminal.send(b"\r");
+    assert_eq!(terminal.finish(), Some(0));
+    assert_eq!(fs::read_to_string(&config).unwrap(),
+        "Host prod secondary\n  HostName old.example\n  User bob\n  Port \"2222\"\n");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn hosts_preview_returns_to_unchanged_entry_without_claiming_mutation() {
+    let before = "Host prod secondary\n  HostName old.example\n  User alice\n";
+    let (root, home, config) = host_edit_fixture("hosts-preview", before);
+    for (key, title) in [(b"\x15".as_slice(), "Edit HostEntry"), (b"\x12".as_slice(), "Rename HostEntry")] {
+        let mut terminal = HostEditTerminal::open(&home, &config,
+            &["tui", "--preview", "--hostname", "new.example", "--alias", "renamed"]);
+        terminal.expect("sshx Hosts");
+        terminal.send(b"secondary");
+        terminal.send(key);
+        terminal.expect(title);
+        terminal.send(b"\x13");
+        terminal.expect("Enter finish preview");
+        terminal.send(b"\r");
+        terminal.expect("HostEntry preview complete.");
+        terminal.expect("secondary");
+        assert!(!contains_tui_text(&terminal.output, "HostEntry updated."));
+        assert!(!contains_tui_text(&terminal.output, "HostEntry renamed."));
+        assert_eq!(fs::read_to_string(&config).unwrap(), before);
+        terminal.send(b"\x1b");
+        assert_eq!(terminal.finish(), Some(0));
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
 fn host_edit_fixture(name: &str, contents: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
     let root = std::env::temp_dir().join(format!("sshx-{name}-{}-{}", std::process::id(),
         SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));

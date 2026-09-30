@@ -617,7 +617,9 @@ fn run_hosts(cli: &Cli, home: &Path, roots: &[RegisteredRoot]) -> Result<(), Str
                     {
                         state.prefill(updated, alias, "");
                     }
-                    Some(if operation == MutationKind::Rename {
+                    Some(if cli.preview {
+                        "HostEntry preview complete.".to_string()
+                    } else if operation == MutationKind::Rename {
                         "HostEntry renamed.".to_string()
                     } else {
                         "HostEntry updated.".to_string()
@@ -1610,11 +1612,14 @@ fn run_host_edit_workspace(
         if current.has_password { "********".to_string() } else { String::new() },
     ];
     let mut fields = original.clone();
-    for (index, value) in [(0, cli.alias.as_ref()), (1, cli.hostname.as_ref()), (2, cli.user.as_ref())] {
-        if let Some(value) = value { fields[index] = value.clone(); }
+    if let Some(alias) = &cli.alias { fields[0] = alias.clone(); }
+    let mut clears = [false; 3];
+    if operation == MutationKind::Update {
+        if let Some(hostname) = &cli.hostname { fields[1] = hostname.clone(); }
+        if let Some(user) = &cli.user { fields[2] = user.clone(); }
+        if let Some(port) = cli.port { fields[3] = port.to_string(); }
+        clears = [cli.clear_user, cli.clear_port, cli.clear_password];
     }
-    if let Some(port) = cli.port { fields[3] = port.to_string(); }
-    let mut clears = [cli.clear_user, cli.clear_port, cli.clear_password];
     for (index, clear) in clears.iter().enumerate() {
         if *clear { fields[index + 2].clear(); }
     }
