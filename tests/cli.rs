@@ -2755,6 +2755,100 @@ fn host_mutation_outputs_redact_secret_for_human_json_and_yaml() {
 }
 
 #[test]
+fn pair_list_does_not_render_relationship_with_duplicate_referenced_id() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(
+        &config,
+        concat!(
+            "##SSHX ID=11111111-1111-4111-8111-111111111111\n",
+            "##SSHX VM=33333333-3333-4333-8333-333333333333\n",
+            "Host gateway\n",
+            "  LocalForward 2200 vm.internal:22\n",
+            "##SSHX ID=11111111-1111-4111-8111-111111111111\n",
+            "Host duplicate\n",
+            "##SSHX ID=33333333-3333-4333-8333-333333333333\n",
+            "##SSHX GATEWAY=11111111-1111-4111-8111-111111111111\n",
+            "##SSHX TRANSIT=vm.internal:22\n",
+            "Host vm\n",
+            "  Port 22\n",
+        ),
+    );
+    let output = run(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "pair",
+            "list",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(output.status.success(), "{output:?}");
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(document["pairs"].as_array().unwrap().is_empty());
+    let duplicate = document["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|diagnostic| diagnostic["code"] == "duplicate_id")
+        .unwrap();
+    let message = duplicate["message"].as_str().unwrap();
+    assert!(message.contains(&format!("{}:3", config.display())), "{message}");
+    assert!(message.contains(&format!("{}:6", config.display())), "{message}");
+    fs::remove_dir_all(root).unwrap();
+}
+#[test]
+fn pair_list_and_validate_keep_stable_read_only_json_output() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(
+        &config,
+        concat!(
+            "##SSHX ID=11111111-1111-4111-8111-111111111111\n",
+            "##SSHX VM=22222222-2222-4222-8222-222222222222\n",
+            "Host gateway\n",
+            "  HostName gateway.example\n",
+            "  LocalForward 2200 vm.internal:22\n",
+            "##SSHX ID=22222222-2222-4222-8222-222222222222\n",
+            "##SSHX GATEWAY=11111111-1111-4111-8111-111111111111\n",
+            "##SSHX TRANSIT=vm.internal:22\n",
+            "Host vm\n",
+            "  HostName vm.internal\n",
+            "  Port 22\n",
+        ),
+    );
+    let original = fs::read_to_string(&config).unwrap();
+
+    for command in ["list", "validate"] {
+        let args = [
+            "--config",
+            config.to_str().unwrap(),
+            "pair",
+            command,
+            "--format",
+            "json",
+        ];
+        let first = run(&home, &args);
+        let second = run(&home, &args);
+        assert!(first.status.success(), "{first:?}");
+        assert!(second.status.success(), "{second:?}");
+        assert_eq!(first.stdout, second.stdout);
+        let document: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+        assert!(document["diagnostics"].as_array().unwrap().is_empty());
+        let pairs = document["pairs"].as_array().unwrap();
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0]["gateway_alias"], "gateway");
+        assert_eq!(pairs[0]["vm_alias"], "vm");
+        assert_eq!(pairs[0]["transit_host"], "vm.internal");
+        assert_eq!(pairs[0]["transit_port"], 22);
+    }
+    assert_eq!(fs::read_to_string(&config).unwrap(), original);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn pair_setup_assigns_ids_and_infers_unique_transit() {
     let (root, home) = fixture_root();
     let config = home.join(".ssh/config");
