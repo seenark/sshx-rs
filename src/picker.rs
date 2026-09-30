@@ -20,6 +20,7 @@ use std::io::{self, IsTerminal, Read};
 use std::os::fd::{AsRawFd, FromRawFd};
 
 pub const CANCELLED: &str = "PICKER_CANCELLED";
+pub const BACK: &str = "PICKER_BACK";
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConnectionMode {
     Session,
@@ -64,6 +65,7 @@ impl Drop for TerminalGuard {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct Selection<'a> {
     pub entry: &'a HostEntry,
     pub alias: &'a str,
@@ -116,10 +118,12 @@ struct Row<'a> {
     alias: &'a str,
 }
 
-pub fn select<'a>(entries: &[&'a HostEntry], label: &str) -> Result<Selection<'a>, String> {
-    if entries.is_empty() {
-        return Err("HOST_NOT_FOUND: no hosts match current filters".to_string());
-    }
+pub fn select<'a>(
+    entries: &[&'a HostEntry],
+    label: &str,
+    state: &mut HostsState,
+    status: Option<&str>,
+) -> Result<Selection<'a>, String> {
 
     with_terminal(
         label,
@@ -128,7 +132,12 @@ pub fn select<'a>(entries: &[&'a HostEntry], label: &str) -> Result<Selection<'a
         ),
         |terminal, input| {
             let mut query = String::new();
-            let mut selected = 0usize;
+            let mut selected = state.selected.as_ref().and_then(|(path, start, end, alias)| {
+                matching_rows(entries, "").iter().position(|row| {
+                    row.entry.source.path == *path && row.entry.source.byte_start == *start
+                        && row.entry.source.byte_end == *end && row.alias == alias
+                })
+            }).unwrap_or(0);
             let mut detail_page = HostDetailPage::Summary;
             let mut detail_scroll = 0u16;
 
@@ -158,7 +167,7 @@ pub fn select<'a>(entries: &[&'a HostEntry], label: &str) -> Result<Selection<'a
                     selected,
                     label,
                     "No matching HostEntry aliases.",
-                    None,
+                    status,
                     None,
                     detail_page,
                     detail_scroll,
@@ -171,6 +180,7 @@ pub fn select<'a>(entries: &[&'a HostEntry], label: &str) -> Result<Selection<'a
                         ..
                     } => {
                         if let Some(row) = rows.get(selected) {
+                            state.prefill(row.entry, row.alias, "");
                             return Ok(Selection {
                                 entry: row.entry,
                                 alias: row.alias,
@@ -2162,7 +2172,7 @@ pub fn connection_workspace(
                 }
                 KeyEvent {
                     code: KeyCode::Esc, ..
-                } => return Err(CANCELLED.to_string()),
+                } => return Err(BACK.to_string()),
                 KeyEvent {
                     code: KeyCode::Char('c'),
                     modifiers,
@@ -2646,7 +2656,7 @@ fn draw_connection_workspace(
                 eprintln!("  ! {error}");
             }
         }
-        eprintln!("↑↓ row  Space select  a -L  r -R  d -D  e edit  x remove custom/R/D  m mode  Enter review  Esc cancel");
+        eprintln!("↑↓ row  Space select  a -L  r -R  d -D  e edit  x remove custom/R/D  m mode  Enter review  Esc back  Ctrl-C cancel");
         return Ok(());
     }
     terminal
@@ -2729,7 +2739,7 @@ fn draw_connection_workspace(
                 } else if editing.is_some() {
                     "Type row\nEnter save\nEsc cancel\nPgUp/Dn row".to_string()
                 } else {
-                    "↑↓ Space · Tab\na -L r -R d -D\ne edit x remove\nm mode · Enter\nreview · Esc".to_string()
+                    "↑↓ Space · Tab\na -L r -R d -D\ne edit x remove\nm mode · Enter\nreview · Esc back".to_string()
                 }
             } else if width < 36 {
                 if review {
@@ -2737,7 +2747,7 @@ fn draw_connection_workspace(
                 } else if editing.is_some() {
                     "Type row\nEnter save\nEsc cancel\nPgUp/Dn row".to_string()
                 } else {
-                    "↑↓ move Space\na -L · r -R · d -D\ne edit · x remove\nm mode · Enter review · Esc cancel".to_string()
+                    "↑↓ move Space\na -L · r -R · d -D\ne edit · x remove\nm mode · Enter review · Esc back".to_string()
                 }
             } else if review {
                 format!(
@@ -2749,7 +2759,7 @@ fn draw_connection_workspace(
                 )
             } else {
                 format!(
-                    "↑↓ row · Space select · a -L · r -R · d -D · e edit\nx remove custom/R/D · m mode · Enter review · Esc cancel\n{page_tabs} · PgUp/PgDn scroll {scroll_target}"
+                    "↑↓ row · Space select · a -L · r -R · d -D · e edit\nx remove custom/R/D · m mode · Enter review · Esc back · Ctrl-C cancel\n{page_tabs} · PgUp/PgDn scroll {scroll_target}"
                 )
             };
             let footer_lines = wrap_status(&footer, width);

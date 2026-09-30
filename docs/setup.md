@@ -101,6 +101,14 @@ sshx connect --id <entry-id> --no-input
 sshx connect db-prod --source ~/.ssh/hosts.conf --line 42 --no-input
 ```
 
+`sshx tui connect HOST`, `sshx tui tunnel HOST`, and incomplete `connect` or `tunnel` commands continue the requested operation on usable stdin and stderr terminals. The focused HostEntry selector preselects an exact supplied alias, ID, or source/line identity. Search and arrow keys can choose another entry within the requested scope/project; identity selectors do not permanently filter the list. Unknown, ambiguous, or conflicting explicit selectors and malformed forwarding options fail before the UI opens.
+
+Bare `sshx tui --id ID` or `sshx tui --source FILE --line N` prefills the exact Hosts row without locking subsequent browsing to that identity. Source selectors resolve the physical file identity, including normalized paths, and still require an exact Host line.
+
+After selection, supplied forwarding values appear in the Session or Tunnel workspace and remain editable before review. `Esc` returns to the focused selector; cancelling before a successful operation exits with status `130` without starting a connection, changing files, or copying anything. Completed operations stay interactive. Password descriptors remain bound to the original exact HostEntry and source snapshot and are not replayed after a HostEntry change. `--no-input`, JSON/YAML, password stdin, and unusable terminals never open a continuation. `sshx host show --id ID` inspects the exact entry; `sshx tui host show --id ID` prefills interactive inspection.
+
+If a selected source changes or disappears, the continuation shows the error without starting the action. Failed rediscovery removes stale choices but leaves cancellation available with the same pending status.
+
 In Hosts, press `Ctrl+U` to update the selected HostEntry or `Ctrl+R` to rename only its selected alias. `sshx host update HOST` and `sshx host rename HOST` continue in the editor when no change is supplied; `sshx tui host update HOST --hostname DESTINATION` and `sshx tui host rename HOST --alias ALIAS` open it even with complete fields. Fields show `keep`, `replace`, or `clear`; a password marked `keep` is never revealed, typing replaces it, and `Ctrl+X` clears it. Interactive review always requires `Enter`, including with `--yes`; `--no-input`, password stdin, and JSON/YAML output never open the editor.
 
 ## Direct shell

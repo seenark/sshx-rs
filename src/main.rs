@@ -170,9 +170,11 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
             format!("{error}\n{}", nearest_usage_for_args(&args))
         }
     })?;
+    validate_cli_without_catalog(&cli)?;
     if let Command::Hosts { explicit } = cli.command {
         if cli.no_input
             || cli.format.is_machine()
+            || cli.password_stdin
             || !io::stdin().is_terminal()
             || !io::stderr().is_terminal()
         {
@@ -192,7 +194,6 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
                 .to_string(),
         );
     }
-    validate_connect_without_catalog(&cli)?;
     if matches!(cli.command, Command::UpdateHost(_) | Command::RenameHost(_) | Command::DeleteHost(_)) {
         let roots = registered_roots(&cli)?;
         run_host_edit(&cli, &roots)?;
@@ -209,22 +210,6 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
         }
         return Ok(());
     }
-    if cli.tui {
-        let selector = match &cli.command {
-            Command::Connect(Some(selector)) | Command::Show(Some(selector))
-            | Command::TunnelStart(Some(selector))
-            | Command::TunnelDirectStart(Some(selector))
-            | Command::TunnelPairedStart(Some(selector)) => Some(selector.as_str()),
-            _ => None,
-        };
-        if selector.is_some() || cli.id.is_some() {
-            let roots = registered_roots(&cli)?;
-            let catalog = discover_roots(&settings::discovery_roots(&roots))
-                .map_err(|error| error.to_string())?;
-            let filtered = filter_entries(&catalog.entries, &cli);
-            select_connect_entry(&filtered, selector, &cli, "TUI HostEntry")?;
-        }
-    }
     let tunnel_incomplete = match &cli.command {
         Command::TunnelStart(selector) | Command::TunnelDirectStart(selector)
         | Command::TunnelPairedStart(selector) => {
@@ -236,7 +221,10 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
         }
         _ => false,
     };
-    if cli.tui || tunnel_incomplete || matches!(&cli.command, Command::Connect(None) | Command::Show(None)) {
+    let missing_host = matches!(&cli.command, Command::Connect(None) | Command::Show(None)
+        | Command::TunnelStart(None) | Command::TunnelDirectStart(None) | Command::TunnelPairedStart(None))
+        && cli.id.is_none();
+    if cli.tui || tunnel_incomplete || missing_host {
         let continuation = cli.tui
             || !cli.no_input
                 && !cli.format.is_machine()
@@ -253,6 +241,12 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
                 return Err("TUI_REQUIRED: continuation requires usable stdin and stderr terminals without --no-input, piped input, or machine output".to_string());
             }
             return run_tui_operation(&cli);
+        }
+        if missing_host {
+            return Err("HOST_REQUIRED: provide a HostEntry selector outside usable interactive terminals".to_string());
+        }
+        if tunnel_incomplete {
+            return Err("FORWARD_REQUIRED: Tunnel requires at least one forwarding mapping outside usable interactive terminals".to_string());
         }
     }
     if matches!(cli.command, Command::Setup) {
@@ -274,7 +268,7 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
         return Ok(());
     }
     if let Command::TunnelChoose { action, route } = cli.command {
-        if cli.no_input || cli.format.is_machine() || !io::stdin().is_terminal() || !io::stderr().is_terminal() {
+        if cli.no_input || cli.format.is_machine() || cli.password_stdin || !io::stdin().is_terminal() || !io::stderr().is_terminal() {
             return Err("TUNNEL_ID_REQUIRED: provide a Tunnel ID outside usable interactive terminals".to_string());
         }
         return run_tunnels_workspace(&cli, &home, 0, Some((action, route)));
@@ -324,24 +318,22 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
 
     match &cli.command {
         Command::List => render_entries(&filtered, &diagnostics, cli.format),
-        Command::Show(selector) => {
-            let selector = selector.as_deref().ok_or_else(|| {
+        Command::Show(positional) => {
+            let selector = cli.id.as_deref().or(positional.as_deref()).ok_or_else(|| {
                 "HOST_REQUIRED: host show requires a selector outside interactive mode".to_string()
             })?;
-            let entries = select_entries(&filtered, selector)?;
+            let entries = if cli.id.is_some() {
+                vec![select_connect_entry(&filtered, positional.as_deref(), &cli, "host show")?.entry]
+            } else {
+                select_entries(&filtered, selector)?
+            };
             render_entries(&entries, &diagnostics, cli.format)
         }
         Command::Connect(selector) => {
             let selected =
                 select_connect_entry(&filtered, selector.as_deref(), &cli, "connect host")?;
             let entry = selected.entry;
-            let action = match cli.action {
-                Some(action) => action,
-                None if selector.is_none() && cli.id.is_none() && !cli.format.is_machine() => {
-                    choose_host_action(entry, &catalog.entries)?
-                }
-                None => HostAction::Connect,
-            };
+            let action = cli.action.unwrap_or(HostAction::Connect);
             if matches!(
                 action,
                 HostAction::CopySsh | HostAction::CopySshx | HostAction::CopyPassword
@@ -494,6 +486,7 @@ fn run_hosts(
     let mut state = picker::HostsState::default();
     state.editing_enabled = true;
     let mut status = initial_status;
+    let mut prefill_selector = cli.id.is_some() || cli.location.source.is_some() || cli.location.line.is_some();
     loop {
         let configured = settings::discovery_roots(&roots);
         let missing_default = cli.config.is_none()
@@ -519,7 +512,28 @@ fn run_hosts(
             Some(status) => format!("{status}\n{error}"),
             None => error,
         });
-        let filtered = filter_entries(&catalog.entries, cli);
+        let filtered = catalog.entries.iter()
+            .filter(|entry| entry_matches_provenance(entry, cli)).collect::<Vec<_>>();
+        if prefill_selector {
+            let selected = if cli.id.is_some() {
+                select_connect_entry(&filtered, None, cli, "Hosts")?
+            } else {
+                let path = source_selector_path(cli.location.source.as_ref()
+                    .ok_or_else(|| "SELECTOR_INCOMPLETE: --source and --line must be provided together".to_string())?, home);
+                let matches = filtered.iter().copied().filter(|entry| {
+                    entry.source.path == path.to_string_lossy()
+                        && Some(entry.source.line_start) == cli.location.line
+                }).collect::<Vec<_>>();
+                let entry = match matches.as_slice() {
+                    [entry] => *entry,
+                    [] => return Err("HOST_NOT_FOUND: source and Host line matched no entries".to_string()),
+                    many => return Err(format_ambiguous("source and Host line", many)),
+                };
+                picker::Selection { entry, alias: entry.aliases.first().map_or("", String::as_str) }
+            };
+            state.prefill(selected.entry, selected.alias, "");
+            prefill_selector = false;
+        }
         let mut sources = HashMap::new();
         for entry in &filtered {
             sources
@@ -635,9 +649,10 @@ fn run_hosts(
         match sshx::pair::paired_route(&catalog.entries, entry) {
             Ok(Some(_)) => {
                 status = match run_connection_workspace(
-                    cli, &catalog, selection, home, picker::ConnectionMode::Session,
+                    cli, &catalog, selection, home, picker::ConnectionMode::Session, false,
                 ) {
-                    Ok(()) => Some("Session ended.".to_string()),
+                    Ok((true, _)) => Some("Session ended.".to_string()),
+                    Ok((false, _)) => None,
                     Err(error) if error == picker::CANCELLED => None,
                     Err(error) => Some(error),
                 };
@@ -804,36 +819,164 @@ fn run_tui_operation(cli: &Cli) -> Result<(), String> {
         run_pairs_workspace(cli, &roots)?;
         return run_hosts(cli, &home, &roots, None);
     }
-    let catalog = discover_with_permission_repair(&settings::discovery_roots(&roots), false)?;
-    let filtered = filter_entries(&catalog.entries, cli);
+    let mut catalog = discover_roots(&settings::discovery_roots(&roots))
+        .map_err(|error| error.to_string())?;
+    let filtered = catalog.entries.iter()
+        .filter(|entry| entry_matches_provenance(entry, cli)).collect::<Vec<_>>();
     match &cli.command {
-        Command::Connect(selector) => {
-            if let Some(action) = cli.action.filter(|action| *action != HostAction::Connect) {
-                let selected = if cli.tui {
-                    let mut state = picker::HostsState::default();
-                    if selector.is_some() || cli.id.is_some() {
-                        let chosen = select_connect_entry(&filtered, selector.as_deref(), cli, "host action")?;
-                        state.prefill(chosen.entry, chosen.alias, "");
-                    }
-                    picker::browse_hosts(&filtered, &catalog.entries, &mut state, None)?
-                        .ok_or_else(|| picker::CANCELLED.to_string())?
-                } else {
-                    select_connect_entry(&filtered, selector.as_deref(), cli, "host action")?
-                };
-                return run_host_action(action, &selected, &catalog.entries, cli);
+        Command::Connect(selector) | Command::TunnelStart(selector)
+        | Command::TunnelDirectStart(selector) | Command::TunnelPairedStart(selector) => {
+            let mode = if matches!(cli.command, Command::Connect(_)) {
+                picker::ConnectionMode::Session
+            } else {
+                picker::ConnectionMode::Tunnel
+            };
+            let label = match cli.action {
+                Some(HostAction::CopySsh) => "Copy SSH HostEntry",
+                Some(HostAction::CopySshx) => "Copy sshx HostEntry",
+                Some(HostAction::CopyPassword) => "Copy password HostEntry",
+                _ if mode == picker::ConnectionMode::Session => "Connect HostEntry",
+                _ => "Tunnel HostEntry",
+            };
+            let initial = if selector.is_some() || cli.id.is_some() {
+                Some(select_connect_entry(&filtered, selector.as_deref(), cli, label)?)
+            } else {
+                None
+            };
+            let mut use_password_fds = cli.password_fd.is_some() || cli.gateway_password_fd.is_some() || cli.vm_password_fd.is_some();
+            let mut credential_gateway = None;
+            if let Some(selected) = initial {
+                let route = sshx::pair::paired_route(&catalog.entries, selected.entry)?;
+                if use_password_fds && let Some(route) = &route {
+                    let source = &route.gateway.source;
+                    let bytes = if source.path == selected.entry.source.path {
+                        None
+                    } else {
+                        Some(std::fs::read(&source.path).map_err(|error| error.to_string())?)
+                    };
+                    credential_gateway = Some((source.path.clone(), source.byte_start, source.byte_end, bytes));
+                }
+                if matches!(cli.command, Command::TunnelDirectStart(_)) && route.is_some() {
+                    return TunnelRoute::Direct.check("paired");
+                }
+                if matches!(cli.command, Command::TunnelPairedStart(_)) && route.is_none() {
+                    return TunnelRoute::Paired.check("direct");
+                }
+                let target = route.as_ref().map_or(selected.entry, |route| &route.vm);
+                if !cli.bind {
+                    requested_forwards(target, cli)?;
+                }
+                if route.is_some() && (!cli.local_forwards.is_empty() || !cli.remote_forwards.is_empty() || !cli.dynamic_forwards.is_empty()) {
+                    return Err("PAIR_FORWARD_INVALID: Pair routes accept declared VM services only".to_string());
+                }
             }
-            let chosen = select_connect_entry(&filtered, selector.as_deref(), cli, "connect host")?;
-            run_connection_workspace(cli, &catalog, chosen, &home, picker::ConnectionMode::Session)
-        }
-        Command::TunnelStart(selector) | Command::TunnelDirectStart(selector)
-        | Command::TunnelPairedStart(selector) => {
-            let chosen = select_connect_entry(&filtered, selector.as_deref(), cli, "tunnel host")?;
-            run_connection_workspace(cli, &catalog, chosen, &home, picker::ConnectionMode::Tunnel)
+            let mut state = picker::HostsState::default();
+            if let Some(initial) = initial {
+                state.prefill(initial.entry, initial.alias, "");
+            }
+            let mut credential_source = if use_password_fds {
+                initial.map(|selection| std::fs::read(&selection.entry.source.path))
+                    .transpose().map_err(|error| error.to_string())?
+            } else {
+                None
+            };
+            let mut credential_entry = initial.filter(|_| use_password_fds).map(|selection| (
+                selection.entry.source.path.clone(),
+                selection.entry.source.byte_start,
+                selection.entry.source.byte_end,
+            ));
+            let mut completed = false;
+            let mut status = None;
+            loop {
+                let filtered = catalog.entries.iter()
+                    .filter(|entry| entry_matches_provenance(entry, cli)).collect::<Vec<_>>();
+                let mut sources = HashMap::new();
+                for entry in &filtered {
+                    sources.entry(entry.source.path.as_str())
+                        .or_insert_with(|| std::fs::read(&entry.source.path).ok());
+                }
+                let selected = match picker::select(&filtered, label, &mut state, status.as_deref()) {
+                    Ok(selected) => selected,
+                    Err(error) if error == picker::CANCELLED && completed => return Ok(()),
+                    Err(error) => return Err(error),
+                };
+                let source = &selected.entry.source;
+                if use_password_fds {
+                    let original = credential_entry.get_or_insert_with(|| (
+                        source.path.clone(), source.byte_start, source.byte_end,
+                    ));
+                    if credential_source.is_none() {
+                        credential_source = sources.get(source.path.as_str()).and_then(Option::as_ref).cloned();
+                    }
+                    use_password_fds = original.0 == source.path
+                        && original.1 == source.byte_start && original.2 == source.byte_end
+                        && sources.get(source.path.as_str()).and_then(Option::as_ref) == credential_source.as_ref();
+                }
+                if use_password_fds {
+                    let route = sshx::pair::paired_route(&catalog.entries, selected.entry)?;
+                    if let Some(original) = &credential_gateway {
+                        use_password_fds = route.as_ref().is_some_and(|route| {
+                            let gateway = &route.gateway.source;
+                            original.0 == gateway.path && original.1 == gateway.byte_start
+                                && original.2 == gateway.byte_end
+                                && original.3.as_ref().is_none_or(|before| {
+                                    std::fs::read(&gateway.path).is_ok_and(|bytes| bytes == *before)
+                                })
+                        });
+                    } else if let Some(route) = route {
+                        let gateway = &route.gateway.source;
+                        let bytes = if gateway.path == source.path {
+                            None
+                        } else {
+                            Some(std::fs::read(&gateway.path).map_err(|error| error.to_string())?)
+                        };
+                        credential_gateway = Some((gateway.path.clone(), gateway.byte_start, gateway.byte_end, bytes));
+                    }
+                }
+                let unchanged = sources.get(source.path.as_str()).and_then(Option::as_ref)
+                    .is_some_and(|before| std::fs::read(&source.path).is_ok_and(|after| after == *before));
+                if !unchanged {
+                    use_password_fds = false;
+                    status = Some("HOST_SOURCE_CHANGED: select the current HostEntry before continuing.".to_string());
+                } else if let Some(action) = cli.action.filter(|action| *action != HostAction::Connect) {
+                    status = match run_host_action(action, &selected, &catalog.entries, cli) {
+                        Ok(()) => { completed = true; Some("Action complete.".to_string()) }
+                        Err(error) => Some(error),
+                    };
+                } else {
+                    status = match run_connection_workspace(cli, &catalog, selected, &home, mode, use_password_fds) {
+                        Ok((done, quit)) => {
+                            completed |= done;
+                            if quit {
+                                return if completed { Ok(()) } else { Err(picker::CANCELLED.to_string()) };
+                            }
+                            None
+                        }
+                        Err(error) => {
+                            if error.starts_with("HOST_SOURCE_CHANGED:") {
+                                use_password_fds = false;
+                            }
+                            Some(error)
+                        }
+                    };
+                }
+                match discover_roots(&settings::discovery_roots(&roots)) {
+                    Ok(refreshed) => catalog = refreshed,
+                    Err(error) => {
+                        catalog.entries.clear();
+                        use_password_fds = false;
+                        status = Some(match status.take() {
+                            Some(status) => format!("{status}\n{error}"),
+                            None => error.to_string(),
+                        });
+                    }
+                }
+            }
         }
         Command::Show(selector) => {
             let mut state = picker::HostsState::default();
-            if let Some(selector) = selector {
-                let selected = select_connect_entry(&filtered, Some(selector), cli, "host show")?;
+            if selector.is_some() || cli.id.is_some() {
+                let selected = select_connect_entry(&filtered, selector.as_deref(), cli, "host show")?;
                 state.prefill(selected.entry, selected.alias, "");
             }
             let mut result = None;
@@ -856,7 +999,8 @@ fn run_connection_workspace(
     selected: picker::Selection<'_>,
     home: &Path,
     mode: picker::ConnectionMode,
-) -> Result<(), String> {
+    use_password_fds: bool,
+) -> Result<(bool, bool), String> {
     if catalog.diagnostics.iter().any(|diagnostic| diagnostic.code == "unsupported_match") {
         return Err("UNSUPPORTED_MATCH: Match prevents exact runtime configuration".to_string());
     }
@@ -878,14 +1022,26 @@ fn run_connection_workspace(
         .map(|route| std::fs::read(&route.gateway.source.path).map_err(|error| error.to_string()))
         .transpose()?;
     if matches!(cli.command, Command::TunnelDirectStart(_)) && route.is_some() {
-        return TunnelRoute::Direct.check("paired");
+        return TunnelRoute::Direct.check("paired").map(|()| (false, false));
     }
     if matches!(cli.command, Command::TunnelPairedStart(_)) && route.is_none() {
-        return TunnelRoute::Paired.check("direct");
+        return TunnelRoute::Paired.check("direct").map(|()| (false, false));
     }
     let target = route.as_ref().map_or(entry, |route| &route.vm);
     let mut services = sshx::session::declared_services(target)?;
-    let mut preselected = if cli.bind { Vec::new() } else { requested_forwards(target, cli)? };
+    let mut forward_warning = None;
+    let mut preselected = if cli.bind {
+        Vec::new()
+    } else {
+        match requested_forwards(target, cli) {
+            Ok(forwards) => forwards,
+            Err(error) if error.starts_with("FORWARD_NOT_FOUND:") || error.starts_with("FORWARD_AMBIGUOUS:") => {
+                forward_warning = Some(format!("{error}\nRequested: {}. Choose current declared services before review.", cli.forwards.join(", ")));
+                Vec::new()
+            }
+            Err(error) => return Err(error),
+        }
+    };
     if route.is_some() && (!cli.local_forwards.is_empty() || !cli.remote_forwards.is_empty() || !cli.dynamic_forwards.is_empty()) {
         return Err("PAIR_FORWARD_INVALID: Pair routes accept declared VM services only".to_string());
     }
@@ -916,7 +1072,7 @@ fn run_connection_workspace(
         if route.is_some() { "Pair" } else { "Direct" }
     );
     let mut restored = None;
-    let mut status = None;
+    let mut status = forward_warning;
     let mut completed = false;
     loop {
         let choice = match picker::connection_workspace(
@@ -924,7 +1080,8 @@ fn run_connection_workspace(
             restored.as_ref(), mode, status.as_deref(), cli.allow_bind, |_| false,
         ) {
             Ok(choice) => choice,
-            Err(error) if error == picker::CANCELLED && completed => return Ok(()),
+            Err(error) if error == picker::BACK => return Ok((completed, false)),
+            Err(error) if error == picker::CANCELLED => return Ok((completed, true)),
             Err(error) => return Err(error),
         };
         if std::fs::read(&entry.source.path).map_or(true, |after| after != before)
@@ -940,8 +1097,8 @@ fn run_connection_workspace(
                 sshx::connect::open_paired_with_forwards(
                     route, home, false, gateway_alias, alias,
                     sshx::connect::PairedCredentials {
-                        gateway_password_fd: cli.gateway_password_fd,
-                        vm_password_fd: cli.vm_password_fd.or(cli.password_fd),
+                        gateway_password_fd: cli.gateway_password_fd.filter(|_| use_password_fds),
+                        vm_password_fd: cli.vm_password_fd.or(cli.password_fd).filter(|_| use_password_fds),
                     },
                     &choice.forwards,
                 ).map(|()| "Session ended.".to_string())
@@ -951,8 +1108,8 @@ fn run_connection_workspace(
                 sshx::tunnel::start_paired(
                     route, home, gateway_alias, alias, false,
                     sshx::connect::PairedCredentials {
-                        gateway_password_fd: cli.gateway_password_fd,
-                        vm_password_fd: cli.vm_password_fd.or(cli.password_fd),
+                        gateway_password_fd: cli.gateway_password_fd.filter(|_| use_password_fds),
+                        vm_password_fd: cli.vm_password_fd.or(cli.password_fd).filter(|_| use_password_fds),
                     },
                     &choice.forwards,
                 ).map(|response| format!("Tunnel started: {}", response.tunnels[0].id))
@@ -961,7 +1118,7 @@ fn run_connection_workspace(
                 let (declared, local, remote, dynamic) = split_selected_forwards(&choice.forwards);
                 sshx::tunnel::parse_forwards(&local, &remote, &dynamic, cli.allow_bind)
                     .and_then(|direct| sshx::connect::open_with_password_fd_and_all_forwards(
-                        entry, home, false, alias, cli.password_fd, &declared, &direct,
+                        entry, home, false, alias, cli.password_fd.filter(|_| use_password_fds), &declared, &direct,
                     ))
                     .map(|()| "Session ended.".to_string())
             }
@@ -972,11 +1129,13 @@ fn run_connection_workspace(
                     sshx::session::write_local_forward_spec(&mut specification, forward);
                     local.push(specification);
                 }
-                sshx::tunnel::start(entry, home, alias, false, cli.password_fd, &local, &remote, &dynamic, cli.allow_bind)
+                sshx::tunnel::start(entry, home, alias, false, cli.password_fd.filter(|_| use_password_fds), &local, &remote, &dynamic, cli.allow_bind)
                     .map(|response| format!("Tunnel started: {}", response.tunnels[0].id))
             }
         };
-        completed |= outcome.is_ok();
+        completed |= outcome.is_ok() || outcome.as_ref().is_err_and(|error| {
+            error.starts_with("SESSION_EXIT:") || error.starts_with("VM_SESSION_EXIT:")
+        });
         status = Some(outcome.unwrap_or_else(|error| error));
         restored = Some(choice);
     }
@@ -1053,23 +1212,40 @@ fn requested_forwards(
     }
 }
 
-fn validate_connect_without_catalog(cli: &Cli) -> Result<(), String> {
-    let Command::Connect(selector) = &cli.command else {
-        return Ok(());
+fn validate_cli_without_catalog(cli: &Cli) -> Result<(), String> {
+    if cli.bind && !cli.forwards.is_empty() {
+        return Err("FORWARD_MODE_CONFLICT: --bind cannot be combined with --forward".to_string());
+    }
+    if cli.password_fd.is_some() && cli.vm_password_fd.is_some() {
+        return Err("PASSWORD_FD_CONFLICT: use only one VM password descriptor".to_string());
+    }
+    if cli.bind || !cli.forwards.is_empty() || !cli.local_forwards.is_empty()
+        || !cli.remote_forwards.is_empty() || !cli.dynamic_forwards.is_empty()
+    {
+        if !matches!(cli.command, Command::Connect(_) | Command::TunnelStart(_)
+            | Command::TunnelDirectStart(_) | Command::TunnelPairedStart(_))
+        {
+            return Err("FORWARD_COMMAND_REQUIRED: forwarding options require Connect or Tunnel".to_string());
+        }
+    }
+    sshx::session::validate_forward_specifications(&cli.forwards)?;
+    sshx::tunnel::parse_forwards(&cli.local_forwards, &cli.remote_forwards, &cli.dynamic_forwards, cli.allow_bind)?;
+    let selector = match &cli.command {
+        Command::Connect(selector) | Command::Show(selector) | Command::TunnelStart(selector)
+        | Command::TunnelDirectStart(selector) | Command::TunnelPairedStart(selector) => selector.as_deref(),
+        Command::Hosts { .. } => {
+            if cli.location.source.is_some() != cli.location.line.is_some() {
+                return Err("SELECTOR_INCOMPLETE: --source and --line must be provided together".to_string());
+            }
+            return Ok(());
+        }
+        _ => return Ok(()),
     };
-    if selector.is_some() || cli.id.is_some() {
-        return Ok(());
-    }
     if cli.location.source.is_some() != cli.location.line.is_some() {
-        return Err(
-            "SELECTOR_INCOMPLETE: --source and --line must be provided together".to_string(),
-        );
+        return Err("SELECTOR_INCOMPLETE: --source and --line must be provided together".to_string());
     }
-    if cli.location.source.is_some() {
-        return Err("SELECTOR_INCOMPLETE: alias is required with --source and --line".to_string());
-    }
-    if cli.no_input {
-        return Err("HOST_REQUIRED: connect requires a host in --no-input mode".to_string());
+    if selector.is_none() && cli.id.is_none() && cli.location.source.is_some() {
+        return Err("SELECTOR_INCOMPLETE: alias or ID is required with --source and --line".to_string());
     }
     Ok(())
 }
@@ -2368,9 +2544,14 @@ fn entry_matches_provenance(entry: &HostEntry, cli: &Cli) -> bool {
     })
 }
 
+fn source_selector_path(path: &Path, home: &Path) -> PathBuf {
+    let path = settings::normalize_path(path, home);
+    std::fs::canonicalize(&path).unwrap_or(path)
+}
+
 fn filter_entries<'a>(entries: &'a [HostEntry], cli: &Cli) -> Vec<&'a HostEntry> {
     let source = cli.location.source.as_ref().map(|path| {
-        settings::normalize_path(path, &home_dir().unwrap_or_else(|_| PathBuf::from(".")))
+        source_selector_path(path, &home_dir().unwrap_or_else(|_| PathBuf::from(".")))
             .to_string_lossy()
             .into_owned()
     });
@@ -2438,6 +2619,10 @@ fn select_connect_entry<'a>(
         || entries.iter().any(|entry| {
             entry.id == selector && !entry.aliases.iter().any(|alias| alias == selector)
         });
+    let source = cli.location.source.as_ref().map(|source| {
+        source_selector_path(source, &home_dir().unwrap_or_else(|_| PathBuf::from(".")))
+            .to_string_lossy().into_owned()
+    });
     let matches = entries
         .iter()
         .copied()
@@ -2449,13 +2634,10 @@ fn select_connect_entry<'a>(
             }
         })
         .filter(|entry| {
-            positional.is_none_or(|alias| entry.aliases.iter().any(|candidate| candidate == alias))
+            positional.is_none_or(|alias| entry.id == alias || entry.aliases.iter().any(|candidate| candidate == alias))
         })
         .filter(|entry| {
-            cli.location.source.as_ref().is_none_or(|source| {
-                let home = home_dir().unwrap_or_else(|_| PathBuf::from("."));
-                entry.source.path == settings::normalize_path(source, &home).to_string_lossy()
-            })
+            source.as_deref().is_none_or(|source| entry.source.path == source)
         })
         .filter(|entry| {
             cli.location
@@ -2487,36 +2669,9 @@ fn interactive_select<'a>(
     entries: &[&'a HostEntry],
     label: &str,
 ) -> Result<picker::Selection<'a>, String> {
-    picker::select(entries, label)
+    picker::select(entries, label, &mut picker::HostsState::default(), None)
 }
 
-fn choose_host_action(entry: &HostEntry, entries: &[HostEntry]) -> Result<HostAction, String> {
-    let paired = sshx::pair::paired_route(entries, entry)?.is_some();
-    let mut actions = vec![HostAction::Connect];
-    if paired {
-        actions.push(HostAction::CopySshx);
-    } else {
-        actions.push(HostAction::CopySsh);
-        actions.push(HostAction::CopySshx);
-        if sshx::connect::has_stored_password(entry)? {
-            actions.push(HostAction::CopyPassword);
-        }
-    }
-    let labels = actions
-        .iter()
-        .map(|action| picker::MenuOption::new(match action {
-            HostAction::Connect => "Connect",
-            HostAction::CopySsh => "Copy SSH",
-            HostAction::CopySshx => "Copy sshx",
-            HostAction::CopyPassword => "Copy password",
-        }, ""))
-        .collect::<Vec<_>>();
-    let choice = picker::select_menu(&labels, "host action menu")?;
-    actions
-        .get(choice)
-        .copied()
-        .ok_or_else(|| "ACTION_INVALID: selected host action is unavailable".to_string())
-}
 fn run_host_action(
     action: HostAction,
     selected: &picker::Selection<'_>,
