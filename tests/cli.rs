@@ -3406,6 +3406,86 @@ fn doctor_fix_permissions_yes_still_requires_confirmation() {
 
 #[cfg(unix)]
 #[test]
+fn doctor_workspace_shows_repair_plan_before_confirmation() {
+    let (root, home) = canonical_fixture_root();
+    let config = home.join(".ssh/config");
+    write(
+        &config,
+        "Host password\n  HostName password.example\n  ##PASSWORD stored-secret\n",
+    );
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o644)).unwrap();
+    let bin = fake_ssh(&root);
+    let (status, output) = run_with_pty_interactions_with_hook(
+        &home,
+        &["--config", config.to_str().unwrap(), "tui"],
+        &bin,
+        &root,
+        &[
+            (b"Search:", b"\x04"),
+            (b"report only", b"yr"),
+            (b"0644 -> 0600", b"\rn\x03"),
+            (b"Search:", b"\x1b"),
+        ],
+        None,
+        Some((100, 36)),
+        |_| assert_eq!(mode_of(&config), 0o644),
+    );
+    assert!(status.success(), "status={status:?} output={output}");
+    assert_eq!(mode_of(&config), 0o644);
+    assert!(!output.contains("stored-secret"), "output={output}");
+
+    let (status, output) = run_with_pty_interactions_with_hook(
+        &home,
+        &["--config", config.to_str().unwrap(), "tui", "doctor"],
+        &bin,
+        &root,
+        &[
+            (b"report only", b"r"),
+            (b"0644 -> 0600", b"y"),
+            (b"fixed:", b"\x1b"),
+        ],
+        None,
+        Some((100, 36)),
+        |stage| assert_eq!(mode_of(&config), if stage < 2 { 0o644 } else { 0o600 }),
+    );
+    assert!(status.success(), "status={status:?} output={output}");
+    assert_eq!(mode_of(&config), 0o600);
+    assert!(!output.contains("stored-secret"), "output={output}");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_workspace_refuses_confirmation_when_plan_cannot_be_seen() {
+    let (root, home) = canonical_fixture_root();
+    let config = home.join(".ssh/config");
+    write(
+        &config,
+        "Host password\n  HostName password.example\n  ##PASSWORD stored-secret\n",
+    );
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o644)).unwrap();
+    let bin = fake_ssh(&root);
+    let (status, output) = run_with_pty_interactions_with_hook(
+        &home,
+        &["--config", config.to_str().unwrap(), "tui", "doctor"],
+        &bin,
+        &root,
+        &[
+            (b"report only", b"r"),
+            (b"Resize", b"yn\x03"),
+        ],
+        None,
+        Some((40, 6)),
+        |_| assert_eq!(mode_of(&config), 0o644),
+    );
+    assert!(status.success(), "status={status:?} output={output}");
+    assert_eq!(mode_of(&config), 0o644);
+    assert!(!output.contains("stored-secret"), "output={output}");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
 fn direct_connect_repairs_password_config_before_retry() {
     let (root, home) = fixture_root();
     let config = home.join(".ssh/config");
