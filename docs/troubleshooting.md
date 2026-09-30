@@ -72,7 +72,7 @@ Do not replace a Pair route with `ProxyJump`. The approved route uses separate O
 - Use `IdentityFile`, `ssh-agent`, or an inherited password file descriptor. Passwords must not appear in argv, environment, runtime config, logs, JSON/YAML, or previews.
 - A wrong configured password is not retried silently. Supply a corrected secret and run the command again.
 
-In the Doctor TUI, press `R` to display eligible paths with their current and target modes. Press `Y` once to apply that plan, or `N`/`Esc` to cancel without changes. Results remain in Doctor; use `Tab` and `PgUp`/`PgDn` to scroll every result, then `Esc` to return to Hosts. `sshx tui doctor` opens the same workspace directly. CLI permission repair still requires an interactive confirmation; `--yes`, piped input, and `--no-input` do not authorize unattended chmod.
+In the Doctor TUI, press `R` to display eligible paths with their current and target modes. Press `Y` once to apply that plan, or `N`/`Esc` to cancel without changes. If the terminal cannot display plan content, confirmation stays disabled until you resize it. Results remain in Doctor; use `Tab` and `PgUp`/`PgDn` to scroll every result, then `Esc` to return to Hosts. `sshx tui doctor` opens the same workspace directly. CLI permission repair still requires an interactive confirmation; `--yes`, piped input, and `--no-input` do not authorize unattended chmod.
 
 ## Host keys
 
