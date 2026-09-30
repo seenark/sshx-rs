@@ -102,17 +102,6 @@ impl HostsState {
     }
 }
 
-pub struct MenuOption<'a> {
-    pub label: &'a str,
-    pub description: &'a str,
-}
-
-impl<'a> MenuOption<'a> {
-    pub const fn new(label: &'a str, description: &'a str) -> Self {
-        Self { label, description }
-    }
-}
-
 struct Row<'a> {
     entry: &'a HostEntry,
     alias: &'a str,
@@ -1769,53 +1758,6 @@ pub fn doctor_workspace(
         },
     )
 }
-
-pub fn select_menu(options: &[MenuOption<'_>], label: &str) -> Result<usize, String> {
-    if options.is_empty() {
-        return Err("ACTION_UNAVAILABLE: no menu options are available".to_string());
-    }
-
-    with_terminal(
-        label,
-        format!("ACTION_REQUIRED: {label} requires a usable interactive terminal"),
-        |terminal, input| {
-            let mut selected = 0usize;
-            loop {
-                draw_menu(terminal, options, selected, label)?;
-                match read_key(input, "ACTION_REQUIRED")? {
-                    KeyEvent { code: KeyCode::Enter, .. }
-                        if terminal.backend().size().is_ok_and(|area| {
-                            area.width == 0
-                                || area.height == 0
-                                || (area.width >= 3 && area.height >= 2)
-                        }) =>
-                    {
-                        return Ok(selected);
-                    }
-                    KeyEvent {
-                        code: KeyCode::Esc, ..
-                    } => return Err(CANCELLED.to_string()),
-                    KeyEvent {
-                        code: KeyCode::Char('c'),
-                        modifiers,
-                        ..
-                    } if modifiers.contains(KeyModifiers::CONTROL) => {
-                        return Err(CANCELLED.to_string());
-                    }
-                    KeyEvent {
-                        code: KeyCode::Up, ..
-                    } => selected = selected.saturating_sub(1),
-                    KeyEvent {
-                        code: KeyCode::Down,
-                        ..
-                    } if selected + 1 < options.len() => selected += 1,
-                    _ => {}
-                }
-            }
-        },
-    )
-}
-
 
 #[allow(clippy::too_many_arguments)]
 pub fn connection_workspace(
@@ -4108,86 +4050,6 @@ fn draw_host_picker(
         .map_err(|error| format!("HOST_REQUIRED: cannot render picker: {error}"))
 }
 
-fn draw_menu(
-    terminal: &mut AppTerminal,
-    options: &[MenuOption<'_>],
-    selected: usize,
-    label: &str,
-) -> Result<(), String> {
-    if terminal
-        .backend()
-        .size()
-        .is_ok_and(|area| area.width == 0 || area.height == 0)
-    {
-        for (index, option) in options.iter().enumerate() {
-            eprint!(
-                "\n{} {} — {}",
-                if index == selected { ">" } else { " " },
-                option.label,
-                option.description
-            );
-        }
-        eprint!("\n↑↓ move  Enter select  Esc cancel");
-    }
-    terminal
-        .draw(|frame| render_menu(frame, options, selected, label))
-        .map(|_| ())
-        .map_err(|error| format!("ACTION_REQUIRED: cannot render menu: {error}"))
-}
-
-fn render_menu(
-    frame: &mut ratatui::Frame<'_>,
-    options: &[MenuOption<'_>],
-    selected: usize,
-    label: &str,
-) {
-    let label_width = options
-        .iter()
-        .map(|option| option.label.chars().count())
-        .max()
-        .unwrap_or(0);
-    let items = options
-        .iter()
-        .map(|option| {
-            ListItem::new(Line::from(vec![
-                Span::styled(
-                    format!("{:<width$}", option.label, width = label_width),
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("  "),
-                Span::styled(option.description, Style::default().fg(Color::Gray)),
-            ]))
-        })
-        .collect::<Vec<_>>();
-    let menu_block = if frame.area().height <= 3 {
-        Block::default()
-    } else {
-        block(format!(" sshx · {label} "), Color::Cyan)
-    };
-    let list = List::new(items)
-        .block(menu_block)
-        .highlight_style(
-            Style::default()
-                .bg(Color::DarkGray)
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol("> ");
-    let mut state = ListState::default();
-    state.select(Some(selected));
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(2), Constraint::Length(1)])
-        .split(frame.area());
-    frame.render_stateful_widget(list, chunks[0], &mut state);
-    frame.render_widget(
-        Paragraph::new("↑↓ move  Enter select  Esc cancel").style(Style::default().fg(Color::Gray)),
-        chunks[1],
-    );
-}
-
 fn block(title: impl Into<Line<'static>>, color: Color) -> Block<'static> {
     Block::default()
         .title(title)
@@ -4198,11 +4060,10 @@ fn block(title: impl Into<Line<'static>>, color: Color) -> Block<'static> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MenuOption, clear_preflight_errors, fuzzy_score, hosts_footer, matching_rows,
-        password_backspace, password_insert, read_key, render_menu, restore_edit_row_errors,
+        clear_preflight_errors, fuzzy_score, hosts_footer, matching_rows,
+        password_backspace, password_insert, read_key, restore_edit_row_errors,
         row_label, source_details, toggle_password_clear, workspace_preflight_issues, wrap_status,
     };
-    use ratatui::{Terminal, backend::TestBackend};
     use sshx::discovery::{HostEntry, SourceIdentity};
 
 
@@ -4262,41 +4123,6 @@ mod tests {
         );
         assert_eq!(value, original);
         assert!(edited);
-    }
-
-    #[test]
-    fn menu_marks_selected_option() {
-        let mut terminal = Terminal::new(TestBackend::new(60, 8)).unwrap();
-        terminal
-            .draw(|frame| {
-                render_menu(
-                    frame,
-                    &[
-                        MenuOption::new("First", "Open the first thing"),
-                        MenuOption::new("Second", "Open the second thing"),
-                    ],
-                    1,
-                    "main menu",
-                )
-            })
-            .unwrap();
-        let buffer = terminal.backend().buffer();
-        assert_eq!(buffer.cell((1, 2)).unwrap().symbol(), ">");
-        assert_eq!(
-            buffer.cell((3, 2)).unwrap().fg,
-            ratatui::style::Color::White
-        );
-        assert_eq!(
-            buffer.cell((3, 2)).unwrap().bg,
-            ratatui::style::Color::DarkGray
-        );
-        assert!(
-            buffer
-                .cell((3, 2))
-                .unwrap()
-                .modifier
-                .contains(ratatui::style::Modifier::BOLD)
-        );
     }
 
     #[test]

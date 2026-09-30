@@ -1,7 +1,9 @@
 mod help;
 mod picker;
 use serde::Serialize;
-use sshx::discovery::{Catalog, DiscoveryRoot, HostEntry, discover_roots, scope_for_path};
+use sshx::discovery::{
+    Catalog, DiscoveryRoot, HostEntry, SourceIdentity, discover_roots, scope_for_path,
+};
 use sshx::mutation::{self, CreateRequest, MutationKind, UpdateRequest};
 use sshx::output::{
     OutputFormat, render_create, render_diagnostic, render_doctor, render_edit, render_human,
@@ -651,8 +653,8 @@ fn run_hosts(
                 status = match run_connection_workspace(
                     cli, &catalog, selection, home, picker::ConnectionMode::Session, false,
                 ) {
-                    Ok((true, _)) => Some("Session ended.".to_string()),
-                    Ok((false, _)) => None,
+                    Ok(outcome) if outcome.completed => Some("Session ended.".to_string()),
+                    Ok(_) => None,
                     Err(error) if error == picker::CANCELLED => None,
                     Err(error) => Some(error),
                 };
@@ -844,7 +846,8 @@ fn run_tui_operation(cli: &Cli) -> Result<(), String> {
                 None
             };
             let mut use_password_fds = cli.password_fd.is_some() || cli.gateway_password_fd.is_some() || cli.vm_password_fd.is_some();
-            let mut credential_gateway = None;
+            let mut credential_gateway: Option<SourceIdentity> = None;
+            let mut credential_gateway_bytes = None;
             if let Some(selected) = initial {
                 let route = sshx::pair::paired_route(&catalog.entries, selected.entry)?;
                 if use_password_fds && let Some(route) = &route {
@@ -854,7 +857,8 @@ fn run_tui_operation(cli: &Cli) -> Result<(), String> {
                     } else {
                         Some(std::fs::read(&source.path).map_err(|error| error.to_string())?)
                     };
-                    credential_gateway = Some((source.path.clone(), source.byte_start, source.byte_end, bytes));
+                    credential_gateway = Some(source.clone());
+                    credential_gateway_bytes = bytes;
                 }
                 if matches!(cli.command, Command::TunnelDirectStart(_)) && route.is_some() {
                     return TunnelRoute::Direct.check("paired");
@@ -874,17 +878,14 @@ fn run_tui_operation(cli: &Cli) -> Result<(), String> {
             if let Some(initial) = initial {
                 state.prefill(initial.entry, initial.alias, "");
             }
-            let mut credential_source = if use_password_fds {
+            let mut credential_source_bytes = if use_password_fds {
                 initial.map(|selection| std::fs::read(&selection.entry.source.path))
                     .transpose().map_err(|error| error.to_string())?
             } else {
                 None
             };
-            let mut credential_entry = initial.filter(|_| use_password_fds).map(|selection| (
-                selection.entry.source.path.clone(),
-                selection.entry.source.byte_start,
-                selection.entry.source.byte_end,
-            ));
+            let mut credential_entry = initial.filter(|_| use_password_fds)
+                .map(|selection| selection.entry.source.clone());
             let mut completed = false;
             let mut status = None;
             loop {
@@ -902,24 +903,22 @@ fn run_tui_operation(cli: &Cli) -> Result<(), String> {
                 };
                 let source = &selected.entry.source;
                 if use_password_fds {
-                    let original = credential_entry.get_or_insert_with(|| (
-                        source.path.clone(), source.byte_start, source.byte_end,
-                    ));
-                    if credential_source.is_none() {
-                        credential_source = sources.get(source.path.as_str()).and_then(Option::as_ref).cloned();
+                    let original = credential_entry.get_or_insert_with(|| source.clone());
+                    if credential_source_bytes.is_none() {
+                        credential_source_bytes = sources.get(source.path.as_str()).and_then(Option::as_ref).cloned();
                     }
-                    use_password_fds = original.0 == source.path
-                        && original.1 == source.byte_start && original.2 == source.byte_end
-                        && sources.get(source.path.as_str()).and_then(Option::as_ref) == credential_source.as_ref();
+                    use_password_fds = original.path == source.path
+                        && original.byte_start == source.byte_start && original.byte_end == source.byte_end
+                        && sources.get(source.path.as_str()).and_then(Option::as_ref) == credential_source_bytes.as_ref();
                 }
                 if use_password_fds {
                     let route = sshx::pair::paired_route(&catalog.entries, selected.entry)?;
                     if let Some(original) = &credential_gateway {
                         use_password_fds = route.as_ref().is_some_and(|route| {
                             let gateway = &route.gateway.source;
-                            original.0 == gateway.path && original.1 == gateway.byte_start
-                                && original.2 == gateway.byte_end
-                                && original.3.as_ref().is_none_or(|before| {
+                            original.path == gateway.path && original.byte_start == gateway.byte_start
+                                && original.byte_end == gateway.byte_end
+                                && credential_gateway_bytes.as_ref().is_none_or(|before| {
                                     std::fs::read(&gateway.path).is_ok_and(|bytes| bytes == *before)
                                 })
                         });
@@ -930,7 +929,8 @@ fn run_tui_operation(cli: &Cli) -> Result<(), String> {
                         } else {
                             Some(std::fs::read(&gateway.path).map_err(|error| error.to_string())?)
                         };
-                        credential_gateway = Some((gateway.path.clone(), gateway.byte_start, gateway.byte_end, bytes));
+                        credential_gateway = Some(gateway.clone());
+                        credential_gateway_bytes = bytes;
                     }
                 }
                 let unchanged = sources.get(source.path.as_str()).and_then(Option::as_ref)
@@ -945,9 +945,9 @@ fn run_tui_operation(cli: &Cli) -> Result<(), String> {
                     };
                 } else {
                     status = match run_connection_workspace(cli, &catalog, selected, &home, mode, use_password_fds) {
-                        Ok((done, quit)) => {
-                            completed |= done;
-                            if quit {
+                        Ok(outcome) => {
+                            completed |= outcome.completed;
+                            if outcome.quit {
                                 return if completed { Ok(()) } else { Err(picker::CANCELLED.to_string()) };
                             }
                             None
@@ -993,6 +993,11 @@ fn run_tui_operation(cli: &Cli) -> Result<(), String> {
     }
 }
 
+struct ConnectionOutcome {
+    completed: bool,
+    quit: bool,
+}
+
 fn run_connection_workspace(
     cli: &Cli,
     catalog: &Catalog,
@@ -1000,7 +1005,7 @@ fn run_connection_workspace(
     home: &Path,
     mode: picker::ConnectionMode,
     use_password_fds: bool,
-) -> Result<(bool, bool), String> {
+) -> Result<ConnectionOutcome, String> {
     if catalog.diagnostics.iter().any(|diagnostic| diagnostic.code == "unsupported_match") {
         return Err("UNSUPPORTED_MATCH: Match prevents exact runtime configuration".to_string());
     }
@@ -1022,10 +1027,12 @@ fn run_connection_workspace(
         .map(|route| std::fs::read(&route.gateway.source.path).map_err(|error| error.to_string()))
         .transpose()?;
     if matches!(cli.command, Command::TunnelDirectStart(_)) && route.is_some() {
-        return TunnelRoute::Direct.check("paired").map(|()| (false, false));
+        return TunnelRoute::Direct.check("paired")
+            .map(|()| ConnectionOutcome { completed: false, quit: false });
     }
     if matches!(cli.command, Command::TunnelPairedStart(_)) && route.is_none() {
-        return TunnelRoute::Paired.check("direct").map(|()| (false, false));
+        return TunnelRoute::Paired.check("direct")
+            .map(|()| ConnectionOutcome { completed: false, quit: false });
     }
     let target = route.as_ref().map_or(entry, |route| &route.vm);
     let mut services = sshx::session::declared_services(target)?;
@@ -1080,8 +1087,8 @@ fn run_connection_workspace(
             restored.as_ref(), mode, status.as_deref(), cli.allow_bind, |_| false,
         ) {
             Ok(choice) => choice,
-            Err(error) if error == picker::BACK => return Ok((completed, false)),
-            Err(error) if error == picker::CANCELLED => return Ok((completed, true)),
+            Err(error) if error == picker::BACK => return Ok(ConnectionOutcome { completed, quit: false }),
+            Err(error) if error == picker::CANCELLED => return Ok(ConnectionOutcome { completed, quit: true }),
             Err(error) => return Err(error),
         };
         if std::fs::read(&entry.source.path).map_or(true, |after| after != before)
