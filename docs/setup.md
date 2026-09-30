@@ -127,7 +127,7 @@ Create a Pair when one route is unambiguous:
 sshx pair setup gateway-alias vm-alias
 ```
 
-Provide the transit destination when inference is not unique:
+Provide the transit destination when inference finds multiple candidates. Explicit destination must match exactly one gateway `LocalForward`, and its port must match the VM `Port`:
 
 ```sh
 sshx pair setup gateway-alias vm-alias \
@@ -135,7 +135,17 @@ sshx pair setup gateway-alias vm-alias \
   --transit-port 22
 ```
 
-Inspect Pair records and validation diagnostics:
+An incomplete command such as `sshx pair setup gateway-alias`, or a route with unresolved transit, opens one Pair workspace when stdin and stderr are usable terminals. Run `sshx tui pair setup gateway-alias vm-alias` to edit even a complete operation. Supplied exact selections remain visible and editable; explicit unknown or ambiguous selectors fail before the workspace opens. Machine output, piped input, and `--no-input` never open it.
+
+Use `Tab` or `Shift+Tab` to move between gateway, VM, transit host, and transit port. Type to search alias rows and press `Enter` to choose an exact entry. Rows and details identify source files and Host lines, including duplicate and secondary aliases. Gateway selection excludes the same HostEntry, already-paired entries, unsafe proxy routes, and VMs without compatible transit. Press `Ctrl+N` to choose and cycle transit candidates explicitly, or edit host and port inline. Ambiguous transit is never silently selected.
+
+Press `Ctrl+S` to review both exact sources, transit, and metadata changes in the same workspace; use Page Up/Page Down to scroll. Only `Enter` during review applies the existing atomic Pair mutation. `Esc` returns to editing, then cancels; `Ctrl+C` cancels immediately. Validation errors retain values. Changed sources require reopening setup, and cancellation or failed validation writes no relationship. A successful result leaves the workspace open. `--yes` skips only the complete CLI consent prompt, not TUI review.
+
+Use `--preview` or `--dry-run` to render Pair changes without writing config. In the workspace, a successful review completes preview without allowing Apply. Complete CLI commands retain direct preview and consent behavior.
+
+Pair setup stops when a recovery journal is pending. Resolve the pending transaction before reopening setup; setup does not roll back files or recover a journal implicitly.
+
+Inspect Pair records and validation diagnostics from the CLI:
 
 ```sh
 sshx pair list

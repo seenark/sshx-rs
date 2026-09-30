@@ -897,116 +897,425 @@ pub fn pairs_workspace(
     )
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct PairSetupDraft {
+    pub gateway: Option<(usize, usize)>,
+    pub vm: Option<(usize, usize)>,
+    pub transit_host: String,
+    pub transit_port: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PairSetupAction {
-    Submit,
-    Cancel,
+    Review,
+    Apply,
+}
+
+fn pair_setup_entry<'a>(entries: &[&'a HostEntry], pick: Option<(usize, usize)>) -> Option<Row<'a>> {
+    let (entry, alias) = pick?;
+    let entry = *entries.get(entry)?;
+    Some(Row { entry, alias: entry.aliases.get(alias)?.as_str() })
+}
+
+fn pair_setup_options(
+    entries: &[&HostEntry],
+    eligible: &[usize],
+    query: &str,
+) -> Vec<(usize, usize)> {
+    let mut options = eligible.iter().copied()
+        .flat_map(|index| (0..entries[index].aliases.len()).map(move |alias| (index, alias)))
+        .filter(|pick| row_rank(&pair_setup_entry(entries, Some(*pick)).unwrap(), query).is_some())
+        .collect::<Vec<_>>();
+    options.sort_by(|left, right| compare_rows(
+        &pair_setup_entry(entries, Some(*left)).unwrap(),
+        &pair_setup_entry(entries, Some(*right)).unwrap(),
+        query,
+    ));
+    options
+}
+
+fn pair_setup_routes(
+    entries: &[&HostEntry],
+    eligible: &[usize],
+    gateway: Option<(usize, usize)>,
+) -> Vec<(usize, Result<Vec<(String, u16)>, String>)> {
+    let Some(gateway) = pair_setup_entry(entries, gateway) else { return Vec::new(); };
+    eligible.iter().copied().filter(|index| {
+        let source = &entries[*index].source;
+        source.path != gateway.entry.source.path
+            || source.byte_start != gateway.entry.source.byte_start
+            || source.byte_end != gateway.entry.source.byte_end
+    }).map(|index| (index, sshx::pair::transit_candidates(gateway.entry, entries[index]))).collect()
+}
+
+fn pair_setup_vm_eligible(
+    eligible: &[usize],
+    gateway: Option<(usize, usize)>,
+    routes: &[(usize, Result<Vec<(String, u16)>, String>)],
+) -> Vec<usize> {
+    if gateway.is_none() { return eligible.to_vec(); }
+    routes.iter().filter_map(|(index, result)| {
+        result.as_ref().is_ok_and(|values| values.iter().any(|candidate| {
+            values.iter().filter(|other| *other == candidate).count() == 1
+        })).then_some(*index)
+    }).collect()
 }
 
 pub fn pair_setup_workspace(
-    mut fields: [String; 4],
-    status: Option<&str>,
-) -> Result<([String; 4], PairSetupAction), String> {
-    const LABELS: [&str; 4] = ["Gateway alias or ID", "VM alias or ID", "Transit host", "Transit port"];
+    entries: &[&HostEntry],
+    mut draft: PairSetupDraft,
+    preview: bool,
+    mut execute: impl FnMut(&PairSetupDraft, PairSetupAction) -> Result<String, String>,
+) -> Result<bool, String> {
     with_terminal(
         "Pair setup",
         "PAIR_REQUIRED: Pair setup requires usable stdin and stderr terminals".to_string(),
         |terminal, input| {
-            let mut selected = 0usize;
+            let eligible = entries.iter().enumerate()
+                .filter_map(|(index, entry)| sshx::pair::setup_eligible(entry).then_some(index))
+                .collect::<Vec<_>>();
+            let mut routes = pair_setup_routes(entries, &eligible, draft.gateway);
+            let mut vm_eligible = pair_setup_vm_eligible(&eligible, draft.gateway, &routes);
+            let empty_candidates = Ok(Vec::<(String, u16)>::new());
+            let initial_candidates = draft.vm.and_then(|(index, _)| {
+                routes.iter().find(|(entry, _)| *entry == index).map(|(_, result)| result)
+            }).unwrap_or(&empty_candidates);
+            let mut focus = if draft.gateway.is_none() {
+                0
+            } else if draft.vm.is_none() {
+                1
+            } else if draft.transit_host.is_empty() != draft.transit_port.is_empty()
+                || (draft.transit_host.is_empty()
+                    && !initial_candidates.as_ref().is_ok_and(|values| values.len() == 1))
+            {
+                2
+            } else {
+                0
+            };
+            let mut queries = [String::new(), String::new()];
+            let mut selected = [0usize; 2];
+            for index in 0..2 {
+                let options = pair_setup_options(entries, if index == 0 { &eligible } else { &vm_eligible }, "");
+                let pick = if index == 0 { draft.gateway } else { draft.vm };
+                selected[index] = options.iter().position(|option| Some(*option) == pick).unwrap_or(0);
+            }
+            let mut list_state = ListState::default();
+            let mut candidate_index = None::<usize>;
+            let mut review = None::<String>;
+            let mut status = None::<(String, bool)>;
+            let mut completed = false;
+            let mut scroll = 0u16;
+            let mut scroll_step = 1u16;
             loop {
-                terminal
-                    .draw(|frame| {
-                        let area = frame.area();
-                        let compact = area.width < 48;
-                        let footer_height = if compact { 2 } else { 1 };
-                        let status_height = if area.height >= 7 {
-                            status.map_or(0, |value| value.lines().count())
-                                .min(area.height.saturating_sub(6) as usize)
+                let candidates = draft.vm.and_then(|(index, _)| {
+                    routes.iter().find(|(entry, _)| *entry == index).map(|(_, result)| result)
+                }).unwrap_or(&empty_candidates);
+                let options = if focus < 2 && review.is_none() {
+                    pair_setup_options(entries, if focus == 0 { &eligible } else { &vm_eligible }, &queries[focus])
+                } else {
+                    Vec::new()
+                };
+                if focus < 2 && review.is_none() {
+                    selected[focus] = selected[focus].min(options.len().saturating_sub(1));
+                }
+                let gateway = pair_setup_entry(entries, draft.gateway);
+                let vm = pair_setup_entry(entries, draft.vm);
+                let mut details = String::new();
+                for (label, row, pick) in [
+                    ("Gateway", gateway.as_ref(), draft.gateway),
+                    ("VM", vm.as_ref(), draft.vm),
+                ] {
+                    if let Some(row) = row {
+                        details.push_str(&format!(
+                            "{label}: {}\nSource: {}:{}\nID: {}\n",
+                            row.alias, row.entry.source.path, row.entry.source.line_start, row.entry.id,
+                        ));
+                        if !eligible.iter().any(|index| std::ptr::eq(entries[*index], row.entry)) {
+                            details.push_str("Ineligible for Pair setup; select another HostEntry.\n");
+                        }
+                        if label == "VM" && draft.gateway.is_some()
+                            && !vm_eligible.iter().any(|index| std::ptr::eq(entries[*index], row.entry))
+                        {
+                            details.push_str("VM has no compatible unambiguous gateway transit; select another HostEntry.\n");
+                        }
+                    } else {
+                        details.push_str(&format!("{label}: {}\n", if pick.is_some() {
+                            "invalid selection; choose a current HostEntry"
                         } else {
-                            0
+                            "not selected"
+                        }));
+                    }
+                }
+                details.push('\n');
+                match &candidates {
+                    Ok(values) if values.len() == 1 && draft.transit_host.is_empty() && draft.transit_port.is_empty() => {
+                        details.push_str(&format!("Automatic transit: {}:{} (unique inference)\n", values[0].0, values[0].1));
+                    }
+                    Ok(values) if !values.is_empty() => {
+                        details.push_str("Transit candidates (Ctrl-N explicitly chooses next):\n");
+                        for (index, (host, port)) in values.iter().enumerate() {
+                            details.push_str(&format!("{} {host}:{port}\n", if Some(index) == candidate_index { ">" } else { " " }));
+                        }
+                        if values.len() > 1 && draft.transit_host.is_empty() && draft.transit_port.is_empty() {
+                            details.push_str("Ambiguous transit: select a candidate or enter host and port.\n");
+                        }
+                    }
+                    Ok(_) => details.push_str("No transit candidates: enter transit host and port.\n"),
+                    Err(error) => details.push_str(&format!("Transit: {error}\n")),
+                }
+                if let Some(review) = &review {
+                    details = format!("Review Pair changes\n{review}\n\n{details}");
+                } else if let Some((text, _)) = &status {
+                    details = format!("{text}\n\n{details}");
+                }
+                let success = status.as_ref().is_some_and(|(_, success)| *success);
+                let applied = success && !preview;
+                let size = terminal.backend().size().ok();
+                let compact = size.is_some_and(|size| size.width < 48 || size.height < 14);
+                let footer = if review.is_some() && !preview {
+                    if compact { "Enter apply · Esc edit\nTab/S-Tab fields · type edits\nPgUp/Dn scroll · ^C cancel" }
+                    else { "Enter apply · Esc edit\nTab/Shift-Tab fields · type edits\nPgUp/PgDn details · Ctrl-C cancel" }
+                } else if review.is_some() {
+                    if compact { "Preview done · Esc edit\nTab/S-Tab fields · type edits\nPgUp/Dn scroll · ^C exit" }
+                    else { "Preview complete · Esc edit\nTab/Shift-Tab fields · type edits\nPgUp/PgDn details · Ctrl-C exit" }
+                } else if success {
+                    if preview {
+                        if compact { "Preview done · Esc exit · type edits\nTab/S-Tab fields · ↑↓ options\nPgUp/Dn scroll · ^N transit" }
+                        else { "Preview complete · Esc exit · type to edit\nTab/Shift-Tab fields · ↑↓ options\nPgUp/PgDn details · Ctrl-N transit" }
+                    } else if compact {
+                        "Applied · Esc exit · type edits\nTab/S-Tab fields · ↑↓ options\nPgUp/Dn scroll · ^N transit"
+                    } else {
+                        "Applied · Esc exit · type to edit\nTab/Shift-Tab fields · ↑↓ options\nPgUp/PgDn details · Ctrl-N transit"
+                    }
+                } else {
+                    if compact { "^S review · Esc cancel\nTab/S-Tab fields · type search/edit\n↑↓/Enter choose · ^N transit\nPgUp/Dn scroll · ^C cancel" }
+                    else { "Ctrl-S review · Esc cancel · Ctrl-C cancel\nTab/Shift-Tab fields · type search/edit\n↑↓ options · Enter choose · Ctrl-N transit · PgUp/PgDn details" }
+                };
+                terminal.draw(|frame| {
+                    let area = frame.area();
+                    let footer_lines = wrap_status(footer, area.width as usize);
+                    let footer_height = (footer_lines.len() as u16).min(area.height.saturating_sub(4));
+                    let status_lines = status.as_ref().map(|(text, _)| wrap_status(text, area.width as usize));
+                    let status_height = status_lines.as_ref().map_or(0, |lines| {
+                        (lines.len() as u16).min(3).min(area.height.saturating_sub(footer_height + 5))
+                    });
+                    let available = area.height.saturating_sub(footer_height + status_height + 1);
+                    let visible_fields = if available >= 6 { 4 } else { available.saturating_sub(1).min(4) };
+                    let rows = Layout::default().direction(Direction::Vertical).constraints([
+                        Constraint::Length(u16::from(area.height > 2)),
+                        Constraint::Length(visible_fields),
+                        Constraint::Min(1),
+                        Constraint::Length(status_height),
+                        Constraint::Length(footer_height),
+                    ]).split(area);
+                    frame.render_widget(
+                        Paragraph::new(if preview { "Pair setup · preview" } else { "Pair setup" })
+                            .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                        rows[0],
+                    );
+                    let first_field = focus.saturating_sub(visible_fields.saturating_sub(1) as usize);
+                    for offset in 0..visible_fields {
+                        let index = first_field + offset as usize;
+                        let value = match index {
+                            0 => gateway.as_ref().map_or("not selected", |row| row.alias),
+                            1 => vm.as_ref().map_or("not selected", |row| row.alias),
+                            2 => if draft.transit_host.is_empty() { "(infer)" } else { &draft.transit_host },
+                            _ => if draft.transit_port.is_empty() { "(infer)" } else { &draft.transit_port },
                         };
-                        let has_status = status_height > 0;
-                        let offset = if has_status { 2 } else { 1 };
-                        let mut constraints = vec![Constraint::Length(1)];
-                        if has_status {
-                            constraints.push(Constraint::Length(status_height as u16));
-                        }
-                        constraints.extend((0..4).map(|_| Constraint::Length(1)));
-                        constraints.extend([Constraint::Min(0), Constraint::Length(footer_height)]);
-                        let rows = Layout::default()
-                            .direction(Direction::Vertical)
-                            .constraints(constraints)
-                            .split(area);
+                        let label = format!("{}{}: ", if index == focus { "> " } else { "  " },
+                            ["Gateway", "VM", "Transit host", "Transit port"][index]);
+                        let label_width = (Span::raw(&label).width() as u16).min(rows[1].width.saturating_sub(1));
+                        let value_width = rows[1].width.saturating_sub(label_width);
+                        let text = if index == focus && index < 2 && !queries[index].is_empty() {
+                            format!("{value} · search: {}", queries[index])
+                        } else {
+                            value.to_string()
+                        };
+                        let horizontal_scroll = if index == focus {
+                            Span::raw(&text).width().saturating_sub(value_width as usize).min(u16::MAX as usize) as u16
+                        } else { 0 };
+                        let style = if index == focus {
+                            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                        } else { Style::default() };
                         frame.render_widget(
-                            Paragraph::new("Pair setup").style(
-                                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                            ),
-                            rows[0],
+                            Paragraph::new(label).style(style),
+                            Rect::new(rows[1].x, rows[1].y + offset, label_width, 1),
                         );
-                        if has_status {
-                            frame.render_widget(
-                                Paragraph::new(status.unwrap_or_default())
-                                    .style(Style::default().fg(Color::Red))
-                                    .wrap(Wrap { trim: false }),
-                                rows[1],
-                            );
-                        }
-                        for index in 0..4 {
-                            let style = if selected == index {
-                                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-                            } else {
-                                Style::default().fg(Color::White)
-                            };
-                            let label = if compact {
-                                ["Gateway", "VM", "Transit host", "Transit port"][index]
-                            } else {
-                                LABELS[index]
-                            };
-                            let text = format!("{label}: {}", fields[index]);
-                            let scroll = if selected == index {
-                                text.chars().count().saturating_sub(area.width as usize) as u16
-                            } else {
-                                0
-                            };
-                            frame.render_widget(
-                                Paragraph::new(text)
-                                    .style(style)
-                                    .scroll((0, scroll)),
-                                rows[offset + index],
-                            );
-                        }
                         frame.render_widget(
-                            Paragraph::new(if compact {
-                                "↑↓ fields\n^S review · Esc"
-                            } else {
-                                "Tab/↑↓ move · Enter next · Ctrl-S review · Esc cancel"
-                            })
-                            .wrap(Wrap { trim: false }),
-                            rows[rows.len() - 1],
+                            Paragraph::new(text).style(style).scroll((0, horizontal_scroll)),
+                            Rect::new(rows[1].x + label_width, rows[1].y + offset, value_width, 1),
                         );
-                    })
-                    .map_err(|error| format!("PAIR_REQUIRED: cannot render Pair form: {error}"))?;
+                    }
+                    let option_height = if focus < 2 && review.is_none() && rows[2].height >= 4 {
+                        (rows[2].height / 2).min(8)
+                    } else { 0 };
+                    let body = Layout::default().direction(Direction::Vertical).constraints([
+                        Constraint::Length(option_height),
+                        Constraint::Min(1),
+                    ]).split(rows[2]);
+                    if option_height > 0 {
+                        let items = options.iter().map(|pick| {
+                            let row = pair_setup_entry(entries, Some(*pick)).unwrap();
+                            ListItem::new(vec![
+                                Line::from(row.alias),
+                                Line::from(format!("{}:{} · ID {}", row.entry.source.path, row.entry.source.line_start, row.entry.id)),
+                            ])
+                        }).collect::<Vec<_>>();
+                        list_state.select(Some(selected[focus]));
+                        frame.render_stateful_widget(
+                            List::new(items).highlight_symbol("> ")
+                                .highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White)),
+                            body[0], &mut list_state,
+                        );
+                    }
+                    if focus < 2 && review.is_none() && status.is_none() {
+                        if let Some(pick) = options.get(selected[focus]) {
+                            let row = pair_setup_entry(entries, Some(*pick)).unwrap();
+                            details.insert_str(0, &format!(
+                                "Choose: {}\nSource: {}:{}\nID: {}\n\n",
+                                row.alias, row.entry.source.path, row.entry.source.line_start, row.entry.id,
+                            ));
+                        }
+                    }
+                    if focus < 2 && review.is_none() && options.is_empty() {
+                        details.insert_str(0, "No eligible matching HostEntry aliases.\n\n");
+                    }
+                    let detail_lines = wrap_status(&details, body[1].width as usize);
+                    scroll_step = body[1].height.max(1);
+                    scroll = scroll.min(detail_lines.len().saturating_sub(body[1].height as usize).min(u16::MAX as usize) as u16);
+                    frame.render_widget(Paragraph::new(detail_lines).scroll((scroll, 0)), body[1]);
+                    if let Some(lines) = status_lines {
+                        frame.render_widget(
+                            Paragraph::new(lines).style(Style::default().fg(if success { Color::Green } else { Color::Red })),
+                            rows[3],
+                        );
+                    }
+                    frame.render_widget(Paragraph::new(footer_lines).style(Style::default().fg(Color::Cyan)), rows[4]);
+                }).map_err(|error| format!("PAIR_REQUIRED: cannot render Pair setup: {error}"))?;
+                let mut edited = false;
                 match read_key(input, "PAIR_REQUIRED")? {
-                    KeyEvent { code: KeyCode::Esc, .. } => return Ok((fields, PairSetupAction::Cancel)),
+                    KeyEvent { code: KeyCode::Esc, .. } if review.is_some() => {
+                        review = None;
+                        scroll = 0;
+                    }
+                    KeyEvent { code: KeyCode::Esc, .. } => return Ok(completed),
                     KeyEvent { code: KeyCode::Char('c'), modifiers, .. }
-                        if modifiers.contains(KeyModifiers::CONTROL) =>
-                    {
-                        return Ok((fields, PairSetupAction::Cancel));
-                    }
+                        if modifiers.contains(KeyModifiers::CONTROL) => return Ok(completed),
                     KeyEvent { code: KeyCode::Char('s'), modifiers, .. }
+                        if modifiers.contains(KeyModifiers::CONTROL) && !applied =>
+                    {
+                        review = None;
+                        status = None;
+                        scroll = 0;
+                        if pair_setup_entry(entries, draft.gateway).is_none()
+                            || !draft.gateway.is_some_and(|(index, _)| eligible.contains(&index))
+                        {
+                            status = Some(("PAIR_SELECTION: select an eligible gateway HostEntry".to_string(), false));
+                            focus = 0;
+                            continue;
+                        }
+                        if pair_setup_entry(entries, draft.vm).is_none()
+                            || !draft.vm.is_some_and(|(index, _)| vm_eligible.contains(&index))
+                        {
+                            status = Some(("PAIR_SELECTION: select a different eligible VM with compatible gateway transit".to_string(), false));
+                            focus = 1;
+                            continue;
+                        }
+                        match execute(&draft, PairSetupAction::Review) {
+                            Ok(text) => {
+                                review = Some(text);
+                                if preview {
+                                    completed = true;
+                                    status = Some(("Preview complete — no files changed".to_string(), true));
+                                }
+                            }
+                            Err(error) => status = Some((error, false)),
+                        }
+                    }
+                    KeyEvent { code: KeyCode::Enter, .. } if review.is_some() => {
+                        if !preview {
+                            review = None;
+                            scroll = 0;
+                            match execute(&draft, PairSetupAction::Apply) {
+                                Ok(text) => {
+                                    completed = true;
+                                    status = Some((text, true));
+                                }
+                                Err(error) => status = Some((error, false)),
+                            }
+                        }
+                    }
+                    KeyEvent { code: KeyCode::Tab, .. } => {
+                        focus = (focus + 1) % 4;
+                        if review.is_none() { scroll = 0; }
+                    }
+                    KeyEvent { code: KeyCode::BackTab, .. } => {
+                        focus = (focus + 3) % 4;
+                        if review.is_none() { scroll = 0; }
+                    }
+                    KeyEvent { code: KeyCode::Up, .. } if focus < 2 && review.is_none() => {
+                        selected[focus] = selected[focus].saturating_sub(1);
+                        scroll = 0;
+                    }
+                    KeyEvent { code: KeyCode::Down, .. } if focus < 2 && review.is_none() => {
+                        selected[focus] = (selected[focus] + 1).min(options.len().saturating_sub(1));
+                        scroll = 0;
+                    }
+                    KeyEvent { code: KeyCode::PageUp | KeyCode::Up, .. } => scroll = scroll.saturating_sub(scroll_step),
+                    KeyEvent { code: KeyCode::PageDown | KeyCode::Down, .. } => scroll = scroll.saturating_add(scroll_step),
+                    KeyEvent { code: KeyCode::Enter, .. } if focus < 2 => {
+                        if let Some(pick) = options.get(selected[focus]) {
+                            if focus == 0 {
+                                draft.gateway = Some(*pick);
+                                routes = pair_setup_routes(entries, &eligible, draft.gateway);
+                                vm_eligible = pair_setup_vm_eligible(&eligible, draft.gateway, &routes);
+                                let vm_options = pair_setup_options(entries, &vm_eligible, &queries[1]);
+                                selected[1] = vm_options.iter().position(|pick| Some(*pick) == draft.vm).unwrap_or(0);
+                            } else {
+                                draft.vm = Some(*pick);
+                            }
+                            focus += 1;
+                            edited = true;
+                            candidate_index = None;
+                        }
+                    }
+                    KeyEvent { code: KeyCode::Char('n'), modifiers, .. }
                         if modifiers.contains(KeyModifiers::CONTROL) =>
                     {
-                        return Ok((fields, PairSetupAction::Submit));
+                        if let Ok(values) = &candidates {
+                            if !values.is_empty() {
+                                let index = candidate_index.map_or(0, |index| (index + 1) % values.len());
+                                draft.transit_host.clone_from(&values[index].0);
+                                draft.transit_port = values[index].1.to_string();
+                                candidate_index = Some(index);
+                                edited = true;
+                            }
+                        }
                     }
-                    KeyEvent { code: KeyCode::Tab | KeyCode::Down | KeyCode::Enter, .. } => selected = (selected + 1) % fields.len(),
-                    KeyEvent { code: KeyCode::Up, .. } => selected = selected.saturating_sub(1),
-                    KeyEvent { code: KeyCode::Backspace, .. } => { fields[selected].pop(); }
+                    KeyEvent { code: KeyCode::Backspace, .. } => {
+                        match focus {
+                            0 | 1 => { queries[focus].pop(); selected[focus] = 0; }
+                            2 => { draft.transit_host.pop(); candidate_index = None; }
+                            _ => { draft.transit_port.pop(); candidate_index = None; }
+                        }
+                        edited = true;
+                    }
                     KeyEvent { code: KeyCode::Char(character), modifiers, .. }
                         if !modifiers.contains(KeyModifiers::CONTROL) && !modifiers.contains(KeyModifiers::ALT) =>
                     {
-                        fields[selected].push(character);
+                        match focus {
+                            0 | 1 => { queries[focus].push(character); selected[focus] = 0; }
+                            2 => { draft.transit_host.push(character); candidate_index = None; }
+                            _ => { draft.transit_port.push(character); candidate_index = None; }
+                        }
+                        edited = true;
                     }
                     _ => {}
+                }
+                if edited {
+                    review = None;
+                    status = None;
+                    scroll = 0;
                 }
             }
         },
@@ -1014,79 +1323,6 @@ pub fn pair_setup_workspace(
 }
 
 
-pub fn pair_review_workspace(
-    review: &str,
-    preview: bool,
-    title: &str,
-) -> Result<MutationReviewAction, String> {
-    with_terminal(
-        title,
-        "MUTATION_REVIEW_REQUIRED: review requires usable stdin and stderr terminals".to_string(),
-        |terminal, input| {
-            let mut scroll = 0u16;
-            loop {
-                terminal
-                    .draw(|frame| {
-                        let rows = Layout::default()
-                            .direction(Direction::Vertical)
-                            .constraints([
-                                Constraint::Length(1),
-                                Constraint::Min(1),
-                                Constraint::Length(1),
-                            ])
-                            .split(frame.area());
-                        frame.render_widget(
-                            Paragraph::new(title).style(
-                                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                            ),
-                            rows[0],
-                        );
-                        frame.render_widget(
-                            Paragraph::new(review)
-                                .wrap(Wrap { trim: false })
-                                .scroll((scroll, 0)),
-                            rows[1],
-                        );
-                        frame.render_widget(
-                            Paragraph::new(if preview {
-                                "Enter finish preview · E edit · Esc cancel · PgUp/PgDn scroll"
-                            } else {
-                                "Enter apply · E edit · Esc cancel · PgUp/PgDn scroll"
-                            }),
-                            rows[2],
-                        );
-                    })
-                    .map_err(|error| {
-                        format!("PAIR_REVIEW_REQUIRED: cannot render review: {error}")
-                    })?;
-                match read_key(input, "PAIR_REVIEW_REQUIRED")? {
-                    KeyEvent { code: KeyCode::Enter, .. } => {
-                        return Ok(if preview {
-                            MutationReviewAction::Acknowledge
-                        } else {
-                            MutationReviewAction::Apply
-                        });
-                    }
-                    KeyEvent { code: KeyCode::Char('e' | 'E'), .. } => {
-                        return Ok(MutationReviewAction::Edit);
-                    }
-                    KeyEvent { code: KeyCode::Esc, .. } => return Err(CANCELLED.to_string()),
-                    KeyEvent { code: KeyCode::Char('c'), modifiers, .. }
-                        if modifiers.contains(KeyModifiers::CONTROL) =>
-                    {
-                        return Err(CANCELLED.to_string());
-                    }
-                    KeyEvent { code: KeyCode::Down, .. } => scroll = scroll.saturating_add(1),
-                    KeyEvent { code: KeyCode::Up, .. } => scroll = scroll.saturating_sub(1),
-                    KeyEvent { code: KeyCode::PageDown, .. } => scroll = scroll.saturating_add(10),
-                    KeyEvent { code: KeyCode::PageUp, .. } => scroll = scroll.saturating_sub(10),
-                    KeyEvent { code: KeyCode::Home, .. } => scroll = 0,
-                    _ => {}
-                }
-            }
-        },
-    )
-}
 
 
 fn remember_selection(state: &mut HostsState, rows: &[Row<'_>], selected: usize) {
@@ -3383,6 +3619,7 @@ fn read_key(input: &mut File, prefix: &str) -> Result<KeyEvent, String> {
         b'\r' | b'\n' => KeyCode::Enter,
         b'\t' => KeyCode::Tab,
         0x03 => return Ok(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+        0x0e => return Ok(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL)),
         0x10 => return Ok(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL)),
         0x13 => return Ok(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)),
         0x18 => return Ok(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL)),
@@ -3406,6 +3643,7 @@ fn read_key(input: &mut File, prefix: &str) -> Result<KeyEvent, String> {
                 b'B' => KeyCode::Down,
                 b'C' => KeyCode::Right,
                 b'D' => KeyCode::Left,
+                b'Z' => KeyCode::BackTab,
                 b'5' if read_escape_byte(input, prefix)? == Some(b'~') => KeyCode::PageUp,
                 b'6' if read_escape_byte(input, prefix)? == Some(b'~') => KeyCode::PageDown,
                 _ => KeyCode::Esc,

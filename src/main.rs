@@ -689,7 +689,12 @@ fn run_pairs_workspace(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), String
                 pair.config = cli.config.clone();
                 pair.scopes = cli.scopes.clone();
                 pair.projects = cli.projects.clone();
-                status = run_pair(&pair, roots).err();
+                pair.tui = true;
+                status = match run_pair(&pair, roots) {
+                    Ok(()) => Some("Pair setup complete.".to_string()),
+                    Err(error) if error == picker::CANCELLED => Some("Pair setup cancelled.".to_string()),
+                    Err(error) => Some(error),
+                };
             }
             picker::PairWorkspaceAction::Recover => {}
         }
@@ -768,6 +773,9 @@ fn run_setup_workspace(home: &Path) -> Result<(), String> {
 
 fn run_tui_operation(cli: &Cli) -> Result<(), String> {
     let home = home_dir()?;
+    if matches!(cli.command, Command::PairSetup { .. }) {
+        return run_pair(cli, &registered_roots(cli)?);
+    }
     if matches!(cli.command, Command::Setup) {
         return run_setup_workspace(&home);
     }
@@ -1094,11 +1102,7 @@ fn run_pair(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), String> {
     if !inspection {
         mutation::validate_mutation_roots(&configured)?;
     }
-    let initial = if inspection {
-        discover_roots(&configured).map_err(|error| error.to_string())?
-    } else {
-        discover_with_permission_repair(&configured, cli.no_input)?
-    };
+    let initial = discover_roots(&configured).map_err(|error| error.to_string())?;
     let mut journal_paths = configured
         .iter()
         .map(|root| root.path.clone())
@@ -1118,24 +1122,9 @@ fn run_pair(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), String> {
     journal_paths.dedup();
     let pending = mutation::pending_pair_journals(&journal_paths);
     if !pending.is_empty() && matches!(cli.command, Command::PairSetup { .. }) {
-        let targets = mutation::pair_recovery_targets(&pending)?;
-        if cli.no_input || !io::stdin().is_terminal() || !io::stderr().is_terminal() {
-            return Err("PAIR_RECOVERY_REVIEW_REQUIRED: review pending Pair mutation targets in an interactive terminal before setup".to_string());
-        }
-        eprintln!("Pending Pair mutation affects:");
-        for path in &targets {
-            eprintln!("  {}", path.display());
-        }
-        if !prompt_yes("Recover pending Pair mutation before setup? [y/N]: ")? {
-            return Err("PAIR_RECOVERY_DECLINED: pending Pair mutation was not recovered".to_string());
-        }
-        mutation::recover_pair_journals(&journal_paths, &targets)?;
+        return Err("PAIR_RECOVERY_PENDING: pending Pair mutation requires explicit recovery before setup; no files changed".to_string());
     }
-    let catalog = if inspection {
-        initial
-    } else {
-        discover_with_permission_repair(&configured, cli.no_input)?
-    };
+    let catalog = initial;
     let diagnostics = sshx::pair::diagnostics(&catalog.entries);
     for diagnostic in &catalog.diagnostics {
         eprintln!("{}", render_diagnostic(diagnostic));
@@ -1150,72 +1139,142 @@ fn run_pair(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), String> {
             Ok(())
         }
         Command::PairSetup { gateway, vm } => {
+            let entries = catalog.entries.iter()
+                .filter(|entry| entry_matches_provenance(entry, cli)).collect::<Vec<_>>();
             let gateway = select_pair_entry(
-                &catalog.entries,
-                gateway.as_deref(),
-                cli.gateway_location
-                    .source
-                    .as_ref()
-                    .or(cli.location.source.as_ref()),
-                cli.gateway_location.line.or(cli.location.line),
-                "gateway",
-                cli.no_input,
+                &entries, gateway.as_deref(),
+                cli.gateway_location.source.as_ref().or(cli.location.source.as_ref()),
+                cli.gateway_location.line.or(cli.location.line), "gateway",
             )?;
             let vm = select_pair_entry(
-                &catalog.entries,
-                vm.as_deref(),
-                cli.vm_location.source.as_ref(),
-                cli.vm_location.line,
-                "VM",
-                cli.no_input,
+                &entries, vm.as_deref(), cli.vm_location.source.as_ref(),
+                cli.vm_location.line, "VM",
             )?;
-            mutation::validate_entry_paths(gateway.entry)?;
-            mutation::validate_entry_paths(vm.entry)?;
-            let plan = sshx::pair::plan_setup(
-                &catalog.entries,
-                gateway.entry,
-                vm.entry,
-                gateway.alias,
-                vm.alias,
-                cli.transit_host.as_deref(),
-                cli.transit_port,
-            )?;
-            if cli.preview {
-                print!("{}", render_pair(&plan, cli.format, false)?);
+            let interactive = !cli.no_input && !cli.format.is_machine() && !cli.password_stdin
+                && io::stdin().is_terminal() && io::stderr().is_terminal();
+            let plan = if !cli.tui && let (Some(gateway), Some(vm)) = (&gateway, &vm) {
+                mutation::validate_entry_paths(gateway.entry)?;
+                mutation::validate_entry_paths(vm.entry)?;
+                match sshx::pair::plan_setup(
+                    &catalog.entries, gateway.entry, vm.entry, gateway.alias, vm.alias,
+                    cli.transit_host.as_deref(), cli.transit_port,
+                ) {
+                    Ok(plan) => Some(plan),
+                    Err(error) if interactive && (error.starts_with("TRANSIT_REQUIRED:")
+                        || error.starts_with("TRANSIT_INCOMPLETE:")) => None,
+                    Err(error) => return Err(error),
+                }
+            } else {
+                None
+            };
+            if let Some(plan) = plan {
+                if cli.preview {
+                    print!("{}", render_pair(&plan, cli.format, false)?);
+                    return Ok(());
+                }
+                if !cli.yes {
+                    if !interactive {
+                        return Err("CONSENT_REQUIRED: non-interactive pair setup requires --yes".to_string());
+                    }
+                    eprint!("{}", render_pair(&plan, OutputFormat::Human, false)?);
+                    if !prompt_yes("Apply changes? [y/N]: ")? {
+                        return Err("MUTATION_DECLINED: pair setup was not applied".to_string());
+                    }
+                }
+                mutation::apply_pair(&plan)?;
+                print!("{}", render_pair(&plan, cli.format, true)?);
                 return Ok(());
             }
-            let interactive = !cli.no_input && io::stdin().is_terminal();
-            if !cli.yes {
-                if !interactive {
-                    return Err(
-                        "CONSENT_REQUIRED: non-interactive pair setup requires --yes".to_string(),
-                    );
-                }
-                eprint!("{}", render_pair(&plan, OutputFormat::Human, false)?);
-                if !prompt_yes("Apply changes? [y/N]: ")? {
-                    return Err("MUTATION_DECLINED: pair setup was not applied".to_string());
-                }
+            if !interactive {
+                return Err(if gateway.is_none() {
+                    "GATEWAY_REQUIRED: provide an exact gateway selector outside usable interactive terminals"
+                } else if vm.is_none() {
+                    "VM_REQUIRED: provide an exact VM selector outside usable interactive terminals"
+                } else {
+                    "TRANSIT_REQUIRED: provide --transit-host and --transit-port outside usable interactive terminals"
+                }.to_string());
             }
-            mutation::apply_pair(&plan)?;
-            print!("{}", render_pair(&plan, cli.format, true)?);
-            Ok(())
+            run_pair_setup_workspace(cli, &catalog.entries, &entries, &journal_paths, gateway, vm)
         }
         _ => Err("PAIR_COMMAND: unsupported pair command".to_string()),
     }
 }
 
+fn run_pair_setup_workspace(
+    cli: &Cli, catalog: &[HostEntry], entries: &[&HostEntry], paths: &[PathBuf],
+    gateway: Option<picker::Selection<'_>>, vm: Option<picker::Selection<'_>>,
+) -> Result<(), String> {
+    let selected_index = |selection: picker::Selection<'_>| {
+        entries.iter().position(|entry| std::ptr::eq(*entry, selection.entry))
+            .map(|index| (index, selection.entry.aliases.iter()
+                .position(|alias| alias == selection.alias).unwrap_or(0)))
+    };
+    let draft = picker::PairSetupDraft {
+        gateway: gateway.and_then(selected_index),
+        vm: vm.and_then(selected_index),
+        transit_host: cli.transit_host.clone().unwrap_or_default(),
+        transit_port: cli.transit_port.map_or_else(String::new, |port| port.to_string()),
+    };
+    let snapshots = paths.iter().map(|path| {
+        std::fs::read(path).map(|bytes| (path, bytes)).map_err(|error| error.to_string())
+    }).collect::<Result<Vec<_>, _>>()?;
+    let mut pending = None;
+    let completed = picker::pair_setup_workspace(entries, draft, cli.preview, |draft, action| {
+        for (path, before) in &snapshots {
+            if !std::fs::read(path).is_ok_and(|after| after == *before) {
+                pending = None;
+                return Err(format!("HOST_SOURCE_CHANGED: {} changed; reopen Pair setup with current sources", path.display()));
+            }
+        }
+        if action == picker::PairSetupAction::Apply {
+            let plan = pending.take().ok_or_else(|| "PAIR_REVIEW_REQUIRED: review current Pair changes before applying".to_string())?;
+            mutation::apply_pair(&plan)?;
+            return Ok(format!("Pair saved.\n{}", render_pair(&plan, OutputFormat::Human, true)?));
+        }
+        pending = None;
+        let choice = |selected: Option<(usize, usize)>, role: &str| {
+            selected.and_then(|(entry, alias)| entries.get(entry)
+                .and_then(|entry| entry.aliases.get(alias).map(|alias| (*entry, alias.as_str()))))
+                .ok_or_else(|| format!("{}_REQUIRED: choose an exact {role} HostEntry", role.to_ascii_uppercase()))
+        };
+        let (gateway, gateway_alias) = choice(draft.gateway, "gateway")?;
+        let (vm, vm_alias) = choice(draft.vm, "VM")?;
+        mutation::validate_entry_paths(gateway)?;
+        mutation::validate_entry_paths(vm)?;
+        let host = (!draft.transit_host.trim().is_empty()).then(|| draft.transit_host.trim());
+        let port = if draft.transit_port.trim().is_empty() { None } else {
+            Some(draft.transit_port.trim().parse::<u16>()
+                .map_err(|_| "PORT_INVALID: transit port must be a number from 1 to 65535".to_string())?)
+        };
+        let plan = sshx::pair::plan_setup(
+            catalog, gateway, vm, gateway_alias, vm_alias, host, port,
+        )?;
+        let review = format!(
+            "Gateway: {gateway_alias} ({})\nSource: {}:{}\nVM: {vm_alias} ({})\nSource: {}:{}\nTransit: {}:{}\n{}",
+            gateway.id, gateway.source.path, gateway.source.line_start,
+            vm.id, vm.source.path, vm.source.line_start, plan.transit_host, plan.transit_port,
+            render_pair(&plan, OutputFormat::Human, false)?,
+        );
+        pending = Some(plan);
+        Ok(review)
+    })?;
+    if completed { Ok(()) } else { Err(picker::CANCELLED.to_string()) }
+}
+
 fn select_pair_entry<'a>(
-    entries: &'a [HostEntry],
+    entries: &'a [&'a HostEntry],
     selector: Option<&str>,
     source: Option<&PathBuf>,
     line: Option<usize>,
     role: &str,
-    no_input: bool,
-) -> Result<picker::Selection<'a>, String> {
+) -> Result<Option<picker::Selection<'a>>, String> {
     if source.is_some() != line.is_some() {
         return Err(format!(
             "SELECTOR_INCOMPLETE: {role} source and line must be provided together"
         ));
+    }
+    if selector.is_none() && source.is_none() {
+        return Ok(None);
     }
     let id_match =
         selector.is_some_and(|selector| entries.iter().any(|entry| entry.id == selector));
@@ -1245,46 +1304,24 @@ fn select_pair_entry<'a>(
         })
         .filter(|entry| line.is_none_or(|line| entry.source.line_start == line))
         .collect::<Vec<_>>();
-    let role_label = role.to_ascii_lowercase();
-    let role_code = role.to_ascii_uppercase();
-    if selector.is_none() {
-        if matches.is_empty() {
-            return Err("HOST_NOT_FOUND: no hosts match current filters".to_string());
-        }
-        if no_input {
-            return Err(format!(
-                "{role_code}_REQUIRED: provide a {role_label} selector in --no-input mode"
-            ));
-        }
-        if !io::stdin().is_terminal() {
-            return Err(format!(
-                "{role_code}_REQUIRED: provide a {role_label} selector outside interactive mode"
-            ));
-        }
-        return interactive_select(&matches, &format!("pair {role_label}"));
-    }
     match matches.as_slice() {
         [entry] => {
-            let selector = selector.unwrap();
-            let alias = (!id_match)
-                .then(|| entry.aliases.iter().find(|alias| alias == &selector))
-                .flatten()
-                .or_else(|| entry.aliases.first())
-                .map(String::as_str)
-                .unwrap_or_default();
-            Ok(picker::Selection { entry, alias })
+            let alias = selector.filter(|_| !id_match)
+                .and_then(|selector| entry.aliases.iter().find(|alias| alias == &selector))
+                .or_else(|| entry.aliases.first()).map(String::as_str).unwrap_or_default();
+            Ok(Some(picker::Selection { entry, alias }))
         }
         [] if source.is_some() => Err(format!(
             "HOST_MISMATCH: {role} selector `{}` does not match source and Host line",
-            selector.unwrap()
+            selector.unwrap_or("<source>")
         )),
         [] => Err(format!(
             "HOST_NOT_FOUND: {role} selector `{}` matched no entries",
-            selector.unwrap()
+            selector.unwrap_or("<source>")
         )),
         many => Err(format!(
             "HOST_AMBIGUOUS: {role} selector `{}` matched {} entries",
-            selector.unwrap(),
+            selector.unwrap_or("<source>"),
             many.len()
         )),
     }
@@ -2296,6 +2333,14 @@ fn registered_roots(cli: &Cli) -> Result<Vec<RegisteredRoot>, String> {
     }])
 }
 
+fn entry_matches_provenance(entry: &HostEntry, cli: &Cli) -> bool {
+    entry.provenance.iter().any(|provenance| {
+        (cli.scopes.is_empty() || cli.scopes.iter().any(|scope| scope == &provenance.scope))
+            && (cli.projects.is_empty() || cli.projects.iter()
+                .any(|project| provenance.project.as_deref() == Some(project.as_str())))
+    })
+}
+
 fn filter_entries<'a>(entries: &'a [HostEntry], cli: &Cli) -> Vec<&'a HostEntry> {
     let source = cli.location.source.as_ref().map(|path| {
         settings::normalize_path(path, &home_dir().unwrap_or_else(|_| PathBuf::from(".")))
@@ -2305,15 +2350,7 @@ fn filter_entries<'a>(entries: &'a [HostEntry], cli: &Cli) -> Vec<&'a HostEntry>
     entries
         .iter()
         .filter(|entry| {
-            let provenance_matches = entry.provenance.iter().any(|provenance| {
-                (cli.scopes.is_empty() || cli.scopes.iter().any(|scope| scope == &provenance.scope))
-                    && (cli.projects.is_empty()
-                        || cli
-                            .projects
-                            .iter()
-                            .any(|project| provenance.project.as_deref() == Some(project.as_str())))
-            });
-            provenance_matches
+            entry_matches_provenance(entry, cli)
                 && source
                     .as_deref()
                     .is_none_or(|path| entry.source.path == path)
