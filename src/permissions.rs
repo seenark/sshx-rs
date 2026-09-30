@@ -17,13 +17,20 @@ use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 
+#[cfg(target_os = "linux")]
+const DIRECTORY_ACCESS: i32 = libc::O_PATH;
+#[cfg(target_vendor = "apple")]
+const DIRECTORY_ACCESS: i32 = libc::O_SEARCH;
+#[cfg(all(unix, not(any(target_os = "linux", target_vendor = "apple"))))]
+const DIRECTORY_ACCESS: i32 = libc::O_RDONLY;
+
 #[cfg(unix)]
 fn open_directory_at(dir: i32, name: &std::ffi::CStr) -> io::Result<OwnedFd> {
     let fd = unsafe {
         libc::openat(
             dir,
             name.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            DIRECTORY_ACCESS | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
         )
     };
     if fd < 0 {
@@ -39,7 +46,7 @@ fn open_repair_target(path: &Path, target: PermissionTarget, mode: u32) -> io::R
     let fd = unsafe {
         libc::open(
             start.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            DIRECTORY_ACCESS | libc::O_DIRECTORY | libc::O_CLOEXEC,
         )
     };
     if fd < 0 {
@@ -99,7 +106,7 @@ fn repair_opened_target(
     }
 
     #[cfg(target_os = "linux")]
-    let changed = unsafe {
+    let mut changed = unsafe {
         libc::syscall(
             libc::SYS_fchmodat2,
             target_file.as_raw_fd(),
@@ -108,6 +115,13 @@ fn repair_opened_target(
             libc::AT_EMPTY_PATH,
         )
     };
+    #[cfg(target_os = "linux")]
+    if changed < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ENOSYS) {
+        // Older kernels lack fchmodat2; procfs still names this held inode,
+        // even if the original path is replaced before chmod.
+        let held_path = CString::new(format!("/proc/self/fd/{}", target_file.as_raw_fd())).unwrap();
+        changed = unsafe { libc::fchmodat(libc::AT_FDCWD, held_path.as_ptr(), mode, 0) }.into();
+    }
     // Darwin cannot open mode-000 targets for fchmod; no-follow fchmodat avoids
     // changing a symlink referent if the final entry races after inspection.
     #[cfg(not(target_os = "linux"))]
@@ -415,12 +429,43 @@ mod tests {
         let result = apply(&candidate);
         assert_eq!(result.outcome, RepairOutcome::Fixed, "{}", result.detail);
         assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o7777, 0o600);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        let result = apply(&candidate);
+        assert_eq!(result.outcome, RepairOutcome::Fixed, "{}", result.detail);
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o7777, 0o600);
 
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
         fs::hard_link(&path, root.join("shared")).unwrap();
         let result = apply(&candidate);
         assert_eq!(result.outcome, RepairOutcome::Skipped);
         assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o7777, 0o644);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn apply_repairs_file_below_search_only_directory() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("sshx-search-only-repair-{unique}"));
+        fs::create_dir_all(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let path = root.join("secret");
+        fs::write(&path, "private").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let candidate = RepairCandidate {
+            kind: "password_file".to_string(),
+            path: path.clone(),
+            target: PermissionTarget::File,
+            current_mode: 0o644,
+            reason: "test".to_string(),
+        };
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o100)).unwrap();
+        let result = apply(&candidate);
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(result.outcome, RepairOutcome::Fixed, "{}", result.detail);
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o7777, 0o600);
         fs::remove_dir_all(root).unwrap();
     }
 }
