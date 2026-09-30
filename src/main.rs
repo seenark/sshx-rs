@@ -8,26 +8,13 @@ use sshx::output::{
     render_machine, render_pair, render_pairs, render_repairs, render_tunnels,
 };
 use sshx::settings::{self, RegisteredRoot};
+use sshx::tunnel::TunnelRoute;
 use std::collections::HashMap;
 use std::env;
 use std::ffi::OsString;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{self, Stdio};
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum TunnelRoute {
-    Direct,
-    Paired,
-}
-
-impl TunnelRoute {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Direct => "direct",
-            Self::Paired => "paired",
-        }
-    }
-}
 
 
 fn main() {
@@ -294,17 +281,17 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
     }
     match &cli.command {
         Command::TunnelList => {
-            let response = sshx::tunnel::list(&home)?;
+            let response = sshx::tunnel::list(&home, cli.tunnel_route)?;
             print!("{}", render_tunnels(&response, cli.format)?);
             return Ok(());
         }
         Command::TunnelStatus(id) => {
-            let response = sshx::tunnel::status(&home, id)?;
+            let response = sshx::tunnel::status(&home, id, cli.tunnel_route)?;
             print!("{}", render_tunnels(&response, cli.format)?);
             return Ok(());
         }
         Command::TunnelStop(id) => {
-            let response = sshx::tunnel::stop(&home, id)?;
+            let response = sshx::tunnel::stop(&home, id, cli.tunnel_route)?;
             print!("{}", render_tunnels(&response, cli.format)?);
             return Ok(());
         }
@@ -436,7 +423,7 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
                 print!("{}", render_tunnels(&response, cli.format)?);
                 Ok(())
             } else if matches!(cli.command, Command::TunnelPairedStart(_)) {
-                Err("TUNNEL_PAIRED_REQUIRED: selected HostEntry has no valid Pair".to_string())
+                TunnelRoute::Paired.check("direct")
             } else {
                 let response = start_direct_tunnel(&cli, entry, &home, selected.alias)?;
                 print!("{}", render_tunnels(&response, cli.format)?);
@@ -448,10 +435,7 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
                 select_connect_entry(&filtered, selector.as_deref(), &cli, "tunnel direct")?;
             let entry = selected.entry;
             if sshx::pair::paired_route(&catalog.entries, entry)?.is_some() {
-                return Err(
-                    "TUNNEL_DIRECT_PAIR: paired entries require a paired standalone tunnel"
-                        .to_string(),
-                );
+                return TunnelRoute::Direct.check("paired");
             }
             let response = start_direct_tunnel(&cli, entry, &home, selected.alias)?;
             print!("{}", render_tunnels(&response, cli.format)?);
@@ -459,13 +443,8 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
         }
         Command::TunnelRestart(id) => {
             let response = sshx::tunnel::restart(
-                &catalog.entries,
-                &home,
-                id,
-                cli.no_input,
-                cli.password_fd,
-                cli.gateway_password_fd,
-                cli.vm_password_fd,
+                &catalog.entries, &home, id, cli.tunnel_route, cli.no_input,
+                cli.password_fd, cli.gateway_password_fd, cli.vm_password_fd,
             )?;
             print!("{}", render_tunnels(&response, cli.format)?);
             Ok(())
@@ -521,7 +500,7 @@ fn run_hosts(
             && configured.len() == 1
             && configured[0].path == home.join(".ssh/config")
             && !configured[0].path.exists();
-        state.active_tunnels = sshx::tunnel::list(home)
+        state.active_tunnels = sshx::tunnel::list(home, None)
             .map(|response| response.tunnels.iter().filter(|tunnel| tunnel.state == "active").count())
             .unwrap_or(0);
         let mut discovery_error = None;
@@ -713,10 +692,8 @@ fn run_tunnels_workspace(
     let mut status = None;
     let mut completed = false;
     loop {
-        let mut tunnels = sshx::tunnel::list(home)?.tunnels;
-        if let Some((_, Some(route))) = requested {
-            tunnels.retain(|tunnel| tunnel.kind == route.as_str());
-        }
+        let route = requested.and_then(|(_, route)| route).or(cli.tunnel_route);
+        let tunnels = sshx::tunnel::list(home, route)?.tunnels;
         let allowed = requested.map(|(action, _)| action);
         let (index, action) = match picker::tunnels_workspace(&tunnels, status.as_deref(), selected, allowed) {
             Ok(result) => result,
@@ -725,15 +702,15 @@ fn run_tunnels_workspace(
         };
         selected = index;
         status = match action {
-            's' => sshx::tunnel::stop(home, &tunnels[index].id).err(),
-            'v' if allowed == Some('v') => sshx::tunnel::status(home, &tunnels[index].id).err(),
+            's' => sshx::tunnel::stop(home, &tunnels[index].id, route).err(),
+            'v' if allowed == Some('v') => sshx::tunnel::status(home, &tunnels[index].id, route).err(),
             'v' => None,
             'r' => {
                 let roots = registered_roots(cli)?;
                 discover_roots(&settings::discovery_roots(&roots))
                     .map_err(|error| error.to_string())
                     .and_then(|catalog| sshx::tunnel::restart(
-                        &catalog.entries, home, &tunnels[index].id, false,
+                        &catalog.entries, home, &tunnels[index].id, route, false,
                         cli.password_fd, cli.gateway_password_fd, cli.vm_password_fd,
                     ))
                     .err()
@@ -803,15 +780,21 @@ fn run_tui_operation(cli: &Cli) -> Result<(), String> {
         return run_tunnels_workspace(cli, &home, 0, None);
     }
     if let Command::TunnelStatus(id) | Command::TunnelStop(id) | Command::TunnelRestart(id) = &cli.command {
-        let tunnels = sshx::tunnel::list(&home)?.tunnels;
+        let tunnels = sshx::tunnel::list(&home, None)?.tunnels;
         let selected = tunnels.iter().position(|tunnel| &tunnel.id == id)
             .ok_or_else(|| format!("TUNNEL_NOT_FOUND: no registered tunnel with ID `{id}`"))?;
+        if let Some(route) = cli.tunnel_route {
+            route.check(&tunnels[selected].kind)?;
+        }
         let action = match cli.command {
             Command::TunnelStatus(_) => 'v',
             Command::TunnelStop(_) => 's',
             _ => 'r',
         };
-        return run_tunnels_workspace(cli, &home, selected, Some((action, None)));
+        let selected = tunnels[..selected].iter()
+            .filter(|tunnel| cli.tunnel_route.is_none_or(|route| tunnel.kind == route.as_str()))
+            .count();
+        return run_tunnels_workspace(cli, &home, selected, Some((action, cli.tunnel_route)));
     }
     if matches!(cli.command, Command::CreateHost | Command::TuiCreateHost) {
         return run_host_create(cli, &registered_roots(cli)?);
@@ -895,10 +878,10 @@ fn run_connection_workspace(
         .map(|route| std::fs::read(&route.gateway.source.path).map_err(|error| error.to_string()))
         .transpose()?;
     if matches!(cli.command, Command::TunnelDirectStart(_)) && route.is_some() {
-        return Err("TUNNEL_DIRECT_PAIR: paired entries require a paired standalone tunnel".to_string());
+        return TunnelRoute::Direct.check("paired");
     }
     if matches!(cli.command, Command::TunnelPairedStart(_)) && route.is_none() {
-        return Err("TUNNEL_PAIRED_REQUIRED: selected HostEntry has no valid Pair".to_string());
+        return TunnelRoute::Paired.check("direct");
     }
     let target = route.as_ref().map_or(entry, |route| &route.vm);
     let mut services = sshx::session::declared_services(target)?;
@@ -2976,6 +2959,7 @@ struct Cli {
     format: OutputFormat,
     action: Option<HostAction>,
     command: Command,
+    tunnel_route: Option<TunnelRoute>,
     tui: bool,
     scopes: Vec<String>,
     projects: Vec<String>,
@@ -3280,6 +3264,17 @@ impl Cli {
         if tui {
             positional.remove(0);
         }
+        let tunnel_route = if positional.first().is_some_and(|token| token == "tunnel")
+            && positional.len() >= 3
+        {
+            match positional[1].as_str() {
+                "direct" => Some(TunnelRoute::Direct),
+                "paired" => Some(TunnelRoute::Paired),
+                _ => None,
+            }
+        } else {
+            None
+        };
         let command = match positional.as_slice() {
             [] => Command::Hosts { explicit: tui },
             [host, list] if host == "host" && list == "list" => Command::List,
@@ -3386,7 +3381,7 @@ impl Cli {
                     route: Some(if route == "direct" { TunnelRoute::Direct } else { TunnelRoute::Paired }),
                 },
             [tunnel] if tunnel == "tunnel" => Command::TunnelStart(None),
-            [tunnel, selector] if tunnel == "tunnel" && !matches!(selector.as_str(), "direct" | "paired") => {
+            [tunnel, selector] if tunnel == "tunnel" => {
                 Command::TunnelStart(Some(selector.clone()))
             }
             [pair, setup, gateway, vm]
@@ -3527,6 +3522,7 @@ impl Cli {
             action,
             tui,
             command,
+            tunnel_route,
             scopes,
             projects,
             location,

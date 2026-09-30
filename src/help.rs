@@ -8,9 +8,10 @@ pub const CONNECT_USAGE: &str = "Usage: sshx connect [SELECTOR] [OPTIONS]";
 pub const TUI_USAGE: &str = "Usage: sshx tui [connect [SELECTOR] | host show [SELECTOR] | host create | tunnel status|stop [ID]] [OPTIONS]";
 pub const HOST_USAGE: &str = "Usage: sshx [--config PATH] host COMMAND [OPTIONS]";
 pub const PAIR_USAGE: &str = "Usage: sshx pair COMMAND [OPTIONS]";
-pub const TUNNEL_USAGE: &str = "Usage: sshx tunnel [HOST] [OPTIONS]\n       sshx tunnel direct|paired start [HOST] [OPTIONS]\n       sshx tunnel list [OPTIONS]\n       sshx tunnel status|stop|restart ID [OPTIONS]\n       sshx tunnel direct|paired list [OPTIONS]\n       sshx tunnel direct|paired status|stop|restart ID [OPTIONS]";
+pub const TUNNEL_USAGE: &str = "Usage: sshx tunnel [HOST] [OPTIONS]\n       sshx tunnel start [HOST] [OPTIONS]\n       sshx tunnel direct|paired start [HOST] [OPTIONS]\n       sshx tunnel list [OPTIONS]\n       sshx tunnel status|stop|restart ID [OPTIONS]\n       sshx tunnel direct|paired list [OPTIONS]\n       sshx tunnel direct|paired status|stop|restart ID [OPTIONS]";
 const TUNNEL_DIRECT_USAGE: &str = "Usage: sshx tunnel direct start [HOST] [OPTIONS] | sshx tunnel direct list [OPTIONS] | sshx tunnel direct status|stop|restart ID [OPTIONS]";
 const TUNNEL_PAIRED_USAGE: &str = "Usage: sshx tunnel paired start [HOST] [OPTIONS] | sshx tunnel paired list [OPTIONS] | sshx tunnel paired status|stop|restart ID [OPTIONS]";
+const TUNNEL_AUTO_START_USAGE: &str = "Usage: sshx tunnel start [HOST] [OPTIONS]";
 const TUNNEL_DIRECT_START_USAGE: &str =
     "Usage: sshx tunnel direct start [HOST] [OPTIONS]";
 const TUNNEL_PAIRED_START_USAGE: &str =
@@ -38,7 +39,7 @@ pub(crate) enum HelpPage {
     PairRecover,
     Tunnel,
     TunnelRoute { route: TunnelRoute },
-    TunnelStart { route: TunnelRoute },
+    TunnelStart { route: Option<TunnelRoute> },
     TunnelLifecycle {
         operation: LifecycleOperation,
         route: Option<TunnelRoute>,
@@ -81,11 +82,12 @@ impl HelpPage {
                 ..
             } => TUNNEL_PAIRED_USAGE,
             Self::TunnelStart {
-                route: TunnelRoute::Direct,
+                route: Some(TunnelRoute::Direct),
             } => TUNNEL_DIRECT_START_USAGE,
             Self::TunnelStart {
-                route: TunnelRoute::Paired,
+                route: Some(TunnelRoute::Paired),
             } => TUNNEL_PAIRED_START_USAGE,
+            Self::TunnelStart { route: None } => TUNNEL_AUTO_START_USAGE,
             Self::TunnelLifecycle { route: None, .. } => TUNNEL_USAGE,
         }
     }
@@ -204,6 +206,7 @@ fn resolve_refs(path: &[&str]) -> Option<HelpPage> {
         ["pair", "validate", ..] => Some(HelpPage::PairValidate),
         ["pair", "recover", ..] => Some(HelpPage::PairRecover),
         ["tunnel"] => Some(HelpPage::Tunnel),
+        ["tunnel", "start", ..] => Some(HelpPage::TunnelStart { route: None }),
         ["tunnel", "direct"] => Some(HelpPage::TunnelRoute {
             route: TunnelRoute::Direct,
         }),
@@ -211,10 +214,10 @@ fn resolve_refs(path: &[&str]) -> Option<HelpPage> {
             route: TunnelRoute::Paired,
         }),
         ["tunnel", "direct", "start", ..] => Some(HelpPage::TunnelStart {
-            route: TunnelRoute::Direct,
+            route: Some(TunnelRoute::Direct),
         }),
         ["tunnel", "paired", "start", ..] => Some(HelpPage::TunnelStart {
-            route: TunnelRoute::Paired,
+            route: Some(TunnelRoute::Paired),
         }),
         ["tunnel", "direct", operation, ..] => LifecycleOperation::parse(operation).map(
             |operation| HelpPage::TunnelLifecycle {
@@ -540,10 +543,10 @@ fn tunnel() -> String {
     page(
         "tunnel",
         "Run automatic-route Tunnel workflows, select a direct or paired route explicitly, or manage registered tunnels. Interactive starts without explicit forwarding options open the connection workspace and return to Hosts with the Tunnel ID; leaving the TUI does not stop a standalone Tunnel.",
-        "sshx tunnel [HOST] [OPTIONS]\nsshx tunnel direct|paired start [HOST] [OPTIONS]\nsshx tunnel list\nsshx tunnel status|stop|restart ID\nsshx tunnel direct|paired list\nsshx tunnel direct|paired status|stop|restart ID\nsshx tunnel --help\nsshx help tunnel",
-        "HOST    Exact alias or stable HostEntry ID. `tunnel HOST` selects direct or Pair route automatically. Missing HOST opens the HostEntry picker when input is available.",
+        "sshx tunnel [HOST] [OPTIONS]\nsshx tunnel start [HOST] [OPTIONS]\nsshx tunnel direct|paired start [HOST] [OPTIONS]\nsshx tunnel list\nsshx tunnel status|stop|restart ID\nsshx tunnel direct|paired list\nsshx tunnel direct|paired status|stop|restart ID\nsshx tunnel --help\nsshx help tunnel",
+        "HOST    Exact alias or stable HostEntry ID. `tunnel HOST` and `tunnel start HOST` select direct or Pair route automatically. Host aliases named `direct` or `paired` remain valid in the automatic form. Missing HOST opens the HostEntry picker when input is available.",
         TUNNEL_OPTIONS,
-        "direct    Start only when HOST resolves to a direct route; list and manage direct tunnel IDs.\npaired    Start only when HOST resolves to a Pair route; list and manage paired tunnel IDs.\nlist    List every registered tunnel.\nstatus ID    Show one registered tunnel by persisted ID.\nstop ID    Stop one registered tunnel by persisted ID.\nrestart ID    Restart one registered tunnel by persisted ID.",
+        "start    Start a tunnel with its HostEntry route selected automatically.\ndirect    Start only when HOST resolves to a direct route; list and manage direct tunnel IDs.\npaired    Start only when HOST resolves to a Pair route; list and manage paired tunnel IDs.\nlist    List every registered tunnel.\nstatus ID    Show one registered tunnel by persisted ID.\nstop ID    Stop one registered tunnel by persisted ID.\nrestart ID    Restart one registered tunnel by persisted ID.",
         "sshx tunnel db-prod\nsshx tunnel direct start db-prod --forward 5432=5432 --forward 6379=6378 --forward 3001=3001 --no-input\nsshx tunnel paired start vm-alias --forward 5432=15432 --no-input",
         "Exit 0 after workflow or lifecycle success. Missing values, route errors, listener errors, and parse errors exit 2. Interactive cancellation exits 130.",
         "sshx connect, sshx pair list, sshx host list",
@@ -583,26 +586,35 @@ fn tunnel_route(route: TunnelRoute) -> String {
     )
 }
 
-fn tunnel_start(route: TunnelRoute) -> String {
-    let route_name = route.as_str();
-    let command_path = format!("tunnel {route_name} start");
+fn tunnel_start(route: Option<TunnelRoute>) -> String {
+    let command_path = route.map_or_else(
+        || "tunnel start".to_string(),
+        |route| format!("tunnel {} start", route.as_str()),
+    );
     let usage = format!(
         "sshx {command_path} [HOST] [OPTIONS]\nsshx {command_path} --help\nsshx help {command_path}"
     );
-    let arguments = format!(
-        "HOST    Exact alias or stable HostEntry ID. It must resolve to a {route_name} route. Missing HOST opens the picker when input is available."
+    let arguments = route.map_or_else(
+        || "HOST    Exact alias or stable HostEntry ID. Select its direct or Pair route automatically. Missing HOST opens the picker when input is available.".to_string(),
+        |route| format!("HOST    Exact alias or stable HostEntry ID. It must resolve to a {} route. Missing HOST opens the picker when input is available.", route.as_str()),
     );
     let example = match route {
-        TunnelRoute::Direct => {
+        Some(TunnelRoute::Direct) => {
             "sshx tunnel direct start db-prod -L 127.0.0.1:15432:db.internal:5432 --no-input"
         }
-        TunnelRoute::Paired => {
+        Some(TunnelRoute::Paired) => {
             "sshx tunnel paired start vm-alias --forward 5432=15432 --no-input"
         }
+        None => "sshx tunnel start db-prod --forward 5432=15432 --no-input",
+    };
+    let purpose = match route {
+        Some(TunnelRoute::Direct) => "Start a standalone direct tunnel and return its persisted ID.",
+        Some(TunnelRoute::Paired) => "Start a standalone paired tunnel and return its persisted ID.",
+        None => "Start a standalone tunnel with its HostEntry route and return its persisted ID.",
     };
     page(
         &command_path,
-        &format!("Start a standalone {route_name} tunnel and return its persisted ID."),
+        purpose,
         &usage,
         &arguments,
         TUNNEL_OPTIONS,

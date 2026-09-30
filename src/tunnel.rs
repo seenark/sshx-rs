@@ -18,6 +18,31 @@ static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub type ForwardSpec = session::ForwardSpec;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TunnelRoute {
+    Direct,
+    Paired,
+}
+
+impl TunnelRoute {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Paired => "paired",
+        }
+    }
+
+    pub fn check(self, kind: &str) -> Result<(), String> {
+        if self.as_str() != kind {
+            return Err(format!(
+                "TUNNEL_ROUTE_MISMATCH: expected {} route, found {kind}",
+                self.as_str()
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct PairedRegistry {
     gateway_entry_id: String,
@@ -470,7 +495,7 @@ fn existing_registry(home: &Path) -> Option<(PathBuf, RegistryFile)> {
     Some((root, registry))
 }
 
-pub fn list(home: &Path) -> Result<TunnelResponse, String> {
+pub fn list(home: &Path, route: Option<TunnelRoute>) -> Result<TunnelResponse, String> {
     let root = registry_root(home);
     if matches!(fs::symlink_metadata(&root), Err(error) if error.kind() == std::io::ErrorKind::NotFound) {
         return Ok(TunnelResponse {
@@ -482,11 +507,13 @@ pub fn list(home: &Path) -> Result<TunnelResponse, String> {
     let registry = read_registry(&root)?;
     Ok(TunnelResponse {
         operation: "list".to_string(),
-        tunnels: registry.tunnels.iter().map(view).collect(),
+        tunnels: registry.tunnels.iter()
+            .filter(|record| route.is_none_or(|route| record.kind == route.as_str()))
+            .map(view).collect(),
     })
 }
 
-pub fn status(home: &Path, id: &str) -> Result<TunnelResponse, String> {
+pub fn status(home: &Path, id: &str, route: Option<TunnelRoute>) -> Result<TunnelResponse, String> {
     let root = registry_root(home);
     ensure_private_tree(&root)?;
     let registry = read_registry(&root)?;
@@ -495,13 +522,16 @@ pub fn status(home: &Path, id: &str) -> Result<TunnelResponse, String> {
         .iter()
         .find(|record| record.id == id)
         .ok_or_else(|| format!("TUNNEL_NOT_FOUND: tunnel `{id}` does not exist"))?;
+    if let Some(route) = route {
+        route.check(&record.kind)?;
+    }
     Ok(TunnelResponse {
         operation: "status".to_string(),
         tunnels: vec![view(record)],
     })
 }
 
-pub fn stop(home: &Path, id: &str) -> Result<TunnelResponse, String> {
+pub fn stop(home: &Path, id: &str, route: Option<TunnelRoute>) -> Result<TunnelResponse, String> {
     let root = registry_root(home);
     ensure_private_tree(&root)?;
     let _lock = RegistryLock::acquire(&root)?;
@@ -511,6 +541,9 @@ pub fn stop(home: &Path, id: &str) -> Result<TunnelResponse, String> {
         .iter()
         .position(|record| record.id == id)
         .ok_or_else(|| format!("TUNNEL_NOT_FOUND: tunnel `{id}` does not exist"))?;
+    if let Some(route) = route {
+        route.check(&registry.tunnels[index].kind)?;
+    }
     if registry.tunnels[index].kind == "paired" {
         validate_pair_control_reference(&root, &registry.tunnels[index])?;
     } else {
@@ -540,6 +573,7 @@ pub fn restart(
     entries: &[HostEntry],
     home: &Path,
     id: &str,
+    expected_route: Option<TunnelRoute>,
     no_input: bool,
     password_fd: Option<i32>,
     gateway_password_fd: Option<i32>,
@@ -554,6 +588,9 @@ pub fn restart(
         .find(|record| record.id == id)
         .ok_or_else(|| format!("TUNNEL_NOT_FOUND: tunnel `{id}` does not exist"))?
         .clone();
+    if let Some(route) = expected_route {
+        route.check(&record.kind)?;
+    }
     if record.kind == "paired" {
         let pair = record
             .pair
@@ -576,7 +613,7 @@ pub fn restart(
         })?;
         validate_paired_record(&route, pair)?;
         if record.state != "stopped" {
-            let _ = stop(home, id)?;
+            let _ = stop(home, id, expected_route)?;
         }
         let forwards = record
             .forwards
@@ -610,7 +647,7 @@ pub fn restart(
         return Err("CONFIG_CHANGED: selected HostEntry changed on disk".to_string());
     }
     if record.state != "stopped" {
-        let _ = stop(home, id)?;
+        let _ = stop(home, id, expected_route)?;
     }
     let mut local = Vec::new();
     let mut remote = Vec::new();

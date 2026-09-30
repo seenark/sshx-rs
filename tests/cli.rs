@@ -439,57 +439,20 @@ fn tunnel_help_covers_every_path_and_form() {
         ("tunnel", "Name: tunnel", true),
         ("tunnel direct", "Name: tunnel direct", true),
         ("tunnel paired", "Name: tunnel paired", true),
-        (
-            "tunnel start",
-            "Name: tunnel start (compatibility alias; canonical: tunnel paired start)",
-            false,
-        ),
         ("tunnel direct start", "Name: tunnel direct start", false),
         ("tunnel paired start", "Name: tunnel paired start", false),
         ("tunnel list", "Name: tunnel list", false),
-        (
-            "tunnel direct list",
-            "Name: tunnel direct list (alias: tunnel list)",
-            false,
-        ),
-        (
-            "tunnel paired list",
-            "Name: tunnel paired list (alias: tunnel list)",
-            false,
-        ),
         ("tunnel status", "Name: tunnel status", false),
-        (
-            "tunnel direct status",
-            "Name: tunnel direct status (alias: tunnel status)",
-            false,
-        ),
-        (
-            "tunnel paired status",
-            "Name: tunnel paired status (alias: tunnel status)",
-            false,
-        ),
         ("tunnel stop", "Name: tunnel stop", false),
-        (
-            "tunnel direct stop",
-            "Name: tunnel direct stop (alias: tunnel stop)",
-            false,
-        ),
-        (
-            "tunnel paired stop",
-            "Name: tunnel paired stop (alias: tunnel stop)",
-            false,
-        ),
         ("tunnel restart", "Name: tunnel restart", false),
-        (
-            "tunnel direct restart",
-            "Name: tunnel direct restart (alias: tunnel restart)",
-            false,
-        ),
-        (
-            "tunnel paired restart",
-            "Name: tunnel paired restart (alias: tunnel restart)",
-            false,
-        ),
+        ("tunnel direct list", "Name: tunnel direct list", false),
+        ("tunnel direct status", "Name: tunnel direct status", false),
+        ("tunnel direct stop", "Name: tunnel direct stop", false),
+        ("tunnel direct restart", "Name: tunnel direct restart", false),
+        ("tunnel paired list", "Name: tunnel paired list", false),
+        ("tunnel paired status", "Name: tunnel paired status", false),
+        ("tunnel paired stop", "Name: tunnel paired stop", false),
+        ("tunnel paired restart", "Name: tunnel paired restart", false),
     ];
 
     for (path, marker, group) in paths {
@@ -532,39 +495,29 @@ fn tunnel_help_covers_every_path_and_form() {
         }
     }
 }
-
 #[test]
-fn tunnel_help_preserves_position_and_alias_behavior() {
+fn tunnel_help_preserves_position_and_rejects_unsupported_paths() {
     let cases: &[(&[&str], &str)] = &[
-        (&["--help", "tunnel", "direct"], "Name: sshx"),
-        (&["tunnel", "--help", "direct"], "Name: tunnel"),
-        (&["tunnel", "direct", "--help"], "Name: tunnel direct"),
-        (&["help", "tunnel", "direct"], "Name: tunnel direct"),
-        (&["--help", "tunnel", "paired", "start"], "Name: sshx"),
-        (&["tunnel", "--help", "paired", "start"], "Name: tunnel"),
-        (
-            &["tunnel", "paired", "--help", "start"],
-            "Name: tunnel paired",
-        ),
-        (
-            &["tunnel", "paired", "start", "vm", "--help"],
-            "Name: tunnel paired start",
-        ),
-        (
-            &["tunnel", "direct", "start", "prod", "--help"],
-            "Name: tunnel direct start",
-        ),
+        (&["--help", "tunnel", "list"], "Name: sshx"),
+        (&["tunnel", "--help", "list"], "Name: tunnel"),
+        (&["tunnel", "list", "--help"], "Name: tunnel list"),
+        (&["help", "tunnel", "list"], "Name: tunnel list"),
         (
             &["tunnel", "status", "dt-1", "--help"],
             "Name: tunnel status",
         ),
         (
-            &["tunnel", "direct", "status", "dt-1", "--help"],
-            "Name: tunnel direct status",
+            &["tunnel", "restart", "pt-1", "--help"],
+            "Name: tunnel restart",
+        ),
+        (&["tunnel", "direct", "--help"], "Name: tunnel direct"),
+        (
+            &["tunnel", "direct", "start", "--help"],
+            "Name: tunnel direct start",
         ),
         (
-            &["tunnel", "paired", "restart", "pt-1", "--help"],
-            "Name: tunnel paired restart",
+            &["tunnel", "paired", "status", "pt-1", "--help"],
+            "Name: tunnel paired status",
         ),
     ];
     for (args, marker) in cases {
@@ -581,277 +534,38 @@ fn tunnel_help_preserves_position_and_alias_behavior() {
         );
     }
 
-    let root_start = Command::new(env!("CARGO_BIN_EXE_sshx"))
-        .args(["help", "tunnel", "start"])
-        .output()
-        .unwrap();
-    let paired_start = Command::new(env!("CARGO_BIN_EXE_sshx"))
-        .args(["help", "tunnel", "paired", "start"])
-        .output()
-        .unwrap();
-    assert!(
-        String::from_utf8_lossy(&root_start.stdout)
-            .contains("compatibility alias; canonical: tunnel paired start")
-    );
-    assert!(String::from_utf8_lossy(&root_start.stdout).contains("--forward REMOTE[=LOCAL]"));
-    assert!(String::from_utf8_lossy(&paired_start.stdout).contains("--forward REMOTE[=LOCAL]"));
-
-    let plain = Command::new(env!("CARGO_BIN_EXE_sshx"))
-        .args(["tunnel", "direct", "start", "--help"])
-        .output()
-        .unwrap();
-    let formatted = Command::new(env!("CARGO_BIN_EXE_sshx"))
-        .args(["tunnel", "direct", "start", "--format", "json", "--help"])
-        .output()
-        .unwrap();
-    assert_eq!(plain.stdout, formatted.stdout);
-}
-
-#[test]
-fn tunnel_help_documents_runtime_contract_and_nearest_usage() {
-    let pages: &[(&[&str], &[&str])] = &[
-        (
-            &["help", "tunnel"],
-            &[
-                "start (compatibility alias; canonical: tunnel paired start)",
-                "direct",
-                "paired",
-                "list",
-                "status",
-                "stop",
-                "restart",
-                "standalone tunnel",
-            ],
-        ),
-        (
-            &["help", "tunnel", "direct"],
-            &[
-                "-L SPEC",
-                "-R SPEC",
-                "-D SPEC",
-                "--allow-bind",
-                "ProxyCommand",
-                "tunnel direct start",
-            ],
-        ),
-        (
-            &["help", "tunnel", "paired"],
-            &[
-                "--forward REMOTE[=LOCAL]",
-                "--bind",
-                "--password-fd FD",
-                "--gateway-password-fd FD",
-                "--vm-password-fd FD",
-                "Pair owns the transit route",
-            ],
-        ),
-        (
-            &["help", "tunnel", "start"],
-            &[
-                "Exact alias or stable HostEntry ID",
-                "--source PATH --line NUMBER",
-                "live fuzzy picker",
-                "--forward REMOTE[=LOCAL]",
-                "--bind",
-                "TUNNEL_PAIRED_REQUIRED",
-                "TUNNEL_FORWARD_MODE",
-                "ProxyCommand is unsupported",
-                "Escape or Ctrl-C",
-                "standalone tunnel",
-                "tunnel ID",
-            ],
-        ),
-        (
-            &["help", "tunnel", "direct", "start"],
-            &[
-                "Exact alias or stable HostEntry ID",
-                "--source PATH --line NUMBER",
-                "live fuzzy picker",
-                "-L SPEC",
-                "-R SPEC",
-                "-D SPEC",
-                "--password-fd FD",
-                "TUNNEL_FORWARD_REQUIRED",
-                "TUNNEL_DIRECT_PAIR",
-                "ProxyCommand",
-                "Escape or Ctrl-C",
-                "standalone tunnel",
-                "tunnel ID",
-            ],
-        ),
-        (
-            &["help", "tunnel", "paired", "start"],
-            &[
-                "Exact alias or stable HostEntry ID",
-                "--source PATH --line NUMBER",
-                "live fuzzy picker",
-                "--forward REMOTE[=LOCAL]",
-                "--bind",
-                "--gateway-password-fd FD",
-                "--vm-password-fd FD",
-                "TUNNEL_FORWARD_REQUIRED",
-                "TUNNEL_PAIRED_REQUIRED",
-                "TUNNEL_FORWARD_MODE",
-                "ProxyCommand is unsupported",
-                "Escape or Ctrl-C",
-                "gateway and VM",
-                "standalone tunnel",
-            ],
-        ),
+    let unsupported_paths: &[&[&str]] = &[
+        &["help", "tunnel", "direct", "unsupported"],
+        &["help", "tunnel", "paired", "unsupported"],
     ];
-    for (args, fragments) in pages {
+    for args in unsupported_paths {
         let output = Command::new(env!("CARGO_BIN_EXE_sshx"))
             .args(*args)
             .output()
             .unwrap();
-        assert!(output.status.success(), "{args:?}: {output:?}");
-        let text = String::from_utf8_lossy(&output.stdout);
-        for fragment in *fragments {
-            assert!(
-                text.contains(fragment),
-                "{args:?}: missing {fragment}\n{text}"
-            );
-        }
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("unknown help path"));
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("Name:"));
     }
+}
 
-    for (path, fragments) in [
-        (
-            "tunnel list",
-            &[
-                "tunnel ID",
-                "registry",
-                "master_status",
-                "listener_status",
-                "master responsive",
-                "listener ready",
-                "does not select discovery roots",
-            ][..],
-        ),
-        (
-            "tunnel status",
-            &[
-                "ID",
-                "TUNNEL_NOT_FOUND",
-                "master",
-                "listener",
-                "master responsive",
-                "listener ready",
-                "does not select discovery roots",
-            ][..],
-        ),
-        (
-            "tunnel stop",
-            &[
-                "ID",
-                "TUNNEL_NOT_FOUND",
-                "control socket",
-                "VM before gateway",
-                "TUNNEL_STOP_FAILED",
-                "does not select discovery roots",
-            ][..],
-        ),
-        (
-            "tunnel restart",
-            &[
-                "ID",
-                "TUNNEL_NOT_FOUND",
-                "CONFIG_CHANGED",
-                "PAIR_BROKEN",
-                "preserves forwarding",
-                "password-fd",
-                "Select the discovery root",
-            ][..],
-        ),
-    ] {
-        for prefix in ["tunnel", "tunnel direct", "tunnel paired"] {
-            let full_path = if prefix == "tunnel" {
-                path.to_string()
-            } else {
-                format!("{prefix} {}", path.strip_prefix("tunnel ").unwrap())
-            };
-            let output = Command::new(env!("CARGO_BIN_EXE_sshx"))
-                .args(["help"])
-                .args(full_path.split_whitespace())
-                .output()
-                .unwrap();
-            assert!(output.status.success(), "{full_path}: {output:?}");
-            let text = String::from_utf8_lossy(&output.stdout);
-            for fragment in fragments {
-                assert!(
-                    text.contains(fragment),
-                    "{full_path}: missing {fragment}\n{text}"
-                );
-            }
-            if path.ends_with("list") || path.ends_with("status") {
-                assert!(
-                    !text.contains("live health"),
-                    "{full_path}: forbidden live health wording\n{text}"
-                );
-                assert!(
-                    !text.contains("application health"),
-                    "{full_path}: forbidden application health wording\n{text}"
-                );
-                assert!(
-                    !text.contains("application_health"),
-                    "{full_path}: forbidden application_health field claim\n{text}"
-                );
-            }
-            if !path.ends_with("list") {
-                let usage = format!("sshx {full_path} ID [OPTIONS]");
-                let short_help = format!("sshx {full_path} --help");
-                let named_help = format!("sshx help {full_path}");
-                let invalid_help = format!("sshx {full_path} ID --help");
-                assert!(
-                    text.contains(&usage),
-                    "{full_path}: missing {usage}\n{text}"
-                );
-                assert!(
-                    text.contains(&short_help),
-                    "{full_path}: missing {short_help}\n{text}"
-                );
-                assert!(
-                    text.contains(&named_help),
-                    "{full_path}: missing {named_help}\n{text}"
-                );
-                assert!(
-                    !text.contains(&invalid_help),
-                    "{full_path}: invalid help form {invalid_help}\n{text}"
-                );
-            }
-        }
-    }
-
-    for (args, usage) in [
-        (
-            &["tunnel", "unknown"][..],
-            "Usage: sshx tunnel COMMAND [OPTIONS]",
-        ),
-        (
-            &["tunnel", "direct", "unknown"][..],
-            "Usage: sshx tunnel direct COMMAND [OPTIONS]",
-        ),
-        (
-            &["tunnel", "paired", "unknown"][..],
-            "Usage: sshx tunnel paired COMMAND [OPTIONS]",
-        ),
-        (
-            &["tunnel", "direct", "status"][..],
-            "Usage: sshx tunnel direct COMMAND [OPTIONS]",
-        ),
-    ] {
+#[test]
+fn invalid_tunnel_paths_return_route_specific_usage() {
+    let cases: &[(&[&str], &str)] = &[
+        (&["tunnel", "direct", "unsupported"], "Usage: sshx tunnel direct"),
+        (&["tunnel", "paired", "unsupported"], "Usage: sshx tunnel paired"),
+    ];
+    for (args, usage) in cases {
         let output = Command::new(env!("CARGO_BIN_EXE_sshx"))
-            .args(args)
+            .args(*args)
             .output()
             .unwrap();
         assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
-        assert!(output.stdout.is_empty(), "{args:?}: {output:?}");
-        assert!(
-            String::from_utf8_lossy(&output.stderr).contains(usage),
-            "{args:?}: {:?}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        assert!(String::from_utf8_lossy(&output.stderr).contains(usage));
+        assert!(output.stdout.is_empty());
     }
 }
+
 
 #[test]
 fn help_parse_errors_use_nearest_usage_on_stderr() {

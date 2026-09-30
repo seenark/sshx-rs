@@ -191,6 +191,8 @@ sshx connect vm-alias --forward 5432=15432 --forward 6379
 
 A **standalone tunnel** owns its detached OpenSSH master, control socket, runtime config, listeners, and Pair dependencies. Ownership is recorded in the locked registry; a PID alone never proves ownership.
 
+`sshx tunnel HOST` and `sshx tunnel start HOST` select the HostEntry's route automatically. Host aliases named `direct` or `paired` remain valid in the automatic form. Use `tunnel direct start HOST` or `tunnel paired start HOST` to require a route; a mismatch returns `TUNNEL_ROUTE_MISMATCH` without starting a Tunnel. Route-specific lists contain only that route's records, and status, stop, and restart reject IDs belonging to the other route before changing owned resources. All forms use the same persisted registry.
+
 Start a direct tunnel and return to the shell:
 
 ```sh
@@ -199,7 +201,7 @@ sshx tunnel direct start db-prod \
   --no-input
 ```
 
-Manage it from another process:
+Manage direct tunnels by persisted Tunnel ID from another process:
 
 ```sh
 sshx tunnel direct list
@@ -208,14 +210,19 @@ sshx tunnel direct restart <tunnel-id>
 sshx tunnel direct stop <tunnel-id>
 ```
 
-Start a Pair-owned standalone tunnel:
+Start a Pair-owned standalone tunnel and manage its IDs:
 
 ```sh
 sshx tunnel paired start vm-alias --forward 5432=15432 --no-input
 sshx tunnel paired list
+sshx tunnel paired status <tunnel-id>
+sshx tunnel paired restart <tunnel-id>
+sshx tunnel paired stop <tunnel-id>
 ```
 
 Only an exact active request can reuse its persisted tunnel ID. Different source identities, routes, or forwards do not share a tunnel. If a control socket is dead, status reports stale/down evidence and does not reconnect automatically or kill an unproved process.
+
+With usable interactive terminals, `sshx tunnel status` and `sshx tunnel stop` open the Tunnels workspace for exact ID selection. Route-specific forms also work. `--no-input`, machine output, and pipes stay CLI-only and require an ID.
 
 ## Local verification boundary
 
