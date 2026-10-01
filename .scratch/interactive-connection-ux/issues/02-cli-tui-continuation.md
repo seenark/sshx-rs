@@ -39,6 +39,8 @@ The three ticket-owned failures in `artifact://1404` are repaired without runtim
 
 Current-worktree verification passes: `cargo check --offline --bin sshx`; all three focused regressions; 10 `continuation_` tests; 12 `selectorless_` tests; and the exact noninteractive-precedence test (26 scoped CLI tests total).
 
+All three focused regressions also pass from an isolated archive of commit `930a95f`, excluding unrelated worktree changes. Independent Standards and Spec reviews of `930a95f` each report zero findings.
+
 Separate actual-binary PTY/VT smoke proves full derived-ID source identity at 18×12 without forced redraws; editable exact secondary alias/ID/source/line selection; persisted Tunnel ID inspection and stop closing its listener; and pre-start interruption followed by cancellation `130`. Complete connect, help, version, and JSON inspection also exit directly on a usable PTY without opening the TUI. Source bytes remain unchanged and smoke fixtures are removed. This is fixture/local validation only, not user-server validation.
 
 Implementation and ticket-owned verification are complete. Status remains `ready-for-agent` solely because the required integrated project-wide suite is still Main's gate after the remaining tickets; `artifact://1404` is not a green run. No unrelated dirty hunks or ignored files are staged.
