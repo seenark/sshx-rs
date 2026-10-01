@@ -4562,6 +4562,183 @@ fn strip_ansi(input: &[u8]) -> Vec<u8> {
 }
 
 
+#[cfg(unix)]
+#[test]
+fn connect_picker_scrolls_full_source_identity_on_compact_terminal() {
+    let (root, home) = fixture_root();
+    let common = format!("{}/{}", "common".repeat(8), "prefix".repeat(8));
+    let first = format!("{common}/alpha/hosts.conf");
+    let second = format!("{common}/beta/hosts.conf");
+    write(
+        &home.join(".ssh/config"),
+        &format!("Include {first}\nInclude {second}\n"),
+    );
+    write(
+        &home.join(".ssh").join(&first),
+        "Host duplicate\n  HostName same.example\n",
+    );
+    write(
+        &home.join(".ssh").join(&second),
+        "Host duplicate\n  HostName same.example\n",
+    );
+    let bin = fake_ssh(&root);
+    let (status, output) = run_with_pty_interactions_with_terminal_hook(
+        &home,
+        &["connect"],
+        &bin,
+        &root,
+        &[
+            (b"Search:", b"\x1b[B\t"),
+            (b"ID:", b"\t"),
+            (b"PgUp/Dn", b"\x1b[6~"),
+            (b"PgUp/Dn", b"\x1b[6~"),
+            (b"PgUp/Dn", b"\x1b[6~"),
+            (b"PgUp/Dn", b"\x1b[6~"),
+            (b"PgUp/Dn", b"\x1b"),
+        ],
+        None,
+        Some((18, 12)),
+        |index, terminal| {
+            if index > 0 {
+                // Resize forces a complete frame instead of diff-only PTY text.
+                let dimensions = libc::winsize {
+                    ws_col: if index % 2 == 0 { 18 } else { 19 },
+                    ws_row: 12,
+                    ws_xpixel: 0,
+                    ws_ypixel: 0,
+                };
+                assert_eq!(unsafe { libc::ioctl(terminal, libc::TIOCSWINSZ, &dimensions) }, 0);
+            }
+        },
+    );
+    assert_eq!(status.code(), Some(130), "output={output}");
+    assert!(output.contains("beta"), "output={output}");
+    assert!(
+        contains_tui_text(output.as_bytes(), b"beta/hosts.conf"),
+        "output={output}"
+    );
+    assert!(!root.join("master-started").exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+
+#[cfg(unix)]
+#[test]
+fn missing_tunnel_status_id_continues_in_tunnels_workspace() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(&config, "Host direct\n  HostName direct.example\n");
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let local_port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let bin = fake_tunnel_ssh(&root);
+    let local_forward = format!("127.0.0.1:{local_port}:127.0.0.1:22");
+    let started = run_fake_ssh(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "tunnel",
+            "direct",
+            "start",
+            "direct",
+            "-L",
+            local_forward.as_str(),
+            "--no-input",
+            "--format",
+            "json",
+        ],
+        &bin,
+        &root,
+    );
+    assert!(started.status.success(), "{started:?}");
+    let document: serde_json::Value = serde_json::from_slice(&started.stdout).unwrap();
+    let id = document["tunnels"][0]["id"].as_str().unwrap().to_string();
+
+    let (status, output) = run_with_pty_interactions(
+        &home,
+        &["tunnel", "status"],
+        &bin,
+        &root,
+        &[(b"ID:", b"\r"), (b"ID:", b"\x1b")],
+        None,
+        Some((100, 30)),
+    );
+    assert!(status.success(), "status={status:?} output={output}");
+    assert!(contains_tui_text(output.as_bytes(), id.as_bytes()), "{output}");
+    let inspected = run_fake_ssh(
+        &home,
+        &["tunnel", "status", &id, "--no-input", "--format", "json"],
+        &bin,
+        &root,
+    );
+    assert!(inspected.status.success(), "{inspected:?}");
+    let inspection: serde_json::Value = serde_json::from_slice(&inspected.stdout).unwrap();
+    assert_eq!(inspection["tunnels"][0]["id"], id);
+    assert_eq!(inspection["tunnels"][0]["master_status"], "responsive");
+
+    let stopped = run_fake_ssh(
+        &home,
+        &["tunnel", "stop", &id, "--no-input"],
+        &bin,
+        &root,
+    );
+    assert!(stopped.status.success(), "{stopped:?}");
+    fs::remove_dir_all(root).unwrap();
+}
+
+
+#[cfg(unix)]
+#[test]
+fn pre_start_interrupt_remains_cancellable_from_tui() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(&config, "Host direct\n  HostName direct.example\n");
+    let bin = fake_ssh(&root);
+    let ssh = bin.join("ssh");
+    let script = fs::read_to_string(&ssh).unwrap();
+    let needle = "  *\" -N \"*)\n";
+    let interrupt = concat!(
+        "  *\" -N \"*)\n",
+        "    kill -INT \"$PPID\"\n",
+        "    exit 5\n",
+    );
+    assert!(script.contains(needle));
+    fs::write(&ssh, script.replacen(needle, interrupt, 1)).unwrap();
+    let (status, output) = run_with_pty_interactions(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "tui",
+            "connect",
+            "direct",
+        ],
+        &bin,
+        &root,
+        &[
+            (b"Search:", b"\r"),
+            (b"Connection workspace", b"\r"),
+            (b"Enter confirm", b"\r"),
+            (b"SESSION_START_INTERRUPTED", b"\x1b"),
+            (b"Search:", b"\x1b"),
+        ],
+        None,
+        None,
+    );
+    assert_eq!(status.code(), Some(130), "status={status:?} output={output}");
+    assert!(output.contains("SESSION_START_INTERRUPTED"), "{output}");
+    assert!(!root.join("master-started").exists());
+    assert_eq!(fs::read_to_string(&config).unwrap(), "Host direct\n  HostName direct.example\n");
+    assert!(!home.join(".config/sshx/tunnels.json").exists());
+    assert!(!home.join(".config/sshx/config.json").exists());
+    assert!(!root.join("clipboard-content").exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
 fn run_with_pty_interactions_with_hook(
     home: &Path,
     args: &[&str],
@@ -4571,6 +4748,25 @@ fn run_with_pty_interactions_with_hook(
     inherited_path: Option<&str>,
     size: Option<(u16, u16)>,
     mut after_render: impl FnMut(usize),
+) -> (std::process::ExitStatus, String) {
+    run_with_pty_interactions_with_terminal_hook(
+        home, args, bin, root, interactions, inherited_path, size,
+        |index, _| after_render(index),
+    )
+}
+
+
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn run_with_pty_interactions_with_terminal_hook(
+    home: &Path,
+    args: &[&str],
+    bin: &Path,
+    root: &Path,
+    interactions: &[(&[u8], &[u8])],
+    inherited_path: Option<&str>,
+    size: Option<(u16, u16)>,
+    mut after_render: impl FnMut(usize, libc::c_int),
 ) -> (std::process::ExitStatus, String) {
     let mut master = -1;
     let mut slave = -1;
@@ -4721,7 +4917,7 @@ fn run_with_pty_interactions_with_hook(
             );
             std::thread::sleep(Duration::from_millis(10));
         }
-        after_render(index);
+        after_render(index, master.as_raw_fd());
         master.write_all(input).expect("pty input should write");
     }
 

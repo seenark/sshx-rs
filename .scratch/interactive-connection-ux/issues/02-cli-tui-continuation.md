@@ -32,3 +32,13 @@ Of the failures in `artifact://1035`, 64 CLI failures and the Tunnel route-misma
 Commit `7db08e0` contains the isolated Hosts regression changes. Deleting `explicit_tui_id_prefill_can_search_to_another_host` and `explicit_tui_source_prefill_can_choose_another_duplicate_host` remains within the existing shared `tests/cli.rs` worktree changes: neither test exists in `HEAD`, so those deletions cannot be committed independently without including unrelated work. No ignored file was force-added, and no unchanged failing full suite was rerun.
 
 Second-attempt independent review: Standards reports no documented-standard breaches or actionable smells; Spec reports no missing requirements, wrong behavior, or scope creep in the isolated commit and supplemental CLI deletions. Both axes have zero findings. The remaining blocker is Main's required green project-wide run, not an unverified ticket-owned runtime change.
+
+### New authorized run verification
+
+The three ticket-owned failures in `artifact://1404` are repaired without runtime changes. Compact source identity now captures complete redraws while resizing between 18 and 19 columns, preserving the derived-ID, full `beta/hosts.conf`, cancellation `130`, and no-start checks. An obsolete footer wording assertion was removed rather than re-pinned. Missing-ID Tunnel status explicitly exits its persistent workspace after inspection; exact persisted ID, responsive master, and stop-by-ID remain verified through the CLI. Pre-start SIGINT uses the current focused picker and review controls, then proves cancellation `130`, unchanged source, and no master, registry, settings, or clipboard side effect.
+
+Current-worktree verification passes: `cargo check --offline --bin sshx`; all three focused regressions; 10 `continuation_` tests; 12 `selectorless_` tests; and the exact noninteractive-precedence test (26 scoped CLI tests total).
+
+Separate actual-binary PTY/VT smoke proves full derived-ID source identity at 18×12 without forced redraws; editable exact secondary alias/ID/source/line selection; persisted Tunnel ID inspection and stop closing its listener; and pre-start interruption followed by cancellation `130`. Complete connect, help, version, and JSON inspection also exit directly on a usable PTY without opening the TUI. Source bytes remain unchanged and smoke fixtures are removed. This is fixture/local validation only, not user-server validation.
+
+Implementation and ticket-owned verification are complete. Status remains `ready-for-agent` solely because the required integrated project-wide suite is still Main's gate after the remaining tickets; `artifact://1404` is not a green run. No unrelated dirty hunks or ignored files are staged.
