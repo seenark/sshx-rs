@@ -60,6 +60,19 @@ fn pair_setup_recovers_interrupted_journal_only_after_explicit_consent() {
     assert_eq!(fs::read(&before).unwrap(), original[1].0);
     assert_eq!(fs::read(&after).unwrap(), interrupted.as_bytes());
 
+    let lock_file = fs::OpenOptions::new().read(true).write(true).open(&lock).unwrap();
+    assert_eq!(unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
+    let mut terminal = PairTerminal::open(&fixture, &arguments);
+    terminal.expect("Recover pending Pair mutation before setup?");
+    terminal.send(b"y\r");
+    assert_eq!(terminal.finish(), Some(2));
+    assert!(String::from_utf8_lossy(&terminal.output).contains("MUTATION_BUSY"));
+    fixture.assert_snapshot(&pending);
+    assert_eq!(fs::read(&journal).unwrap(), journal_bytes);
+    assert_eq!(fs::read(&before).unwrap(), original[1].0);
+    assert_eq!(fs::read(&after).unwrap(), interrupted.as_bytes());
+    drop(lock_file);
+
     let mut terminal = PairTerminal::open(&fixture, &arguments);
     terminal.expect("Pending Pair mutation affects:");
     terminal.expect("Recover pending Pair mutation before setup?");
@@ -74,6 +87,29 @@ fn pair_setup_recovers_interrupted_journal_only_after_explicit_consent() {
     assert_eq!(terminal.finish(), Some(130));
     fixture.assert_snapshot(&original);
     assert_eq!(fixture.pairs()["pairs"], serde_json::json!([]));
+}
+
+#[test]
+fn malformed_pending_pair_journal_refuses_preview_and_setup_without_mutation() {
+    let fixture = PairFixture::new("malformed-journal-pair");
+    let before = fixture.snapshot();
+    let journal = fixture.gateway.with_file_name(".gateway-source.sshx.lock.journal");
+    let journal_bytes = b"{ invalid journal";
+    fs::write(&journal, journal_bytes).unwrap();
+    for mode in ["--preview", "--yes"] {
+        let arguments = ["pair", "setup", "gateway", "vm",
+            "--vm-source", fixture.vm.to_str().unwrap(), "--vm-line", "1",
+            "--transit-host", "127.0.0.1", "--transit-port", "2222", mode];
+        let output = fixture.command().args(arguments).arg("--no-input").output().unwrap();
+        assert_eq!(output.status.code(), Some(2), "{mode}: {output:?}");
+        fixture.assert_snapshot(&before);
+        assert_eq!(fs::read(&journal).unwrap(), journal_bytes);
+
+        let mut terminal = PairTerminal::open(&fixture, &arguments);
+        assert_eq!(terminal.finish(), Some(2), "{mode}");
+        fixture.assert_snapshot(&before);
+        assert_eq!(fs::read(&journal).unwrap(), journal_bytes);
+    }
 }
 
 #[test]
@@ -121,6 +157,82 @@ fn partial_pair_setup_reviews_exact_duplicate_vm_and_chosen_transit_before_apply
 }
 
 #[test]
+fn pairs_tab_reviews_exact_secondary_alias_sources_then_refreshes_applied_record() {
+    let fixture = PairFixture::new("tab-exact-pair");
+    let first_gateway = fixture.home.join(".ssh/first-gateway");
+    let first_gateway_bytes = b"Host gateway gw\n  HostName decoy-gateway.example\n  LocalForward 127.0.0.1:12224 127.0.0.3:2222\n";
+    fs::write(&first_gateway, first_gateway_bytes).unwrap();
+    fs::set_permissions(&first_gateway, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::write(&fixture.config, "Include first-gateway gateway-source first-vm second-vm\n").unwrap();
+    for (source, original, aliases) in [
+        (&fixture.gateway, "Host gateway\n", "Host gateway gw\n"),
+        (&fixture.decoy, "Host vm\n", "Host vm machine\n"),
+        (&fixture.vm, "Host vm\n", "Host vm machine\n"),
+    ] {
+        let bytes = fs::read_to_string(source).unwrap().replace(original, aliases);
+        fs::write(source, bytes).unwrap();
+    }
+    let before = fixture.snapshot();
+    let mut terminal = PairTerminal::open(&fixture, &[]);
+    terminal.expect("sshx Hosts");
+    terminal.send(b"\x10");
+    terminal.expect("No valid Pair relationships.");
+    terminal.send(b"s");
+    terminal.expect("Pair setup");
+    terminal.send(b"gw\x1b[B");
+    terminal.expect("gateway-source");
+    terminal.send(b"\r");
+    terminal.expect("Gateway: gw");
+    terminal.send(b"machine\x1b[B");
+    terminal.expect("second-vm");
+    terminal.send(b"\r\x13");
+    terminal.expect("TRANSIT_REQUIRED");
+    fixture.assert_snapshot(&before);
+    terminal.send(b"\x0e\x0e\x13");
+    terminal.expect("Review Pair changes");
+    terminal.expect("Gateway: gw");
+    terminal.expect("VM: machine");
+    terminal.expect("Transit: 127.0.0.2:2222");
+    fixture.assert_snapshot(&before);
+    assert_eq!(fs::read(&first_gateway).unwrap(), first_gateway_bytes);
+    terminal.send(b"\x1b");
+    terminal.expect_absent("Review Pair changes");
+    fixture.assert_snapshot(&before);
+    assert_eq!(fixture.pairs()["pairs"], serde_json::json!([]));
+    terminal.send(b"\x13");
+    terminal.expect("Review Pair changes");
+    fixture.assert_snapshot(&before);
+    terminal.send(b"\r");
+    terminal.expect("Pair saved.");
+    terminal.send(b"\x1b");
+    terminal.expect("Pair setup complete.");
+    let pairs = fixture.pairs();
+    assert_eq!(pairs["pairs"].as_array().unwrap().len(), 1);
+    let pair = &pairs["pairs"][0];
+    terminal.expect(pair["gateway_id"].as_str().unwrap());
+    terminal.expect(pair["vm_id"].as_str().unwrap());
+    assert_eq!(pair["transit_host"], "127.0.0.2");
+    assert_eq!(pair["transit_port"], 2222);
+    let gateway = fs::read_to_string(&fixture.gateway).unwrap();
+    let vm = fs::read_to_string(&fixture.vm).unwrap();
+    assert!(gateway.contains("Host gateway gw\n"));
+    assert!(vm.contains("Host vm machine\n"));
+    assert!(gateway.contains(&format!("##SSHX VM={}", pair["vm_id"].as_str().unwrap())));
+    assert!(vm.contains(&format!("##SSHX GATEWAY={}", pair["gateway_id"].as_str().unwrap())));
+    assert!(vm.contains("##SSHX TRANSIT=127.0.0.2:2222"));
+    assert_eq!(fs::read(&fixture.config).unwrap(), before[0].0);
+    assert_eq!(fs::read(&fixture.decoy).unwrap(), before[2].0);
+    assert_eq!(fs::read(&first_gateway).unwrap(), first_gateway_bytes);
+    for (source, (_, mode)) in fixture.sources().iter().zip(&before) {
+        assert_eq!(fs::metadata(source).unwrap().permissions().mode() & 0o777, *mode);
+    }
+    terminal.send(b"\x1b");
+    terminal.expect("sshx Hosts");
+    terminal.send(b"\x1b");
+    assert_eq!(terminal.finish(), Some(0));
+}
+
+#[test]
 fn pair_setup_review_and_interrupt_cancellation_preserve_all_sources() {
     let fixture = PairFixture::new("cancel-pair");
     let before = fixture.snapshot();
@@ -165,24 +277,38 @@ fn pair_setup_invalid_transit_keeps_workspace_open_without_partial_metadata() {
 }
 
 #[test]
-fn pair_setup_rejects_source_changes_after_review_without_writing_either_side() {
-    let fixture = PairFixture::new("stale-pair");
-    let mut terminal = PairTerminal::open(&fixture, &["tui", "pair", "setup", "gateway", "vm",
-        "--vm-source", fixture.vm.to_str().unwrap(), "--vm-line", "1",
-        "--transit-host", "127.0.0.1", "--transit-port", "2222"]);
-    terminal.expect("Pair setup");
-    terminal.send(b"\x13");
-    terminal.expect("Review Pair changes");
-    let external = format!("{}# external edit after review\n", fs::read_to_string(&fixture.vm).unwrap());
-    fs::write(&fixture.vm, external).unwrap();
-    let after_external_edit = fixture.snapshot();
-    terminal.send(b"\r");
-    terminal.expect("HOST_SOURCE_CHANGED");
-    fixture.assert_snapshot(&after_external_edit);
-    terminal.send(b"\x1b");
-    assert_eq!(terminal.finish(), Some(130));
-    fixture.assert_snapshot(&after_external_edit);
-    assert_eq!(fixture.pairs()["pairs"], serde_json::json!([]));
+fn pair_setup_rejects_source_changes_before_and_after_review_and_keeps_values_editable() {
+    for after_review in [false, true] {
+        let fixture = PairFixture::new("stale-pair");
+        let mut terminal = PairTerminal::open(&fixture, &["tui", "pair", "setup", "gateway", "vm",
+            "--vm-source", fixture.vm.to_str().unwrap(), "--vm-line", "1",
+            "--transit-host", "127.0.0.1", "--transit-port", "2222"]);
+        terminal.expect("Pair setup");
+        if after_review {
+            terminal.send(b"\x13");
+            terminal.expect("Review Pair changes");
+        }
+        let external = format!("{}# external edit\n", fs::read_to_string(&fixture.vm).unwrap());
+        fs::write(&fixture.vm, external).unwrap();
+        let after_external_edit = fixture.snapshot();
+        terminal.send(if after_review { b"\r" } else { b"\x13" });
+        terminal.expect("HOST_SOURCE_CHANGED");
+        terminal.expect("Gateway: gateway");
+        terminal.expect("VM: vm");
+        terminal.expect("second-vm");
+        terminal.expect("Transit host: 127.0.0.1");
+        terminal.expect("Transit port: 2222");
+        fixture.assert_snapshot(&after_external_edit);
+        terminal.send(b"\x0e\x0e");
+        terminal.expect("Transit host: 127.0.0.2");
+        terminal.send(b"\x13");
+        terminal.expect("HOST_SOURCE_CHANGED");
+        fixture.assert_snapshot(&after_external_edit);
+        terminal.send(b"\x1b");
+        assert_eq!(terminal.finish(), Some(130));
+        fixture.assert_snapshot(&after_external_edit);
+        assert_eq!(fixture.pairs()["pairs"], serde_json::json!([]));
+    }
 }
 
 #[test]

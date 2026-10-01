@@ -2926,6 +2926,7 @@ fn pair_setup_requires_explicit_transit_for_ambiguous_candidates() {
             "  Port 22\n",
         ),
     );
+    let original = fs::read(&config).unwrap();
     let missing = run(
         &home,
         &[
@@ -2941,9 +2942,9 @@ fn pair_setup_requires_explicit_transit_for_ambiguous_candidates() {
     );
     assert_eq!(missing.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&missing.stderr).contains("TRANSIT_REQUIRED"));
-    assert!(!fs::read_to_string(&config).unwrap().contains("##SSHX ID="));
+    assert_eq!(fs::read(&config).unwrap(), original);
 
-    let explicit = run(
+    let unmatched = run(
         &home,
         &[
             "--config",
@@ -2960,12 +2961,95 @@ fn pair_setup_requires_explicit_transit_for_ambiguous_candidates() {
             "--no-input",
         ],
     );
-    assert!(explicit.status.success(), "{explicit:?}");
-    assert!(
-        fs::read_to_string(&config)
-            .unwrap()
-            .contains("##SSHX TRANSIT=chosen.internal:22")
+    assert_eq!(unmatched.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&unmatched.stderr).contains("TRANSIT_MISMATCH"));
+    assert_eq!(fs::read(&config).unwrap(), original);
+    let wrong_vm_port = run(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "pair",
+            "setup",
+            "gateway",
+            "vm",
+            "--transit-host",
+            "first.internal",
+            "--transit-port",
+            "23",
+            "--yes",
+            "--no-input",
+        ],
     );
+    assert_eq!(wrong_vm_port.status.code(), Some(2));
+    assert_eq!(fs::read(&config).unwrap(), original);
+    write(
+        &config,
+        concat!(
+            "Host gateway\n",
+            "  HostName gateway.example\n",
+            "  LocalForward 2200 first.internal:22\n",
+            "  LocalForward 2201 second.internal:22\n",
+            "  LocalForward 2202 first.internal:22\n",
+            "Host vm\n",
+            "  HostName vm.internal\n",
+            "  Port 22\n",
+        ),
+    );
+    let ambiguous_source = fs::read(&config).unwrap();
+    let ambiguous = run(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "pair",
+            "setup",
+            "gateway",
+            "vm",
+            "--transit-host",
+            "first.internal",
+            "--transit-port",
+            "22",
+            "--yes",
+            "--no-input",
+        ],
+    );
+    assert_eq!(ambiguous.status.code(), Some(2));
+    assert_eq!(fs::read(&config).unwrap(), ambiguous_source);
+    write(
+        &config,
+        concat!(
+            "Host gateway\n",
+            "  HostName gateway.example\n",
+            "  LocalForward 2200 first.internal:22\n",
+            "  LocalForward 2201 second.internal:22\n",
+            "Host vm\n",
+            "  HostName vm.internal\n",
+            "  Port 22\n",
+        ),
+    );
+
+    let explicit = run(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "pair",
+            "setup",
+            "gateway",
+            "vm",
+            "--transit-host",
+            "first.internal",
+            "--transit-port",
+            "22",
+            "--yes",
+            "--no-input",
+        ],
+    );
+    assert!(explicit.status.success(), "{explicit:?}");
+    assert!(fs::read_to_string(&config)
+        .unwrap()
+        .contains("##SSHX TRANSIT=first.internal:22"));
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -3800,54 +3884,6 @@ fn hosts_tui_keeps_mutations_available_for_pair_gateway() {
     fs::remove_dir_all(root).unwrap();
 }
 
-#[cfg(unix)]
-#[test]
-fn pair_setup_picker_selects_gateway_and_vm_alias_rows() {
-    let (root, home) = fixture_root();
-    let config = home.join(".ssh/config");
-    write(
-        &config,
-        concat!(
-            "Host gateway gw\n",
-            "  HostName gateway.example\n",
-            "  LocalForward 2200 vm.internal:22\n",
-            "Host vm machine\n",
-            "  HostName vm.internal\n",
-            "  Port 22\n",
-        ),
-    );
-    let bin = fake_ssh(&root);
-    let (status, output) = run_with_pty_header(
-        &home,
-        &[
-            "--config",
-            config.to_str().unwrap(),
-            "pair",
-            "setup",
-            "--format",
-            "json",
-        ],
-        &bin,
-        &root,
-        b"gw\nmachine\ny\n",
-        b"sshx pair gateway picker",
-    );
-    assert!(status.success(), "status={status:?} output={output}");
-    assert!(output.contains("sshx pair vm picker"), "output={output}");
-    let document_start = output.find('{').expect("pair JSON should be rendered");
-    let document: serde_json::Value =
-        serde_json::from_str(&output[document_start..]).expect("pair JSON should parse");
-    let gateway_id = document["gateway_id"].as_str().unwrap();
-    let vm_id = document["vm_id"].as_str().unwrap();
-    let updated = fs::read_to_string(&config).unwrap();
-    assert!(updated.contains("Host gateway gw\n"));
-    assert!(updated.contains("Host vm machine\n"));
-    assert!(updated.contains(&format!("##SSHX ID={gateway_id}\n")));
-    assert!(updated.contains(&format!("##SSHX ID={vm_id}\n")));
-    assert!(updated.contains(&format!("##SSHX GATEWAY={gateway_id}\n")));
-    assert!(updated.contains(&format!("##SSHX VM={vm_id}\n")));
-    fs::remove_dir_all(root).unwrap();
-}
 
 
 

@@ -18,7 +18,7 @@ A live 12×46 PTY smoke selected the VM, reviewed the same workspace, scrolled t
 
 Additional live CLI/PTY smoke verified selected secondary aliases in TUI review, accepted secondary selectors without changing Host alias lists, and confirmed that machine-output operations on a PTY and piped incomplete commands return exit `2` without a workspace or config writes. Pair list retains its existing primary-alias representation.
 
-Required full validation remains blocked by the previously observed unrelated dirty `tests/cli.rs` failures: `expected a literal` in `concat!` at line 4548, missing `fs`/`OpenOptions` imports, and 589 errors in all-target/all-feature check and test runs. Those changes are preserved; the known failing checks were not rerun. Keep `ready-for-agent` until required full validation completes.
+The prior compiler blockers are resolved. The latest integrated full-suite run (`artifact://1404`) compiled and recorded 28 CLI failures, including eleven legacy Pair setup/recovery cases; all other targets passed. A new integrated full-suite run remains required after the ticket-owned changes below. Main owns that run; keep `ready-for-agent` until it completes successfully.
 
 ## Standards
 
@@ -28,4 +28,14 @@ Parallel review found no documented-standard violations. Two nonblocking judgeme
 
 Parallel review found one safety regression in the interrupted implementation: pending journals had no remaining consent-gated recovery path. Commit `41249ce` restores the existing affected-file review, explicit recovery consent, and rediscovery; the regression test failed before this correction and passed afterward. Follow-up review found no remaining ticket-13 implementation mismatches or scope creep.
 
-Review summary: Standards has zero violations and two nonblocking judgement calls; Spec has zero remaining implementation findings. Required full-suite verification remains blocked as recorded above.
+Historical review summary: Standards has zero violations and two nonblocking judgement calls; Spec has zero remaining implementation findings. Required integrated full-suite verification remains pending.
+
+### New authorized run
+
+Read `skill://implement`, `skill://tdd` and its test/mocking references, `skill://code-review`, `skill://ponytail`, and `skill://diagnosing-bugs`. No production bug was reproduced. Removed eleven obsolete or duplicate dirty CLI tests rather than restoring removed prompts or the standalone recovery command. Preserved transit cardinality and mismatch scenarios in `pair_setup_requires_explicit_transit_for_ambiguous_candidates`. Equivalent current-interface checks live in `tests/pairs.rs`; unique checks now cover selectorless duplicate gateway and VM sources with secondary aliases, Pairs-tab review cancellation and refreshed records, stale sources before and after review with editable values, malformed-journal refusal, and recovery lock contention after consent.
+
+`cargo check --offline --bin sshx` passed. `cargo test --offline --test pairs` passed all thirteen tests; `cargo test --offline --test cli pair_setup -- --nocapture` passed all seven selected tests. Current Pair list output continues using primary aliases; tests verify selected secondary aliases in the workspace and preserve source alias lists rather than requiring a changed machine schema.
+
+Independent live binary smoke used a real 120×40 PTY: Hosts → Pairs → setup selected exact duplicate gateway/VM sources through secondary aliases, explicitly chose the second transit, left every source unchanged through review, applied only after Enter consent, refreshed the Pairs workspace, and exited normally. Pair list JSON and reciprocal source metadata confirmed the chosen relationship; decoy files remained unchanged. Separate live PTY smoke verified that `--yes` cannot bypass recovery consent, declining preserves source/journal/backups, consenting while another writer holds the lock refuses without writes, successful recovery restores source content and rediscovery, and subsequent setup cancellation exits `130` without Pair metadata. Another live smoke refused a stale source before review while retaining selected fields; malformed-journal machine preview returned exit `2` without writes. These are fixture/local checks, not user-server validation.
+
+Required parallel Standards and Spec review and isolated committed-tree checks are recorded below when complete. Remaining verification: Main's integrated full-suite run.
