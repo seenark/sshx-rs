@@ -6647,6 +6647,88 @@ fn cancelling_edit_keeps_unchecked_service_unselected() {
 
 #[cfg(unix)]
 #[test]
+fn explicit_tui_edits_prefilled_nonloopback_local_forward() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(
+        &config,
+        "Host prod\n  HostName prod.example\n  ##PORT 5432\n",
+    );
+    let bin = fake_ssh(&root);
+    let listeners = (0..3)
+        .map(|_| TcpListener::bind(("127.0.0.1", 0)).unwrap())
+        .collect::<Vec<_>>();
+    let ports = listeners
+        .iter()
+        .map(|listener| listener.local_addr().unwrap().port())
+        .collect::<Vec<_>>();
+    drop(listeners);
+    let declared = format!("5432={}", ports[0]);
+    let initial = format!("192.0.2.1:{}:db.internal:5432", ports[1]);
+    let edited = format!("192.0.2.1:{}:cache.internal:6379", ports[2]);
+    let rejected = Command::new(env!("CARGO_BIN_EXE_sshx"))
+        .env("HOME", &home)
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "tui",
+            "connect",
+            "prod",
+            "--forward",
+            &declared,
+            "-L",
+            &initial,
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(rejected.status.code(), Some(2), "{rejected:?}");
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("FORWARD_BIND_UNSAFE"),
+        "{rejected:?}"
+    );
+    let edited_id = format!("local:{edited}");
+    let edit = format!("{}{edited}\r", "\x7f".repeat(initial.len()));
+    let (status, output) = run_with_pty_interactions(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "tui",
+            "connect",
+            "prod",
+            "--allow-bind",
+            "--forward",
+            &declared,
+            "-L",
+            &initial,
+        ],
+        &bin,
+        &root,
+        &[
+            (b"Search:", b"\n"),
+            (b"Connection workspace", b"\x1b[Be"),
+            (b"Enter save", edit.as_bytes()),
+            (edited_id.as_bytes(), b"\r"),
+            (b"2 forwarding row(s).", b"\x03"),
+        ],
+        None,
+        Some((100, 40)),
+    );
+    assert_eq!(status.code(), Some(130), "status={status:?} output={output}");
+    assert!(
+        contains_tui_text(output.as_bytes(), edited_id.as_bytes()),
+        "{output}"
+    );
+    assert!(!root.join("master-started").exists());
+    assert!(!root.join("runtime-config").exists());
+    assert!(!home.join(".config/sshx/tunnels/registry.json").exists());
+    for port in ports {
+        drop(TcpListener::bind(("127.0.0.1", port)).unwrap());
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+#[cfg(unix)]
+#[test]
 fn tui_connection_workspace_handles_three_declared_service_forwards_at_18_by_12() {
     let (root, home) = fixture_root();
     let config = home.join(".ssh/config");
