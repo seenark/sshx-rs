@@ -382,6 +382,7 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
                             vm_password_fd,
                         },
                         &forwards,
+                        false,
                     )
                 } else {
                     let forwards = requested_forwards(entry, &cli)?;
@@ -389,7 +390,7 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
                         &cli.local_forwards, &cli.remote_forwards, &cli.dynamic_forwards, cli.allow_bind,
                     )?;
                     sshx::connect::open_with_password_fd_and_all_forwards(
-                        entry, &home, cli.no_input, alias, cli.password_fd, &forwards, &direct,
+                        entry, &home, cli.no_input, alias, cli.password_fd, &forwards, &direct, false,
                     )
                 }
             }
@@ -533,12 +534,7 @@ fn run_hosts(
             state.prefill(selected.entry, selected.alias, "");
             prefill_selector = false;
         }
-        let mut sources = HashMap::new();
-        for entry in &filtered {
-            sources
-                .entry(entry.source.path.as_str())
-                .or_insert_with(|| std::fs::read(&entry.source.path).ok());
-        }
+        let sources = catalog_source_snapshots(&catalog);
         let selection = match picker::browse_hosts(
             &filtered, &catalog.entries, &mut state, discovery_status.as_deref().or(status.as_deref()),
         ) {
@@ -584,12 +580,7 @@ fn run_hosts(
         let entry = selection.entry;
         let alias = selection.alias;
         let edit_action = state.edit_action.take();
-        let unchanged = sources
-            .get(entry.source.path.as_str())
-            .and_then(Option::as_ref)
-            .is_some_and(|before| {
-                std::fs::read(&entry.source.path).is_ok_and(|after| after == *before)
-            });
+        let unchanged = entry_sources_unchanged(entry, &sources);
         if !unchanged {
             status = Some(format!(
                 "HOST_SOURCE_CHANGED: {} changed; select its current HostEntry again",
@@ -646,7 +637,7 @@ fn run_hosts(
             continue;
         }
         status = match run_connection_workspace(
-            cli, &catalog, selection, home, picker::ConnectionMode::Session, false,
+            cli, &catalog, selection, home, picker::ConnectionMode::Session, false, &sources,
         ) {
             Ok(outcome) if outcome.quit => return Ok(()),
             Ok(outcome) if outcome.completed => Some("Connection completed.".to_string()),
@@ -875,11 +866,7 @@ fn run_tui_operation(cli: &Cli) -> Result<(), String> {
             loop {
                 let filtered = catalog.entries.iter()
                     .filter(|entry| entry_matches_provenance(entry, cli)).collect::<Vec<_>>();
-                let mut sources = HashMap::new();
-                for entry in &filtered {
-                    sources.entry(entry.source.path.as_str())
-                        .or_insert_with(|| std::fs::read(&entry.source.path).ok());
-                }
+                let sources = catalog_source_snapshots(&catalog);
                 let selected = match picker::select(&filtered, label, &mut state, status.as_deref()) {
                     Ok(selected) => selected,
                     Err(error) if error == picker::CANCELLED && completed => return Ok(()),
@@ -917,8 +904,7 @@ fn run_tui_operation(cli: &Cli) -> Result<(), String> {
                         credential_gateway_bytes = bytes;
                     }
                 }
-                let unchanged = sources.get(source.path.as_str()).and_then(Option::as_ref)
-                    .is_some_and(|before| std::fs::read(&source.path).is_ok_and(|after| after == *before));
+                let unchanged = entry_sources_unchanged(selected.entry, &sources);
                 if !unchanged {
                     use_password_fds = false;
                     status = Some("HOST_SOURCE_CHANGED: select the current HostEntry before continuing.".to_string());
@@ -928,7 +914,7 @@ fn run_tui_operation(cli: &Cli) -> Result<(), String> {
                         Err(error) => Some(error),
                     };
                 } else {
-                    status = match run_connection_workspace(cli, &catalog, selected, &home, mode, use_password_fds) {
+                    status = match run_connection_workspace(cli, &catalog, selected, &home, mode, use_password_fds, &sources) {
                         Ok(outcome) => {
                             completed |= outcome.completed;
                             if outcome.quit {
@@ -977,6 +963,25 @@ fn run_tui_operation(cli: &Cli) -> Result<(), String> {
     }
 }
 
+fn catalog_source_snapshots(catalog: &Catalog) -> HashMap<&str, Option<Vec<u8>>> {
+    let mut sources = HashMap::new();
+    for entry in &catalog.entries {
+        for path in std::iter::once(entry.source.path.as_str())
+            .chain(entry.provenance.iter().flat_map(|provenance| provenance.paths.iter().map(String::as_str)))
+        {
+            sources.entry(path).or_insert_with(|| std::fs::read(path).ok());
+        }
+    }
+    sources
+}
+
+fn entry_sources_unchanged(entry: &HostEntry, sources: &HashMap<&str, Option<Vec<u8>>>) -> bool {
+    std::iter::once(entry.source.path.as_str())
+        .chain(entry.provenance.iter().flat_map(|provenance| provenance.paths.iter().map(String::as_str)))
+        .all(|path| sources.get(path).and_then(Option::as_ref)
+            .is_some_and(|before| std::fs::read(path).is_ok_and(|after| after == *before)))
+}
+
 struct ConnectionOutcome {
     completed: bool,
     quit: bool,
@@ -989,6 +994,7 @@ fn run_connection_workspace(
     home: &Path,
     mode: picker::ConnectionMode,
     use_password_fds: bool,
+    sources: &HashMap<&str, Option<Vec<u8>>>,
 ) -> Result<ConnectionOutcome, String> {
     if catalog.diagnostics.iter().any(|diagnostic| diagnostic.code == "unsupported_match") {
         return Err("UNSUPPORTED_MATCH: Match prevents exact runtime configuration".to_string());
@@ -1004,12 +1010,12 @@ fn run_connection_workspace(
     }
     let entry = selected.entry;
     let alias = selected.alias;
-    let before = std::fs::read(&entry.source.path).map_err(|error| error.to_string())?;
     let route = sshx::pair::paired_route(&catalog.entries, entry)?;
-    let gateway_before = route.as_ref()
-        .filter(|route| route.gateway.source.path != entry.source.path)
-        .map(|route| std::fs::read(&route.gateway.source.path).map_err(|error| error.to_string()))
-        .transpose()?;
+    if !entry_sources_unchanged(entry, sources)
+        || route.as_ref().is_some_and(|route| !entry_sources_unchanged(&route.gateway, sources))
+    {
+        return Err("HOST_SOURCE_CHANGED: selected HostEntry or Pair gateway changed; select current source again".to_string());
+    }
     if matches!(cli.command, Command::TunnelDirectStart(_)) && route.is_some() {
         return TunnelRoute::Direct.check("paired")
             .map(|()| ConnectionOutcome { completed: false, quit: false });
@@ -1019,8 +1025,15 @@ fn run_connection_workspace(
             .map(|()| ConnectionOutcome { completed: false, quit: false });
     }
     let target = route.as_ref().map_or(entry, |route| &route.vm);
-    let mut services = sshx::session::declared_services(target)?;
     let mut forward_warning = None;
+    let mut services = match sshx::session::declared_services(target) {
+        Ok(services) => services,
+        Err(error) if error.starts_with("FORWARD_METADATA_INVALID:") && cli.forwards.is_empty() => {
+            forward_warning = Some(error);
+            Vec::new()
+        }
+        Err(error) => return Err(error),
+    };
     let mut preselected = if cli.bind {
         Vec::new()
     } else {
@@ -1085,10 +1098,8 @@ fn run_connection_workspace(
             Err(error) if error == picker::CANCELLED => return Ok(ConnectionOutcome { completed, quit: true }),
             Err(error) => return Err(error),
         };
-        if std::fs::read(&entry.source.path).map_or(true, |after| after != before)
-            || route.as_ref().zip(gateway_before.as_ref()).is_some_and(|(route, before)| {
-                std::fs::read(&route.gateway.source.path).map_or(true, |after| after != *before)
-            })
+        if !entry_sources_unchanged(entry, sources)
+            || route.as_ref().is_some_and(|route| !entry_sources_unchanged(&route.gateway, sources))
         {
             return Err("HOST_SOURCE_CHANGED: selected HostEntry or Pair gateway changed; select current source again".to_string());
         }
@@ -1102,6 +1113,7 @@ fn run_connection_workspace(
                         vm_password_fd: cli.vm_password_fd.or(cli.password_fd).filter(|_| use_password_fds),
                     },
                     &choice.forwards,
+                    true,
                 ).map(|()| "Session ended.".to_string())
             }
             (Some(route), picker::ConnectionMode::Tunnel) => {
@@ -1119,7 +1131,7 @@ fn run_connection_workspace(
                 let (declared, local, remote, dynamic) = split_selected_forwards(&choice.forwards);
                 sshx::tunnel::parse_forwards(&local, &remote, &dynamic, cli.allow_bind)
                     .and_then(|direct| sshx::connect::open_with_password_fd_and_all_forwards(
-                        entry, home, false, alias, cli.password_fd.filter(|_| use_password_fds), &declared, &direct,
+                        entry, home, false, alias, cli.password_fd.filter(|_| use_password_fds), &declared, &direct, true,
                     ))
                     .map(|()| "Session ended.".to_string())
             }

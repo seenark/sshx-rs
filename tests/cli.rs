@@ -6977,3 +6977,458 @@ fn direct_connect_compiles_exact_block_for_multiple_forwards_with_owned_master()
     assert!(root.join("master-closed").exists());
     fs::remove_dir_all(root).expect("fixture should be removed");
 }
+
+#[cfg(unix)]
+#[test]
+fn hosts_tui_config_refresh_clears_cached_password() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    let original =
+        "##SSHX ID=11111111-1111-4111-8111-111111111111\nHost direct\n  HostName direct.example\n";
+    let changed =
+        "##SSHX ID=11111111-1111-4111-8111-111111111111\nHost direct\n  HostName remote.example\n";
+    write(&config, original);
+    write(&root.join("auth-fail"), "");
+    let bin = fake_ssh(&root);
+    fake_sshpass(&root);
+    let ssh = bin.join("ssh");
+    let script = fs::read_to_string(&ssh).unwrap();
+    let auth_check = r#"if [ "$SSHX_AUTH_FAIL" = "1" ]; then"#;
+    let fail_once = r#"if [ "$SSHX_AUTH_FAIL" = "1" ] && [ ! -f "$SSHX_CAPTURE.failed-once" ]; then
+      : > "$SSHX_CAPTURE.failed-once""#;
+    assert!(script.contains(auth_check));
+    fs::write(&ssh, script.replace(auth_check, fail_once)).unwrap();
+    let sshpass = bin.join("sshpass");
+    let script = fs::read_to_string(&sshpass).unwrap();
+    let capture =
+        r#"[ -n "$SSHX_PASSWORD_CAPTURE" ] && eval "cat <&$password_fd" > "$SSHX_PASSWORD_CAPTURE""#;
+    assert!(script.contains(capture));
+    fs::write(
+        &sshpass,
+        script.replace(
+            capture,
+            r#"eval "cat <&$password_fd" >> "$SSHX_CAPTURE.passwords""#,
+        ),
+    )
+    .unwrap();
+
+    let mut fds = [-1; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    let mut writer = unsafe { fs::File::from_raw_fd(fds[1]) };
+    writer.write_all(b"stale-secret\n").unwrap();
+    drop(writer);
+    let flags = unsafe { libc::fcntl(fds[0], libc::F_GETFD) };
+    assert!(flags >= 0);
+    assert_eq!(
+        unsafe { libc::fcntl(fds[0], libc::F_SETFD, flags & !libc::FD_CLOEXEC) },
+        0
+    );
+    let password_fd = fds[0].to_string();
+    let (status, output) = run_with_pty_interactions_with_hook(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "tui",
+            "connect",
+            "direct",
+            "--password-fd",
+            &password_fd,
+        ],
+        &bin,
+        &root,
+        &[
+            (b"Search:", b"\r"),
+            (b"Connection workspace", b"\r"),
+            (b"Enter confirm", b"\r"),
+            (
+                b"Password for direct host `direct` (replacement):",
+                b"\n",
+            ),
+            (b"Connection workspace", b"\x1b"),
+            (b"Search:", b"\r"),
+            (b"HOST_SOURCE_CHANGED", b"\r"),
+            (b"Connection workspace", b"\r"),
+            (b"Enter confirm", b"\r"),
+            (b"Session ended.", b"\x1b"),
+            (b"Search:", b"\x1b"),
+        ],
+        None,
+        None,
+        |index| {
+            if index == 5 {
+                write(&config, changed);
+            }
+        },
+    );
+    unsafe {
+        libc::close(fds[0]);
+    }
+    assert!(status.success(), "status={status:?} output={output}");
+    assert!(!output.contains("stale-secret"), "{output}");
+    assert!(
+        fs::read_to_string(root.join("runtime-config"))
+            .unwrap()
+            .contains("HostName remote.example"),
+        "{output}"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("runtime-config.passwords")).unwrap(),
+        "stale-secret\n"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn malformed_service_comments_do_not_block_zero_forward_session() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(
+        &config,
+        "Host direct\n  HostName direct.example\n  ##PORT invalid\n",
+    );
+    let bin = fake_ssh(&root);
+    let (status, output) = run_with_pty_interactions(
+        &home,
+        &["tui", "connect", "direct"],
+        &bin,
+        &root,
+        &[
+            (b"Search:", b"\n"),
+            (
+                b"FORWARD_METADATA_INVALID: ##PORT remote port must be a number",
+                b"\r",
+            ),
+            (b"Enter confirm", b"\r"),
+            (b"Session ended.", b"\x1b"),
+            (b"Search:", b"\x1b"),
+        ],
+        None,
+        None,
+    );
+    assert!(status.success(), "status={status:?} output={output}");
+    let runtime = fs::read_to_string(root.join("runtime-config")).unwrap();
+    assert!(!runtime.contains("LocalForward"), "{runtime}");
+    assert!(root.join("master-closed").exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn hosts_tui_opens_exact_duplicate_and_restores_selection_after_session() {
+    let (root, home) = fixture_root();
+    let ssh = home.join(".ssh");
+    write(&ssh.join("config"), "Include one.conf two.conf\n");
+    write(
+        &ssh.join("one.conf"),
+        "##SSHX ID=11111111-1111-4111-8111-111111111111\nHost duplicate secondary\n  HostName one.example\n",
+    );
+    write(
+        &ssh.join("two.conf"),
+        "##SSHX ID=22222222-2222-4222-8222-222222222222\nHost duplicate secondary\n  HostName two.example\n",
+    );
+    let config_before = fs::read(ssh.join("config")).unwrap();
+    let one_before = fs::read(ssh.join("one.conf")).unwrap();
+    let two_before = fs::read(ssh.join("two.conf")).unwrap();
+    let bin = fake_ssh(&root);
+    let (status, output) = run_with_pty_interactions(
+        &home,
+        &[],
+        &bin,
+        &root,
+        &[
+            (b"sshx Hosts", b"secondary\t\t\x1b[6~\x1b[B\r"),
+            (b"Connection workspace", b"\r"),
+            (b"Enter confirm", b"\r"),
+            (b"Session ended.", b"\x1b"),
+            (b"Search:", b"\t\t\x1b[6~"),
+            (b"22222222-2222-4222-8222-222222222222", b"\x1b"),
+        ],
+        None,
+        Some((48, 18)),
+    );
+    assert!(status.success(), "status={status:?} output={output}");
+    assert!(output.contains("one.conf"), "output={output}");
+    assert!(output.contains("two.conf"), "output={output}");
+    assert!(output.contains("ID:"), "output={output}");
+    let session_status = output
+        .rfind("Session ended.")
+        .or_else(|| output.rfind("Sessionended."))
+        .expect("Hosts should show Session completion status");
+    assert!(
+        output[session_status..].contains("two.conf"),
+        "Hosts should preserve the selected source after Session: {output}"
+    );
+    assert!(contains_tui_text(
+        output[session_status..].as_bytes(),
+        b"22222222-2222-4222-8222-222222222222",
+    ), "Hosts should restore the exact selected ID: {output}");
+    let runtime = fs::read_to_string(root.join("runtime-config")).unwrap();
+    assert!(runtime.lines().any(|line| line == "Host secondary"), "{runtime}");
+    assert!(runtime.contains("HostName two.example"));
+    assert!(!runtime.contains("one.example"));
+    assert!(!runtime.contains("LocalForward"));
+    assert!(!runtime.contains("RemoteForward"));
+    assert!(!runtime.contains("DynamicForward"));
+    assert!(root.join("master-started").exists());
+    assert!(root.join("master-closed").exists());
+    assert_eq!(fs::read(ssh.join("config")).unwrap(), config_before);
+    assert_eq!(fs::read(ssh.join("one.conf")).unwrap(), one_before);
+    assert_eq!(fs::read(ssh.join("two.conf")).unwrap(), two_before);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn hosts_tui_session_output_uses_terminal_when_stdout_is_redirected() {
+    let (root, home) = fixture_root();
+    write(
+        &home.join(".ssh/config"),
+        "Host direct\n  HostName direct.example\n",
+    );
+    write(&root.join("redirect-stdout"), "");
+    let bin = fake_ssh(&root);
+    let (status, output) = run_with_pty_interactions(
+        &home,
+        &[],
+        &bin,
+        &root,
+        &[
+            (b"Search:", b"\r"),
+            (b"Connection workspace", b"\r"),
+            (b"Enter confirm", b"\r"),
+            (b"Session ended.", b"\x1b"),
+            (b"Search:", b"\x1b"),
+        ],
+        None,
+        None,
+    );
+    assert!(status.success(), "status={status:?} output={output}");
+    assert!(output.contains("direct-shell"), "output={output}");
+    assert!(root.join("master-closed").exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn hosts_tui_session_output_uses_terminal_when_stdout_is_closed() {
+    let (root, home) = fixture_root();
+    write(
+        &home.join(".ssh/config"),
+        "Host direct\n  HostName direct.example\n",
+    );
+    write(&root.join("close-stdout"), "");
+    let bin = fake_ssh(&root);
+    let (status, output) = run_with_pty_interactions(
+        &home,
+        &[],
+        &bin,
+        &root,
+        &[
+            (b"Search:", b"\r"),
+            (b"Connection workspace", b"\r"),
+            (b"Enter confirm", b"\r"),
+            (b"Session ended.", b"\x1b"),
+            (b"Search:", b"\x1b"),
+        ],
+        None,
+        None,
+    );
+    assert!(status.success(), "status={status:?} output={output}");
+    assert!(output.contains("direct-shell"), "output={output}");
+    assert!(root.join("master-closed").exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn hosts_tui_refreshes_changed_source_before_session() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    let original = "##SSHX ID=11111111-1111-4111-8111-111111111111\nHost direct\n  HostName direct.example\n";
+    let changed = "##SSHX ID=22222222-2222-4222-8222-222222222222\nHost direct\n  HostName direct.example\n";
+    write(&config, original);
+    let bin = fake_ssh(&root);
+    let (status, output) = run_with_pty_interactions_with_hook(
+        &home,
+        &[],
+        &bin,
+        &root,
+        &[
+            (b"sshx Hosts", b"\r"),
+            (b"HOST_SOURCE_CHANGED", b"\x1b"),
+        ],
+        None,
+        None,
+        |index| {
+            if index == 0 {
+                write(&config, changed);
+            }
+        },
+    );
+    assert!(status.success(), "status={status:?} output={output}");
+    assert!(output.contains("22222222-2222-4222-8222-222222222222"), "{output}");
+    assert!(!root.join("master-started").exists());
+    assert!(!root.join("runtime-config").exists());
+    assert_eq!(fs::read_to_string(&config).unwrap(), changed);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn hosts_tui_refreshes_changed_include_before_session() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    let first = home.join(".ssh/one.conf");
+    let second = home.join(".ssh/two.conf");
+    write(&config, "Include one.conf\n");
+    write(&first, "Host selected\n  HostName first.example\n");
+    write(&second, "Host replacement\n  HostName second.example\n");
+    let bin = fake_ssh(&root);
+    let changed = "Include two.conf\n";
+    let (status, output) = run_with_pty_interactions_with_hook(
+        &home,
+        &[],
+        &bin,
+        &root,
+        &[
+            (b"Search:", b"\r"),
+            (b"HOST_SOURCE_CHANGED", b"\x1b"),
+        ],
+        None,
+        None,
+        |index| {
+            if index == 0 {
+                write(&config, changed);
+            }
+        },
+    );
+    assert!(status.success(), "status={status:?} output={output}");
+    assert!(output.contains("replacement"), "output={output}");
+    assert!(!root.join("master-started").exists());
+    assert!(!root.join("runtime-config").exists());
+    assert_eq!(fs::read_to_string(&config).unwrap(), changed);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn hosts_tui_refreshes_changed_pair_gateway_before_session() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    let gateway = home.join(".ssh/gateway.conf");
+    write(&config, "Include gateway.conf vm.conf\n");
+    write(
+        &gateway,
+        "Host gateway\n  HostName gateway.example\n  LocalForward 2200 vm.internal:22\n",
+    );
+    write(
+        &home.join(".ssh/vm.conf"),
+        "Host vm\n  HostName vm.internal\n  Port 22\n",
+    );
+    let setup = run(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "pair",
+            "setup",
+            "gateway",
+            "vm",
+            "--yes",
+            "--no-input",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(setup.status.success(), "{setup:?}");
+    let bin = fake_ssh(&root);
+    let (status, output) = run_with_pty_interactions_with_hook(
+        &home,
+        &[],
+        &bin,
+        &root,
+        &[
+            (b"Search:", b"\x1b[B\r"),
+            (b"HOST_SOURCE_CHANGED", b"\x1b"),
+        ],
+        None,
+        None,
+        |index| {
+            if index == 0 {
+                let mut contents = fs::read_to_string(&gateway).unwrap();
+                contents.push_str("# changed while Hosts is open\n");
+                write(&gateway, &contents);
+            }
+        },
+    );
+    assert!(status.success(), "status={status:?} output={output}");
+    assert!(fs::read_to_string(&gateway).unwrap().contains("# changed while Hosts is open"));
+    assert!(!root.join("master-started").exists());
+    assert!(!root.join("runtime-config").exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn hosts_tui_rejects_unsupported_match_before_session() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(
+        &config,
+        "Host direct\n  HostName direct.example\nMatch host other\n  User other\n",
+    );
+    let bin = fake_ssh(&root);
+    let (status, output) = run_with_pty_interactions(
+        &home,
+        &[],
+        &bin,
+        &root,
+        &[
+            (b"Search:", b"direct\r"),
+            (b"UNSUPPORTED_MATCH", b"\x1b"),
+        ],
+        None,
+        None,
+    );
+    assert!(status.success(), "status={status:?} output={output}");
+    assert!(output.contains("UNSUPPORTED_MATCH"), "output={output}");
+    assert!(!root.join("master-started").exists());
+    assert!(!root.join("runtime-config").exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn hosts_tui_searches_unicode_aliases() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(
+        &config,
+        "Host cafe\n  HostName cafe.example\nHost CAFÉ\n  HostName accent.example\n",
+    );
+    let bin = fake_ssh(&root);
+    let (status, output) = run_with_pty_interactions(
+        &home,
+        &[],
+        &bin,
+        &root,
+        &[
+            (b"sshx Hosts", b"caf\xc3\xa9\r"),
+            (b"Connection workspace", b"\r"),
+            (b"Enter confirm", b"\r"),
+            (b"Session ended.", b"\x1b"),
+            (b"Search:", b"\x1b"),
+        ],
+        None,
+        None,
+    );
+    assert!(status.success(), "status={status:?} output={output}");
+    assert!(output.contains("CAFÉ"), "output={output}");
+    let runtime = fs::read_to_string(root.join("runtime-config")).unwrap();
+    assert!(runtime.contains("Host CAFÉ"), "runtime={runtime}");
+    assert!(runtime.contains("HostName accent.example"), "runtime={runtime}");
+    assert!(root.join("master-closed").exists());
+    fs::remove_dir_all(root).unwrap();
+}

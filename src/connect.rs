@@ -467,10 +467,11 @@ pub fn open_with_password_fd_and_forwards(
     forwards: &[ServiceForward],
 ) -> Result<(), String> {
     open_with_password_fd_and_all_forwards(
-        entry, home, no_input, selected_alias, password_fd, forwards, &[],
+        entry, home, no_input, selected_alias, password_fd, forwards, &[], false,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn open_with_password_fd_and_all_forwards(
     entry: &HostEntry,
     home: &Path,
@@ -479,6 +480,7 @@ pub fn open_with_password_fd_and_all_forwards(
     password_fd: Option<i32>,
     forwards: &[ServiceForward],
     direct_forwards: &[session::ForwardSpec],
+    terminal: bool,
 ) -> Result<(), String> {
     SIGNAL.store(0, Ordering::Relaxed);
     install_signal_handlers();
@@ -490,6 +492,7 @@ pub fn open_with_password_fd_and_all_forwards(
         password_fd,
         forwards,
         direct_forwards,
+        terminal,
     );
     reset_signal_handlers();
     result
@@ -537,6 +540,7 @@ fn preflight_direct_listeners(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn open_session(
     entry: &HostEntry,
     home: &Path,
@@ -545,6 +549,7 @@ fn open_session(
     password_fd: Option<i32>,
     forwards: &[ServiceForward],
     direct_forwards: &[session::ForwardSpec],
+    terminal: bool,
 ) -> Result<(), String> {
     session::preflight(forwards)?;
     preflight_direct_listeners(forwards, direct_forwards)?;
@@ -607,7 +612,7 @@ fn open_session(
     {
         return Err(error);
     }
-    let mut shell = spawn_shell(service.runtime(master_index), no_input)?;
+    let mut shell = spawn_shell(service.runtime(master_index), no_input, terminal)?;
     let status = wait_for_shell(&mut shell)?;
     service.stop();
     if let Some(signal) = received_signal() {
@@ -639,9 +644,11 @@ pub fn open_paired(
             vm_password_fd,
         },
         &[],
+        false,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn open_paired_with_forwards(
     route: &PairedRoute,
     home: &Path,
@@ -650,6 +657,7 @@ pub fn open_paired_with_forwards(
     vm_alias: &str,
     credentials: PairedCredentials,
     forwards: &[ServiceForward],
+    terminal: bool,
 ) -> Result<(), String> {
     SIGNAL.store(0, Ordering::Relaxed);
     install_signal_handlers();
@@ -661,11 +669,13 @@ pub fn open_paired_with_forwards(
         vm_alias,
         credentials,
         forwards,
+        terminal,
     );
     reset_signal_handlers();
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 fn open_paired_session(
     route: &PairedRoute,
     home: &Path,
@@ -674,6 +684,7 @@ fn open_paired_session(
     vm_alias: &str,
     credentials: PairedCredentials,
     forwards: &[ServiceForward],
+    terminal: bool,
 ) -> Result<(), String> {
     session::preflight(forwards).map_err(|error| format!("VM_{error}"))?;
     let transit_port = allocate_transit_port()?;
@@ -735,7 +746,7 @@ fn open_paired_session(
         save_replacement_for(service.runtime(vm_index), attempt, no_input, "VM")?;
     }
 
-    let mut shell = spawn_shell(service.runtime(vm_index), no_input)
+    let mut shell = spawn_shell(service.runtime(vm_index), no_input, terminal)
         .map_err(|error| format!("VM_SESSION_FAILED: {error}"))?;
     let status = wait_for_shell(&mut shell)?;
     service.stop();
@@ -1330,13 +1341,18 @@ pub(crate) fn stop_standalone_checked_at(socket: &Path, alias: &str) -> Result<(
     Ok(())
 }
 
-fn spawn_shell(runtime: &Runtime, no_input: bool) -> Result<Child, String> {
+fn spawn_shell(runtime: &Runtime, no_input: bool, terminal: bool) -> Result<Child, String> {
     let mut command = ssh_command(runtime, no_input, true);
     command.args(["-o", "ControlMaster=no"]);
     command.arg(&runtime.alias);
+    // The TUI uses stderr as its terminal even when stdout is redirected or closed.
     command
         .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
+        .stdout(if terminal {
+            Stdio::from(io::stderr())
+        } else {
+            Stdio::inherit()
+        })
         .stderr(Stdio::inherit());
     command
         .spawn()
