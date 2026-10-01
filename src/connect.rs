@@ -89,6 +89,24 @@ pub struct PairedCredentials {
     pub vm_password_fd: Option<i32>,
 }
 
+/// Retains paired-session password attempts across workspace retries.
+pub struct PairedSessionCredentials {
+    input: PairedCredentials,
+    gateway_attempt: Option<PasswordAttempt>,
+    vm_attempt: Option<PasswordAttempt>,
+}
+
+impl PairedSessionCredentials {
+    /// Stores password descriptors without reading them until session startup.
+    pub fn new(input: PairedCredentials) -> Self {
+        Self {
+            input,
+            gateway_attempt: None,
+            vm_attempt: None,
+        }
+    }
+}
+
 struct PasswordAttempt {
     bytes: Vec<u8>,
     source: PasswordSource,
@@ -633,16 +651,17 @@ pub fn open_paired(
     gateway_password_fd: Option<i32>,
     vm_password_fd: Option<i32>,
 ) -> Result<(), String> {
+    let mut credentials = PairedSessionCredentials::new(PairedCredentials {
+        gateway_password_fd,
+        vm_password_fd,
+    });
     open_paired_with_forwards(
         route,
         home,
         no_input,
         gateway_alias,
         vm_alias,
-        PairedCredentials {
-            gateway_password_fd,
-            vm_password_fd,
-        },
+        &mut credentials,
         &[],
         false,
     )
@@ -655,7 +674,7 @@ pub fn open_paired_with_forwards(
     no_input: bool,
     gateway_alias: &str,
     vm_alias: &str,
-    credentials: PairedCredentials,
+    credentials: &mut PairedSessionCredentials,
     forwards: &[ServiceForward],
     terminal: bool,
 ) -> Result<(), String> {
@@ -682,7 +701,7 @@ fn open_paired_session(
     no_input: bool,
     gateway_alias: &str,
     vm_alias: &str,
-    credentials: PairedCredentials,
+    credentials: &mut PairedSessionCredentials,
     forwards: &[ServiceForward],
     terminal: bool,
 ) -> Result<(), String> {
@@ -712,15 +731,20 @@ fn open_paired_session(
     )?;
     let vm_runtime =
         Runtime::create_with_content(&route.vm, home, vm_alias, vm_config, forwards, no_input)?;
-    let mut gateway_attempt = password_attempt(&gateway_runtime, credentials.gateway_password_fd)
-        .map_err(|error| paired_stage_error("gateway", error))?;
-    let mut vm_attempt = password_attempt(&vm_runtime, credentials.vm_password_fd)
-        .map_err(|error| paired_stage_error("VM", error))?;
+    if credentials.gateway_attempt.is_none() {
+        credentials.gateway_attempt =
+            password_attempt(&gateway_runtime, credentials.input.gateway_password_fd)
+                .map_err(|error| paired_stage_error("gateway", error))?;
+    }
+    if credentials.vm_attempt.is_none() {
+        credentials.vm_attempt = password_attempt(&vm_runtime, credentials.input.vm_password_fd)
+            .map_err(|error| paired_stage_error("VM", error))?;
+    }
 
     let gateway_master = authenticate_paired_master(
         &gateway_runtime,
         no_input,
-        &mut gateway_attempt,
+        &mut credentials.gateway_attempt,
         "gateway",
         ForwardStage::Transit,
     )?;
@@ -729,7 +753,7 @@ fn open_paired_session(
     let vm_master = authenticate_paired_master(
         &vm_runtime,
         no_input,
-        &mut vm_attempt,
+        &mut credentials.vm_attempt,
         "VM",
         if forwards.is_empty() {
             ForwardStage::None
@@ -739,10 +763,10 @@ fn open_paired_session(
     )?;
     let vm_index = service.add(vm_runtime, vm_master);
 
-    if let Some(attempt) = gateway_attempt.as_ref() {
+    if let Some(attempt) = credentials.gateway_attempt.as_ref() {
         save_replacement_for(service.runtime(gateway_index), attempt, no_input, "gateway")?;
     }
-    if let Some(attempt) = vm_attempt.as_ref() {
+    if let Some(attempt) = credentials.vm_attempt.as_ref() {
         save_replacement_for(service.runtime(vm_index), attempt, no_input, "VM")?;
     }
 
@@ -781,6 +805,7 @@ fn authenticate_paired_master(
     forward_stage: ForwardStage,
 ) -> Result<Child, String> {
     let mut enrolled = false;
+    let mut prompted = false;
     loop {
         let mut master = spawn_master(
             runtime,
@@ -801,14 +826,13 @@ fn authenticate_paired_master(
                 let can_prompt = !no_input
                     && io::stdin().is_terminal()
                     && error.starts_with("SSH_AUTH_FAILED")
-                    && attempt
-                        .as_ref()
-                        .is_none_or(|value| value.source != PasswordSource::Prompted);
+                    && !prompted;
                 if can_prompt
                     && let Some(next) = prompt_password_for(role, &runtime.alias, attempt.is_some())
                         .map_err(|error| paired_stage_error(role, error))?
                 {
                     *attempt = Some(next);
+                    prompted = true;
                     continue;
                 }
                 return Err(paired_stage_error(role, error));

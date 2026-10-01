@@ -371,16 +371,19 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
                         (None, None) => None,
                     };
                     let forwards = requested_forwards(&route.vm, &cli)?;
+                    let mut credentials = sshx::connect::PairedSessionCredentials::new(
+                        sshx::connect::PairedCredentials {
+                            gateway_password_fd: cli.gateway_password_fd,
+                            vm_password_fd,
+                        },
+                    );
                     sshx::connect::open_paired_with_forwards(
                         &route,
                         &home_dir()?,
                         cli.no_input,
                         gateway_alias,
                         alias,
-                        sshx::connect::PairedCredentials {
-                            gateway_password_fd: cli.gateway_password_fd,
-                            vm_password_fd,
-                        },
+                        &mut credentials,
                         &forwards,
                         false,
                     )
@@ -637,10 +640,10 @@ fn run_hosts(
             continue;
         }
         status = match run_connection_workspace(
-            cli, &catalog, selection, home, picker::ConnectionMode::Session, false, &sources,
+            cli, &catalog, selection, home, picker::ConnectionMode::Session, false, &sources, true,
         ) {
             Ok(outcome) if outcome.quit => return Ok(()),
-            Ok(outcome) if outcome.completed => Some("Connection completed.".to_string()),
+            Ok(outcome) if outcome.completed => outcome.status,
             Ok(_) => None,
             Err(error) if error == picker::CANCELLED => None,
             Err(error) => Some(error),
@@ -914,7 +917,7 @@ fn run_tui_operation(cli: &Cli) -> Result<(), String> {
                         Err(error) => Some(error),
                     };
                 } else {
-                    status = match run_connection_workspace(cli, &catalog, selected, &home, mode, use_password_fds, &sources) {
+                    status = match run_connection_workspace(cli, &catalog, selected, &home, mode, use_password_fds, &sources, false) {
                         Ok(outcome) => {
                             completed |= outcome.completed;
                             if outcome.quit {
@@ -985,8 +988,10 @@ fn entry_sources_unchanged(entry: &HostEntry, sources: &HashMap<&str, Option<Vec
 struct ConnectionOutcome {
     completed: bool,
     quit: bool,
+    status: Option<String>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_connection_workspace(
     cli: &Cli,
     catalog: &Catalog,
@@ -995,6 +1000,7 @@ fn run_connection_workspace(
     mode: picker::ConnectionMode,
     use_password_fds: bool,
     sources: &HashMap<&str, Option<Vec<u8>>>,
+    return_to_hosts: bool,
 ) -> Result<ConnectionOutcome, String> {
     if catalog.diagnostics.iter().any(|diagnostic| diagnostic.code == "unsupported_match") {
         return Err("UNSUPPORTED_MATCH: Match prevents exact runtime configuration".to_string());
@@ -1018,11 +1024,11 @@ fn run_connection_workspace(
     }
     if matches!(cli.command, Command::TunnelDirectStart(_)) && route.is_some() {
         return TunnelRoute::Direct.check("paired")
-            .map(|()| ConnectionOutcome { completed: false, quit: false });
+            .map(|()| ConnectionOutcome { completed: false, quit: false, status: None });
     }
     if matches!(cli.command, Command::TunnelPairedStart(_)) && route.is_none() {
         return TunnelRoute::Paired.check("direct")
-            .map(|()| ConnectionOutcome { completed: false, quit: false });
+            .map(|()| ConnectionOutcome { completed: false, quit: false, status: None });
     }
     let target = route.as_ref().map_or(entry, |route| &route.vm);
     let mut forward_warning = None;
@@ -1088,14 +1094,20 @@ fn run_connection_workspace(
     let mut restored = None;
     let mut status = forward_warning;
     let mut completed = false;
+    let mut paired_credentials = sshx::connect::PairedSessionCredentials::new(
+        sshx::connect::PairedCredentials {
+            gateway_password_fd: cli.gateway_password_fd.filter(|_| use_password_fds),
+            vm_password_fd: cli.vm_password_fd.or(cli.password_fd).filter(|_| use_password_fds),
+        },
+    );
     loop {
         let choice = match picker::connection_workspace(
             &route_label, route.is_some(), &services, &preselected,
             restored.as_ref(), mode, status.as_deref(), cli.allow_bind, |_| false,
         ) {
             Ok(choice) => choice,
-            Err(error) if error == picker::BACK => return Ok(ConnectionOutcome { completed, quit: false }),
-            Err(error) if error == picker::CANCELLED => return Ok(ConnectionOutcome { completed, quit: true }),
+            Err(error) if error == picker::BACK => return Ok(ConnectionOutcome { completed, quit: false, status }),
+            Err(error) if error == picker::CANCELLED => return Ok(ConnectionOutcome { completed, quit: true, status }),
             Err(error) => return Err(error),
         };
         if !entry_sources_unchanged(entry, sources)
@@ -1108,10 +1120,7 @@ fn run_connection_workspace(
                 let gateway_alias = route.gateway.aliases.first().ok_or_else(|| "PAIR_INVALID: gateway has no alias".to_string())?;
                 sshx::connect::open_paired_with_forwards(
                     route, home, false, gateway_alias, alias,
-                    sshx::connect::PairedCredentials {
-                        gateway_password_fd: cli.gateway_password_fd.filter(|_| use_password_fds),
-                        vm_password_fd: cli.vm_password_fd.or(cli.password_fd).filter(|_| use_password_fds),
-                    },
+                    &mut paired_credentials,
                     &choice.forwards,
                     true,
                 ).map(|()| "Session ended.".to_string())
@@ -1146,10 +1155,14 @@ fn run_connection_workspace(
                     .map(|response| format!("Tunnel started: {}", response.tunnels[0].id))
             }
         };
-        completed |= outcome.is_ok() || outcome.as_ref().is_err_and(|error| {
+        let operation_completed = outcome.is_ok() || outcome.as_ref().is_err_and(|error| {
             error.starts_with("SESSION_EXIT:") || error.starts_with("VM_SESSION_EXIT:")
         });
+        completed |= operation_completed;
         status = Some(outcome.unwrap_or_else(|error| error));
+        if return_to_hosts && choice.mode == picker::ConnectionMode::Session && operation_completed {
+            return Ok(ConnectionOutcome { completed, quit: false, status });
+        }
         restored = Some(choice);
     }
 }

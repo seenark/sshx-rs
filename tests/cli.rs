@@ -7373,7 +7373,6 @@ fn hosts_tui_opens_exact_duplicate_and_restores_selection_after_session() {
             (b"sshx Hosts", b"secondary\t\t\x1b[6~\x1b[B\r"),
             (b"Connection workspace", b"\r"),
             (b"Enter confirm", b"\r"),
-            (b"Session ended.", b"\x1b"),
             (b"Search:", b"\t\t\x1b[6~"),
             (b"22222222-2222-4222-8222-222222222222", b"\x1b"),
         ],
@@ -7430,7 +7429,6 @@ fn hosts_tui_session_output_uses_terminal_when_stdout_is_redirected() {
             (b"Search:", b"\r"),
             (b"Connection workspace", b"\r"),
             (b"Enter confirm", b"\r"),
-            (b"Session ended.", b"\x1b"),
             (b"Search:", b"\x1b"),
         ],
         None,
@@ -7461,7 +7459,6 @@ fn hosts_tui_session_output_uses_terminal_when_stdout_is_closed() {
             (b"Search:", b"\r"),
             (b"Connection workspace", b"\r"),
             (b"Enter confirm", b"\r"),
-            (b"Session ended.", b"\x1b"),
             (b"Search:", b"\x1b"),
         ],
         None,
@@ -7650,7 +7647,6 @@ fn hosts_tui_searches_unicode_aliases() {
             (b"sshx Hosts", b"caf\xc3\xa9\r"),
             (b"Connection workspace", b"\r"),
             (b"Enter confirm", b"\r"),
-            (b"Session ended.", b"\x1b"),
             (b"Search:", b"\x1b"),
         ],
         None,
@@ -7662,5 +7658,303 @@ fn hosts_tui_searches_unicode_aliases() {
     assert!(runtime.contains("Host CAFÉ"), "runtime={runtime}");
     assert!(runtime.contains("HostName accent.example"), "runtime={runtime}");
     assert!(root.join("master-closed").exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+
+#[cfg(unix)]
+#[test]
+fn paired_nonzero_session_exit_returns_to_hosts() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(
+        &config,
+        concat!(
+            "##SSHX ID=11111111-1111-4111-8111-111111111111\n",
+            "##SSHX VM=22222222-2222-4222-8222-222222222222\n",
+            "Host gateway\n  HostName gateway.example\n  LocalForward 2200 vm.internal:22\n",
+            "##SSHX ID=22222222-2222-4222-8222-222222222222\n",
+            "##SSHX GATEWAY=11111111-1111-4111-8111-111111111111\n",
+            "##SSHX TRANSIT=vm.internal:22\n",
+            "Host vm\n  HostName vm.internal\n  Port 22\n",
+        ),
+    );
+    let config_before = fs::read(&config).unwrap();
+    let bin = fake_ssh(&root);
+    let ssh = bin.join("ssh");
+    let script = fs::read_to_string(&ssh).unwrap();
+    let failing_shell = script.replace(r#"printf 'direct-shell\n'"#, "exit 7");
+    assert_ne!(script, failing_shell);
+    fs::write(ssh, failing_shell).unwrap();
+
+    let (status, output) = run_with_pty_interactions(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+        ],
+        &bin,
+        &root,
+        &[
+            (b"Search:", b"vm\r"),
+            (b"VM: vm", b"\r"),
+            (b"Enter confirm", b"\r"),
+            (b"Search:", b"\t\t\x1b[6~"),
+            (b"22222222-2222-4222-8222-222222222222", b"\x1b"),
+        ],
+        None,
+        Some((80, 24)),
+    );
+    assert!(status.success(), "status={status:?} output={output}");
+    assert!(contains_tui_text(output.as_bytes(), b"VM_SESSION_EXIT"), "{output}");
+    let returned_hosts = output.rfind("Search:")
+        .expect("Session exit should restore Hosts");
+    assert!(contains_tui_text(
+        output[returned_hosts..].as_bytes(),
+        b"22222222-2222-4222-8222-222222222222",
+    ), "Hosts should preserve the exact VM identity: {output}");
+    assert!(contains_tui_text(output[returned_hosts..].as_bytes(), b"vm.internal"), "{output}");
+    assert!(root.join("master-closed").exists());
+    assert_eq!(fs::read(&config).unwrap(), config_before);
+    assert!(!home.join(".config/sshx/tunnels/registry.json").exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+
+#[cfg(unix)]
+#[test]
+fn paired_retry_reuses_gateway_and_vm_password_fds() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(
+        &config,
+        concat!(
+            "##SSHX ID=11111111-1111-4111-8111-111111111111\n",
+            "##SSHX VM=22222222-2222-4222-8222-222222222222\n",
+            "Host gateway\n",
+            "  HostName gateway.example\n",
+            "  LocalForward 2200 vm.internal:22\n",
+            "##SSHX ID=22222222-2222-4222-8222-222222222222\n",
+            "##SSHX GATEWAY=11111111-1111-4111-8111-111111111111\n",
+            "##SSHX TRANSIT=vm.internal:22\n",
+            "Host vm\n",
+            "  HostName vm.internal\n",
+            "  Port 22\n",
+        ),
+    );
+    let bin = paired_fake_ssh(&root);
+    let ssh = bin.join("ssh");
+    let script = fs::read_to_string(&ssh).unwrap();
+    let fail_once = script.replace(
+        r#"if [ "$SSHX_PAIRED_FAIL_ROLE" = "VM" ] && grep -q '^Host vm$' "$config"; then"#,
+        r#"if grep -q '^Host vm$' "$config" && [ ! -f "$SSHX_CAPTURE.vm-failed-once" ]; then
+      : > "$SSHX_CAPTURE.vm-failed-once""#,
+    );
+    assert_ne!(script, fail_once);
+    fs::write(ssh, fail_once).unwrap();
+    let sshpass = bin.join("sshpass");
+    let script = fs::read_to_string(&sshpass).unwrap();
+    let gateway_capture = r#"eval "cat <&$password_fd" > "$SSHX_PAIRED_GATEWAY_PASSWORD""#;
+    let vm_capture = r#"eval "cat <&$password_fd" > "$SSHX_PAIRED_VM_PASSWORD""#;
+    assert!(script.contains(gateway_capture));
+    assert!(script.contains(vm_capture));
+    let script = script
+        .replace(
+            gateway_capture,
+            r#"eval "cat <&$password_fd" >> "$SSHX_CAPTURE.gateway-passwords""#,
+        )
+        .replace(
+            vm_capture,
+            r#"eval "cat <&$password_fd" >> "$SSHX_CAPTURE.vm-passwords""#,
+        );
+    fs::write(sshpass, script).unwrap();
+    let make_password_fd = |password: &[u8]| {
+        let mut fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let mut writer = unsafe { fs::File::from_raw_fd(fds[1]) };
+        writer.write_all(password).unwrap();
+        drop(writer);
+        let flags = unsafe { libc::fcntl(fds[0], libc::F_GETFD) };
+        assert!(flags >= 0);
+        assert_eq!(
+            unsafe { libc::fcntl(fds[0], libc::F_SETFD, flags & !libc::FD_CLOEXEC) },
+            0
+        );
+        fds[0]
+    };
+    let gateway_fd = make_password_fd(b"gateway-secret\n");
+    let vm_fd = make_password_fd(b"vm-secret\n");
+    let gateway_fd_arg = gateway_fd.to_string();
+    let vm_fd_arg = vm_fd.to_string();
+    let (status, output) = run_with_pty_interactions(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "tui",
+            "connect",
+            "vm",
+            "--gateway-password-fd",
+            &gateway_fd_arg,
+            "--vm-password-fd",
+            &vm_fd_arg,
+        ],
+        &bin,
+        &root,
+        &[
+            (b"Search:", b"\r"),
+            (b"VM: vm", b"\r"),
+            (b"Enter confirm", b"\r"),
+            (b"Password for VM `vm` (replacement):", b"\n"),
+            (b"VM_AUTH_FAILED", b"\r"),
+            (b"Enter confirm", b"\r"),
+            (b"Save replacement password for gateway `gateway`?", b"n\n"),
+            (b"Save replacement password for VM `vm`?", b"n\n"),
+            (b"Session ended.", b"\x1b"),
+            (b"Search:", b"\x1b"),
+        ],
+        None,
+        Some((80, 24)),
+    );
+    unsafe {
+        libc::close(gateway_fd);
+        libc::close(vm_fd);
+    }
+    assert!(status.success(), "status={status:?} output={output}");
+    assert_eq!(
+        fs::read_to_string(root.join("runtime-config.gateway-passwords"))
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["gateway-secret", "gateway-secret"]
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("runtime-config.vm-passwords"))
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["vm-secret", "vm-secret"]
+    );
+    assert!(!output.contains("gateway-secret"), "{output}");
+    assert!(!output.contains("vm-secret"), "{output}");
+    fs::remove_dir_all(root).unwrap();
+}
+
+
+#[test]
+fn paired_session_rejects_custom_local_remote_and_socks_before_start() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(
+        &config,
+        concat!(
+            "##SSHX ID=11111111-1111-4111-8111-111111111111\n",
+            "##SSHX VM=22222222-2222-4222-8222-222222222222\n",
+            "Host gateway\n",
+            "  HostName gateway.example\n",
+            "  LocalForward 2200 vm.internal:22\n",
+            "  SessionType none\n",
+            "##SSHX ID=22222222-2222-4222-8222-222222222222\n",
+            "##SSHX GATEWAY=11111111-1111-4111-8111-111111111111\n",
+            "##SSHX TRANSIT=vm.internal:22\n",
+            "Host vm\n",
+            "  HostName vm.internal\n",
+            "  ##PORT 5432\n",
+        ),
+    );
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+    let config_before = fs::read(&config).unwrap();
+    let bin = fake_ssh(&root);
+    for (flag, specification) in [
+        ("-L", "127.0.0.1:15432:db.internal:5432"),
+        ("-R", "127.0.0.1:15432:db.internal:5432"),
+        ("-D", "127.0.0.1:1080"),
+    ] {
+        let output = run_fake_ssh(
+            &home,
+            &[
+                "--config",
+                config.to_str().unwrap(),
+                "connect",
+                "vm",
+                flag,
+                specification,
+                "--no-input",
+            ],
+            &bin,
+            &root,
+        );
+        assert_eq!(output.status.code(), Some(2), "{flag}: {output:?}");
+        assert!(!root.join("master-started").exists());
+        assert!(!root.join("runtime-config").exists());
+        assert!(!home.join(".config/sshx/tunnels/registry.json").exists());
+        assert_eq!(fs::read(&config).unwrap(), config_before);
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+
+#[cfg(unix)]
+#[test]
+fn paired_session_retry_can_correct_rejected_replacement_password() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(
+        &config,
+        concat!(
+            "##SSHX ID=11111111-1111-4111-8111-111111111111\n",
+            "##SSHX VM=22222222-2222-4222-8222-222222222222\n",
+            "Host gateway\n  HostName gateway.example\n  LocalForward 2200 vm.internal:22\n",
+            "##SSHX ID=22222222-2222-4222-8222-222222222222\n",
+            "##SSHX GATEWAY=11111111-1111-4111-8111-111111111111\n",
+            "##SSHX TRANSIT=vm.internal:22\n",
+            "Host vm\n  HostName vm.internal\n  ##PASSWORD initial-secret\n",
+        ),
+    );
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+    let config_before = fs::read(&config).unwrap();
+    let bin = paired_fake_ssh(&root);
+    let ssh = bin.join("ssh");
+    let script = fs::read_to_string(&ssh).unwrap();
+    let reject_password = script.replace(
+        r#"if [ "$SSHX_PAIRED_FAIL_ROLE" = "VM" ] && grep -q '^Host vm$' "$config"; then"#,
+        r#"if grep -q '^Host vm$' "$config" && [ "$(cat "$SSHX_CAPTURE.vm-password")" != "correct-secret" ]; then"#,
+    );
+    assert_ne!(script, reject_password);
+    fs::write(ssh, reject_password).unwrap();
+    let sshpass = bin.join("sshpass");
+    let script = fs::read_to_string(&sshpass).unwrap();
+    let capture_password = script.replace(
+        r#"eval "cat <&$password_fd" > "$SSHX_PAIRED_VM_PASSWORD""#,
+        r#"eval "cat <&$password_fd" > "$SSHX_CAPTURE.vm-password""#,
+    );
+    assert_ne!(script, capture_password);
+    fs::write(sshpass, capture_password).unwrap();
+    let (status, output) = run_with_pty_interactions(
+        &home,
+        &["--config", config.to_str().unwrap(), "tui", "connect", "vm"],
+        &bin,
+        &root,
+        &[
+            (b"Search:", b"\r"),
+            (b"VM: vm", b"\r"),
+            (b"Enter confirm", b"\r"),
+            (b"Password for VM `vm` (replacement):", b"wrong-secret\n"),
+            (b"VM_AUTH_FAILED", b"\r"),
+            (b"Enter confirm", b"\r"),
+            (b"Password for VM `vm` (replacement):", b"correct-secret\n"),
+            (b"Save replacement password for VM `vm`?", b"n\n"),
+            (b"Session ended.", b"\x1b"),
+            (b"Search:", b"\x1b"),
+        ],
+        None,
+        Some((80, 24)),
+    );
+    assert!(status.success(), "status={status:?} output={output}");
+    assert!(output.contains("paired-shell"), "{output}");
+    assert!(!output.contains("initial-secret"), "{output}");
+    assert!(!output.contains("wrong-secret"), "{output}");
+    assert!(!output.contains("correct-secret"), "{output}");
+    assert_eq!(fs::read(&config).unwrap(), config_before);
     fs::remove_dir_all(root).unwrap();
 }
