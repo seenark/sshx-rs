@@ -38,4 +38,14 @@ Read `skill://implement`, `skill://tdd` and its test/mocking references, `skill:
 
 Independent live binary smoke used a real 120×40 PTY: Hosts → Pairs → setup selected exact duplicate gateway/VM sources through secondary aliases, explicitly chose the second transit, left every source unchanged through review, applied only after Enter consent, refreshed the Pairs workspace, and exited normally. Pair list JSON and reciprocal source metadata confirmed the chosen relationship; decoy files remained unchanged. Separate live PTY smoke verified that `--yes` cannot bypass recovery consent, declining preserves source/journal/backups, consenting while another writer holds the lock refuses without writes, successful recovery restores source content and rediscovery, and subsequent setup cancellation exits `130` without Pair metadata. Another live smoke refused a stale source before review while retaining selected fields; malformed-journal machine preview returned exit `2` without writes. These are fixture/local checks, not user-server validation.
 
-Required parallel Standards and Spec review and isolated committed-tree checks are recorded below when complete. Remaining verification: Main's integrated full-suite run.
+Commit `3fc9fb0` contains only reviewed ticket-owned CLI hunks, Pair tests, and this tracked ticket. An isolated archive of that commit passed all thirteen `tests/pairs.rs` tests and all six committed `pair_setup` CLI tests, proving the commit does not rely on unrelated dirty tests. Temporary smoke fixtures, the isolated tree, and the staging patch were removed.
+
+#### Standards
+
+Parallel committed-diff review found zero hard violations. One nonblocking possible Duplicated Code smell notes repeated successful-apply assertions in the new Pairs-tab test. These assertions exercise a distinct root-workspace transition and exact duplicate-source relationship; the small repetition does not justify another helper.
+
+#### Spec
+
+Parallel committed-diff review found zero findings. Exact duplicate-source gateway/VM selection, secondary aliases, review cancellation, explicit apply, reciprocal metadata, untouched decoys and alias lists, refreshed records, transit boundaries, preview, recovery consent and lock refusal, malformed-journal refusal, and stale-source refusal retain current-interface coverage. No production change or scope expansion was required.
+
+Review summary: Standards has zero hard violations and one nonblocking judgement call; Spec has zero findings. Remaining verification is Main's integrated full-suite run; status remains `ready-for-agent`.
