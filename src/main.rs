@@ -1103,7 +1103,21 @@ fn run_connection_workspace(
     loop {
         let choice = match picker::connection_workspace(
             &route_label, route.is_some(), &services, &preselected,
-            restored.as_ref(), mode, status.as_deref(), cli.allow_bind, |_| false,
+            restored.as_ref(), mode, status.as_deref(), cli.allow_bind, |forwards| {
+                if let Some(route) = &route {
+                    return route.gateway.aliases.first().is_some_and(|gateway_alias| {
+                        sshx::tunnel::has_active_paired_request(route, home, gateway_alias, alias, forwards)
+                    });
+                }
+                let (declared, mut local, remote, dynamic) = split_selected_forwards(forwards);
+                for forward in &declared {
+                    let mut specification = String::new();
+                    sshx::session::write_local_forward_spec(&mut specification, forward);
+                    local.push(specification);
+                }
+                sshx::tunnel::parse_forwards(&local, &remote, &dynamic, cli.allow_bind)
+                    .is_ok_and(|forwards| sshx::tunnel::has_active_direct_request(entry, home, alias, &forwards))
+            },
         ) {
             Ok(choice) => choice,
             Err(error) if error == picker::BACK => return Ok(ConnectionOutcome { completed, quit: false, status }),

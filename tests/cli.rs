@@ -8244,3 +8244,322 @@ fn direct_session_remote_nonloopback_requires_opt_in_before_start() {
 
     fs::remove_dir_all(root).unwrap();
 }
+
+#[cfg(unix)]
+#[test]
+fn tunnels_tab_stops_active_tunnel_and_refreshes_registry() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(&config, "Host direct\n  HostName direct.example\n");
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let local_port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let bin = fake_tunnel_ssh(&root);
+    let local_forward = format!("127.0.0.1:{local_port}:127.0.0.1:22");
+    let started = run_fake_ssh(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "tunnel",
+            "direct",
+            "start",
+            "direct",
+            "-L",
+            local_forward.as_str(),
+            "--no-input",
+            "--format",
+            "json",
+        ],
+        &bin,
+        &root,
+    );
+    assert!(started.status.success(), "{started:?}");
+    let document: serde_json::Value = serde_json::from_slice(&started.stdout).unwrap();
+    let id = document["tunnels"][0]["id"].as_str().unwrap().to_string();
+
+    let second_listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let second_port = second_listener.local_addr().unwrap().port();
+    drop(second_listener);
+    let second_forward = format!("127.0.0.1:{second_port}:127.0.0.1:22");
+    let second_started = run_fake_ssh(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "tunnel",
+            "direct",
+            "start",
+            "direct",
+            "-L",
+            second_forward.as_str(),
+            "--no-input",
+            "--format",
+            "json",
+        ],
+        &bin,
+        &root,
+    );
+    assert!(second_started.status.success(), "{second_started:?}");
+    let second_document: serde_json::Value =
+        serde_json::from_slice(&second_started.stdout).unwrap();
+    let second_id = second_document["tunnels"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let second_stopped = run_fake_ssh(
+        &home,
+        &["tunnel", "stop", &second_id, "--no-input"],
+        &bin,
+        &root,
+    );
+    assert!(second_stopped.status.success(), "{second_stopped:?}");
+
+    let (status, output) = run_with_pty_interactions(
+        &home,
+        &[],
+        &bin,
+        &root,
+        &[
+            (b"Search:", b"\x14"),
+            (b"Tunnel details", b"s"),
+            (b"stopped", b"\x1b"),
+            (b"Search:", b"\x1b"),
+        ],
+        None,
+        Some((100, 30)),
+    );
+    assert!(status.success(), "status={status:?} output={output}");
+    assert!(contains_tui_text(output.as_bytes(), id.as_bytes()), "{output}");
+    assert!(contains_tui_text(output.as_bytes(), b"1 active"), "{output}");
+    assert!(contains_tui_text(output.as_bytes(), b"0 active"), "{output}");
+    assert!(!root.join("master-started").exists());
+
+    let listed = run_fake_ssh(&home, &["tunnel", "list", "--format", "json"], &bin, &root);
+    assert!(listed.status.success(), "{listed:?}");
+    let tunnels: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(tunnels["tunnels"][0]["id"], id);
+    assert_eq!(tunnels["tunnels"][1]["id"], second_id);
+    assert_eq!(tunnels["tunnels"][0]["state"], "stopped");
+    assert_eq!(tunnels["tunnels"][1]["state"], "stopped");
+
+    let config_changed = b"Host direct\n  HostName direct.changed\n";
+    let error_marker = "CONFIG_CHANGED: selected HostEntry changed on disk";
+    let interactions: [(&[u8], &[u8]); 6] = [
+        (b"Search:", b"\x14"),
+        (b"Tunnel details", b"\x1b[B"),
+        (second_id.as_bytes(), b"r"),
+        (error_marker.as_bytes(), b"\r"),
+        (b"ID:", b"\x1b"),
+        (b"Search:", b"\x1b"),
+    ];
+    let (status, output) = run_with_pty_interactions_with_hook(
+        &home,
+        &[],
+        &bin,
+        &root,
+        &interactions,
+        None,
+        Some((100, 30)),
+        |index| {
+            if index == 1 {
+                fs::write(&config, config_changed).unwrap();
+            }
+        },
+    );
+    assert!(status.success(), "status={status:?} output={output}");
+    assert!(contains_tui_text(output.as_bytes(), second_id.as_bytes()), "{output}");
+    assert!(contains_tui_text(output.as_bytes(), error_marker.as_bytes()), "{output}");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn tunnels_tui_restarts_stopped_tunnel_from_explicit_config() {
+    let (root, home) = fixture_root();
+    let config = root.join("custom.conf");
+    write(&config, "Host direct\n  HostName direct.example\n");
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let local_port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let bin = fake_tunnel_ssh(&root);
+    let local_forward = format!("127.0.0.1:{local_port}:127.0.0.1:22");
+    let started = run_fake_ssh(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "tunnel",
+            "direct",
+            "start",
+            "direct",
+            "-L",
+            local_forward.as_str(),
+            "--no-input",
+            "--format",
+            "json",
+        ],
+        &bin,
+        &root,
+    );
+    assert!(started.status.success(), "{started:?}");
+    let started_document: serde_json::Value = serde_json::from_slice(&started.stdout).unwrap();
+    let stopped_id = started_document["tunnels"][0]["id"].as_str().unwrap().to_string();
+    let stopped = run_fake_ssh(
+        &home,
+        &["tunnel", "stop", &stopped_id, "--no-input"],
+        &bin,
+        &root,
+    );
+    assert!(stopped.status.success(), "{stopped:?}");
+
+    let (status, output) = run_with_pty_interactions(
+        &home,
+        &["--config", config.to_str().unwrap(), "tui"],
+        &bin,
+        &root,
+        &[
+            (b"sshx Hosts", b"\x14"),
+            (b"Tunnel details", b"r"),
+            (b"active", b"\x1b"),
+            (b"Search:", b"\x1b"),
+        ],
+        None,
+        Some((100, 30)),
+    );
+    assert!(status.success(), "status={status:?} output={output}");
+    assert!(contains_tui_text(output.as_bytes(), stopped_id.as_bytes()), "{output}");
+    let listed = run_fake_ssh(&home, &["tunnel", "list", "--format", "json"], &bin, &root);
+    assert!(listed.status.success(), "{listed:?}");
+    let tunnels: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(tunnels["tunnels"].as_array().unwrap().len(), 2);
+    assert_eq!(tunnels["tunnels"][0]["id"], stopped_id);
+    assert_eq!(tunnels["tunnels"][0]["state"], "stopped");
+    assert_eq!(tunnels["tunnels"][1]["state"], "active");
+    assert_eq!(tunnels["tunnels"][1]["master_status"], "responsive");
+    assert_eq!(tunnels["tunnels"][1]["listener_status"], "bound");
+    let restarted_id = tunnels["tunnels"][1]["id"].as_str().unwrap();
+    assert_ne!(restarted_id, stopped_id);
+    assert!(contains_tui_text(output.as_bytes(), restarted_id.as_bytes()), "{output}");
+    let stopped = run_fake_ssh(
+        &home,
+        &["tunnel", "stop", restarted_id, "--no-input"],
+        &bin,
+        &root,
+    );
+    assert!(stopped.status.success(), "{stopped:?}");
+    assert!(!root.join("master-started").exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn tui_reuses_exact_active_tunnel_before_listener_preflight() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let local_port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let dynamic_listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let dynamic_port = dynamic_listener.local_addr().unwrap().port();
+    drop(dynamic_listener);
+    write(
+        &config,
+        &format!(
+            "Host direct\n  HostName direct.example\n  ##PORT 5432\n  ##SSHX SERVICE 5432 HOST=[::1] LOCAL={local_port}\n"
+        ),
+    );
+    let bin = fake_tunnel_ssh(&root);
+    let forward = format!("5432={local_port}");
+    let remote = "127.0.0.1:2222:127.0.0.1:22";
+    let dynamic = format!("127.0.0.1:{dynamic_port}");
+    let remote_input = format!(
+        "{}{remote}\n",
+        "\x7f".repeat("127.0.0.1:1:127.0.0.1:1".len())
+    );
+    let dynamic_input = format!(
+        "{}{dynamic}\n",
+        "\x7f".repeat("127.0.0.1:1".len())
+    );
+    let dynamic_port_text = dynamic_port.to_string();
+    let started = run_fake_ssh(
+        &home,
+        &[
+            "tunnel",
+            "direct",
+            "start",
+            "direct",
+            "--forward",
+            forward.as_str(),
+            "-R",
+            remote,
+            "-D",
+            dynamic.as_str(),
+            "--no-input",
+            "--format",
+            "json",
+        ],
+        &bin,
+        &root,
+    );
+    assert!(started.status.success(), "{started:?}");
+    let started_document: serde_json::Value =
+        serde_json::from_slice(&started.stdout).expect("Tunnel start JSON should parse");
+    let id = started_document["tunnels"][0]["id"]
+        .as_str()
+        .expect("Tunnel start should return an ID")
+        .to_string();
+
+    let initial_master_args = fs::read_to_string(root.join("runtime-config.args")).unwrap();
+    let (status, output) = run_with_pty_interactions(
+        &home,
+        &["tunnel", "direct"],
+        &bin,
+        &root,
+        &[
+            (b"Search:", b"\r"),
+            (b"Connection workspace", b" r"),
+            (b"remote:127.0.0.1:1:127.0.0.1:1", remote_input.as_bytes()),
+            (b"2222", b"d"),
+            (b"socks:127.0.0.1:1", dynamic_input.as_bytes()),
+            (dynamic_port_text.as_bytes(), b"\r"),
+            (b"Enter confirm", b"\r"),
+            (id.as_bytes(), b"\x1b"),
+            (b"Search:", b"\x1b"),
+        ],
+        None,
+        Some((110, 40)),
+    );
+    assert!(status.success(), "status={status:?} output={output}");
+    assert!(
+        contains_tui_text(output.as_bytes(), id.as_bytes()),
+        "{output}"
+    );
+    assert!(root.join("master-started").exists());
+    assert_eq!(
+        fs::read_to_string(root.join("runtime-config.args")).unwrap(),
+        initial_master_args
+    );
+
+    let listed = run_fake_ssh(
+        &home,
+        &["tunnel", "direct", "list", "--format", "json"],
+        &bin,
+        &root,
+    );
+    assert!(listed.status.success(), "{listed:?}");
+    let listed_document: serde_json::Value =
+        serde_json::from_slice(&listed.stdout).expect("Tunnel list JSON should parse");
+    assert_eq!(listed_document["tunnels"].as_array().unwrap().len(), 1);
+    assert_eq!(listed_document["tunnels"][0]["id"], id);
+
+    let stopped = run_fake_ssh(
+        &home,
+        &["tunnel", "direct", "stop", id.as_str(), "--format", "json"],
+        &bin,
+        &root,
+    );
+    assert!(stopped.status.success(), "{stopped:?}");
+    assert!(!root.join("master-started").exists());
+    fs::remove_dir_all(root).unwrap();
+}
