@@ -200,6 +200,7 @@ pub fn start(
         });
     }
     reserve_forwards(&forwards)?;
+    session::warn_remote_exposure(&forwards);
 
     let id = next_id(&registry);
     let control_dir = root.join(&id);

@@ -198,6 +198,8 @@ sshx tunnel direct start db-prod --forward 5432=5432 --forward 6379=6378 --forwa
 
 From Hosts, press `Enter` on either a direct HostEntry or a Pair VM to open the same connection workspace. Select rows with `Space`, edit local ports with `E`, and switch Session/Tunnel mode with `M`. Review shows exact source identity and, for a Pair, both gateway and VM identities. `Enter` opens review; a second `Enter` starts the request. Session permits no selected services; Tunnel requires at least one. A failed start keeps edited rows available for correction, and `Esc` returns to Hosts without starting another request.
 
+`-R` listens on the server. Connections go to the destination on your side. Local preflight cannot prove the server listener is available; OpenSSH reports server bind failures. Remote listeners can expose services beyond loopback. A specific non-loopback remote bind requires `--allow-bind` in both Session and Tunnel mode; sshx warns about that exposure before launching OpenSSH. Review bind address and server policy before starting.
+
 `--forward REMOTE[=LOCAL]` keeps listeners on `127.0.0.1` by default. `--bind` selects declared `##PORT` services. A requested local port conflict returns a stage-specific error; sshx does not close an unrelated process or silently choose another port.
 
 ## Standalone tunnel lifecycle

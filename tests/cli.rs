@@ -8040,3 +8040,207 @@ fn paired_session_retry_can_correct_rejected_replacement_password() {
     assert_eq!(fs::read(&config).unwrap(), config_before);
     fs::remove_dir_all(root).unwrap();
 }
+
+
+#[cfg(unix)]
+#[test]
+fn tui_adds_edits_and_starts_remote_and_socks_rows() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(&config, "Host prod\n  HostName prod.example\n");
+    let bin = fake_ssh(&root);
+    let ssh = bin.join("ssh");
+    let remote_initial = "127.0.0.1:1:127.0.0.1:1";
+    let remote_listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let remote_listener_port = remote_listener.local_addr().unwrap().port();
+    let remote_final = format!("127.0.0.1:{remote_listener_port}:cache.internal:6379");
+    let socks_initial = "127.0.0.1:1";
+    let socks_listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let socks_edited_listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let socks_port = socks_listener.local_addr().unwrap().port();
+    let socks_edited_port = socks_edited_listener.local_addr().unwrap().port();
+    assert_ne!(socks_port, socks_edited_port);
+    drop((socks_listener, socks_edited_listener));
+    let socks_final = format!("127.0.0.1:{socks_port}");
+    let socks_edited = format!("127.0.0.1:{socks_edited_port}");
+    let script = fs::read_to_string(&ssh).unwrap();
+    let started_block = format!(
+        r#"    [ -n "$SSHX_STARTED" ] && : > "$SSHX_STARTED"
+    python3 -c 'import socket,sys,time; s=socket.socket(); s.bind(("127.0.0.1", int(sys.argv[1]))); s.listen(); time.sleep(60)' {socks_edited_port} >/dev/null 2>&1 &
+    listener=$!
+    printf '%s' "$$" > "$SSHX_CAPTURE.master"
+    trap 'kill "$listener" 2>/dev/null || :; wait "$listener" 2>/dev/null || :; rm -f "$SSHX_CAPTURE.master"; exit 0' INT HUP TERM"#
+    );
+    write(
+        &ssh,
+        &script.replace(
+            r#"    [ -n "$SSHX_STARTED" ] && : > "$SSHX_STARTED"
+    trap 'exit 0' INT HUP TERM"#,
+            &started_block,
+        ).replace(
+            r#"  *" -O exit "*)
+    [ -n "$SSHX_CLOSED" ]"#,
+            r#"  *" -O exit "*)
+    kill -TERM "$(cat "$SSHX_CAPTURE.master")" 2>/dev/null || :
+    while [ -f "$SSHX_CAPTURE.master" ]; do sleep 0.01; done
+    [ -n "$SSHX_CLOSED" ]"#,
+        ),
+    );
+    let initial_remote_input = format!(
+        "{}{remote_initial}\n",
+        "\x7f".repeat(remote_initial.len())
+    );
+    let replace_remote = format!(
+        "{}{remote_final}\n",
+        "\x7f".repeat(remote_initial.len())
+    );
+    let replace_socks = format!(
+        "{}{socks_final}\n",
+        "\x7f".repeat(socks_initial.len())
+    );
+    let edit_socks = format!(
+        "{}{socks_edited}\n",
+        "\x7f".repeat(socks_final.len())
+    );
+    let interactions: &[(&[u8], &[u8])] = &[
+        (b"Search:", b"\n"),
+        (b"Connection workspace", b"r"),
+        (b"Enter save", initial_remote_input.as_bytes()),
+        (b"Remote (-R)", b"d"),
+        (b"Enter -D", replace_socks.as_bytes()),
+        (b"SOCKS (-D) [checked]", b"\x1b[A"),
+        (b"Remote (-R) [checked]", b"e"),
+        (b"Edit -R", replace_remote.as_bytes()),
+        (b"Remote (-R) [checked]", b"\x1b[B"),
+        (b"SOCKS (-D) [checked]", b"e"),
+        (b"Edit -D", edit_socks.as_bytes()),
+        (socks_edited.as_bytes(), b"\r"),
+        (b"Review", b"\r"),
+        (b"Session ended.", b"\x03"),
+    ];
+    let (status, output) = run_with_pty_interactions(
+        &home,
+        &["--config", config.to_str().unwrap(), "tui", "connect", "prod"],
+        &bin,
+        &root,
+        interactions,
+        None,
+        Some((110, 40)),
+    );
+    assert!(status.success(), "status={status:?} output={output}");
+    let runtime = fs::read_to_string(root.join("runtime-config")).unwrap();
+    assert!(
+        runtime.contains(&format!(
+            "RemoteForward 127.0.0.1:{remote_listener_port} cache.internal:6379"
+        )),
+        "{runtime}"
+    );
+    assert!(
+        runtime.contains(&format!("DynamicForward {socks_edited}")),
+        "{runtime}"
+    );
+    assert!(root.join("master-closed").exists());
+    drop(TcpListener::bind(("127.0.0.1", socks_edited_port)).unwrap());
+    assert!(remote_listener.local_addr().is_ok());
+    fs::remove_dir_all(root).unwrap();
+}
+
+
+#[cfg(unix)]
+#[test]
+fn tui_preserves_editable_remote_rows_after_startup_failure() {
+    let (root, home) = fixture_root();
+    write(&home.join(".ssh/config"), "Host prod\n  HostName prod.example\n");
+    fs::write(root.join("fail-once"), "").unwrap();
+    let bin = fake_ssh(&root);
+    let first = "127.0.0.1:2222:127.0.0.1:22";
+    let second = "127.0.0.1:2223:127.0.0.1:22";
+    let edited_second = "127.0.0.1:2224:127.0.0.1:22";
+    let placeholder = "127.0.0.1:1:127.0.0.1:1";
+    let add_first = format!("{}{first}\n", "\x7f".repeat(placeholder.len()));
+    let add_second = format!("{}{second}\n", "\x7f".repeat(placeholder.len()));
+    let edit_second = format!("{}{edited_second}\n", "\x7f".repeat(second.len()));
+    let (status, output) = run_with_pty_interactions(
+        &home,
+        &["tui", "connect", "prod"],
+        &bin,
+        &root,
+        &[
+            (b"Search:", b"\n"),
+            (b"Connection workspace", b"r"),
+            (b"Enter -R", add_first.as_bytes()),
+            (b"Remote (-R)", b"r"),
+            (b"Enter -R", add_second.as_bytes()),
+            (b"Remote (-R)", b"\r"),
+            (b"Review", b"\r"),
+            (b"SERVICE_BIND_FAILED", b"\x1b[Be"),
+            (b"Edit -R", edit_second.as_bytes()),
+            (b"Remote (-R)", b"\r"),
+            (b"Review", b"\r"),
+            (b"Session ended.", b"\x03"),
+        ],
+        None,
+        Some((110, 40)),
+    );
+    assert!(status.success(), "status={status:?} output={output}");
+    assert!(!root.join("fail-once").exists());
+    let runtime = fs::read_to_string(root.join("runtime-config")).unwrap();
+    assert!(runtime.contains("RemoteForward 127.0.0.1:2222 127.0.0.1:22"), "{runtime}");
+    assert!(runtime.contains("RemoteForward 127.0.0.1:2224 127.0.0.1:22"), "{runtime}");
+    assert!(!runtime.contains("RemoteForward 127.0.0.1:2223 "), "{runtime}");
+    assert!(root.join("master-closed").exists());
+    assert!(!home.join(".config/sshx/tunnels/registry.json").exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+
+#[test]
+fn direct_session_remote_nonloopback_requires_opt_in_before_start() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(&config, "Host direct\n  HostName direct.example\n");
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+    let bin = fake_ssh(&root);
+    let denied = run_fake_ssh(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "connect",
+            "direct",
+            "-R",
+            "192.0.2.1:15432:db.internal:5432",
+            "--no-input",
+        ],
+        &bin,
+        &root,
+    );
+    assert_eq!(denied.status.code(), Some(2), "{denied:?}");
+    assert!(
+        String::from_utf8_lossy(&denied.stderr).contains("FORWARD_BIND_UNSAFE"),
+        "{denied:?}"
+    );
+    assert!(!root.join("master-started").exists());
+    assert!(!root.join("runtime-config").exists());
+
+    let remote = run_fake_ssh(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "connect",
+            "direct",
+            "--allow-bind",
+            "-R",
+            "192.0.2.1:15432:db.internal:5432",
+            "--no-input",
+        ],
+        &bin,
+        &root,
+    );
+    assert!(remote.status.success(), "{remote:?}");
+    let runtime = fs::read_to_string(root.join("runtime-config")).unwrap();
+    assert!(runtime.contains("RemoteForward 192.0.2.1:15432 db.internal:5432"));
+
+    fs::remove_dir_all(root).unwrap();
+}

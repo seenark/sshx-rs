@@ -571,6 +571,7 @@ fn open_session(
 ) -> Result<(), String> {
     session::preflight(forwards)?;
     preflight_direct_listeners(forwards, direct_forwards)?;
+    session::warn_remote_exposure(direct_forwards);
     let runtime = Runtime::create_with_direct_forwards(
         entry,
         home,

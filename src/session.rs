@@ -42,6 +42,23 @@ impl ForwardSpec {
     }
 }
 
+pub(crate) fn warn_remote_exposure(forwards: &[ForwardSpec]) {
+    for forward in forwards {
+        if forward.flag() == 'R'
+            && forward.bind_address != "localhost"
+            && forward
+                .bind_address
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|address| !address.is_loopback())
+        {
+            eprintln!(
+                "Warning: -R {} exposes a service on your side through a non-loopback server listener; OpenSSH determines remote listener readiness.",
+                forward.effective
+            );
+        }
+    }
+}
+
 pub fn write_local_forward_spec(output: &mut String, forward: &ServiceForward) {
     use std::fmt::Write as _;
     output.push_str("127.0.0.1:");
