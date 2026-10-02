@@ -30,6 +30,8 @@ Human output names a stage and evidence. A report can prove local configuration 
 
 **Symptoms:** `PAIR_INVALID`, `PAIR_REQUIRED`, `PAIR_TRANSIT`, `gateway trust`, `gateway auth`, `transit bind`, `VM trust`, or `VM auth` stage errors.
 
+If Pair setup reports a pending recovery journal, run `sshx pair setup` in an interactive terminal to review affected paths and explicitly confirm restoring saved pre-mutation content. `--yes` does not bypass recovery consent; `--no-input`, piped input, and machine output remain blocked. Setup rediscovers HostEntries after recovery.
+
 1. Validate exact records:
 
    ```sh
@@ -38,7 +40,7 @@ Human output names a stage and evidence. A report can prove local configuration 
    ```
 
 2. Ensure the Pair names the intended gateway and VM HostEntries, not aliases that happen to match another source.
-3. If transit inference has more than one candidate, create the Pair with both `--transit-host` and `--transit-port`.
+3. If transit inference has multiple candidates, select an exact `--transit-host` and `--transit-port` from the gateway's `LocalForward` directives. Transit port must match VM `Port`.
 4. Confirm the gateway can reach the transit destination and that the requested temporary loopback port is free.
 5. Treat gateway and VM authentication as separate checks. Supply separate password file descriptors when needed; do not retry a rejected password automatically.
 6. A paired shell requires the gateway master first, then VM trust and authentication. A local listener or gateway master response is not end-to-end VM success.

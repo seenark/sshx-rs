@@ -47,6 +47,9 @@ done
 if [ -n "$SSHX_CAPTURE" ] && [ -f "$config" ]; then
   cat "$config" > "$SSHX_CAPTURE"
 fi
+if [ -n "$SSHX_CAPTURE_ARGS" ] && [ ! -e "$SSHX_CAPTURE_ARGS" ]; then
+  printf '%s\n' "$@" > "$SSHX_CAPTURE_ARGS"
+fi
 case " $* " in
   *" -O check "*) [ -f "$SSHX_STARTED" ] && exit 0; exit 1 ;;
   *" -O exit "*) [ -n "$SSHX_CLOSED" ] && : > "$SSHX_CLOSED"; exit 0 ;;
@@ -221,6 +224,61 @@ fn direct_session_preserves_proxycommand_hash_and_tokens_verbatim() {
 }
 
 #[test]
+fn direct_session_preserves_user_known_hosts_file_and_config_precedence() {
+    let (root, home) = fixture("user-known-hosts");
+    let config = home.join(".ssh/config");
+    write(
+        &config,
+        concat!(
+            "Host direct\n",
+            "  HostName direct.example\n",
+            "  StrictHostKeyChecking no\n",
+            "  UserKnownHostsFile /dev/null %d/known_hosts\n",
+            "  ProxyCommand cloudflared access ssh --hostname %h\n",
+        ),
+    );
+    let bin = session_ssh(&root);
+    let capture = root.join("runtime-config");
+    let args_capture = root.join("ssh-args");
+    let output = run(
+        &home,
+        &bin,
+        &["connect", "direct", "--no-input"],
+        &[
+            ("SSHX_CAPTURE", capture.clone()),
+            ("SSHX_CAPTURE_ARGS", args_capture.clone()),
+            ("SSHX_STARTED", root.join("master-started")),
+            ("SSHX_CLOSED", root.join("master-closed")),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "status={:?} stdout={} stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let runtime =
+        fs::read_to_string(&capture).expect("runtime config should reach the OpenSSH engine");
+    assert!(runtime.contains("UserKnownHostsFile /dev/null %d/known_hosts"));
+    assert!(runtime.contains("ProxyCommand cloudflared access ssh --hostname %h"));
+    let args = fs::read_to_string(&args_capture).expect("SSH arguments should be captured");
+    assert!(
+        !args
+            .lines()
+            .any(|argument| argument.starts_with("UserKnownHostsFile=")),
+        "sshx must not override configured UserKnownHostsFile: {args}"
+    );
+    assert!(
+        !args
+            .lines()
+            .any(|argument| argument.starts_with("StrictHostKeyChecking=")),
+        "sshx must not override configured StrictHostKeyChecking: {args}"
+    );
+    fs::remove_dir_all(root).expect("fixture directory should be removed");
+}
+
+#[test]
 fn direct_standalone_tunnel_copies_exact_block_proxycommand_verbatim() {
     let (root, home) = fixture("direct-tunnel");
     let config = home.join(".ssh/config");
@@ -241,8 +299,6 @@ fn direct_standalone_tunnel_copies_exact_block_proxycommand_verbatim() {
         &bin,
         &[
             "tunnel",
-            "direct",
-            "start",
             "direct",
             "-R",
             "127.0.0.1:2222:127.0.0.1:22",

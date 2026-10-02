@@ -48,6 +48,8 @@ The **filesystem source of truth** is the SSH config on disk. `sshx` does not im
 
 Default personal root is `~/.ssh/config`. This environment also supports the existing work root `~/.private-key/private-key/config`; setup must not invent `~/.private-key/config`.
 
+Run `sshx` with no arguments to open Hosts. Run `sshx --config PATH` to open Hosts against an explicit config root; this also requires usable terminals.
+
 Let setup discover existing roots:
 
 ```sh
@@ -79,7 +81,7 @@ sshx doctor
 sshx doctor --format json
 ```
 
-`doctor` reports problems. It does not chmod files, rewrite config, trust host keys, adopt processes, or stop tunnels silently.
+`doctor` groups findings by severity and stage, with path, evidence, and next action. It reports only by default. In Hosts, choose Doctor, then **Repair eligible permissions** to review one explicit plan. The CLI equivalent is `sshx doctor --fix-permissions`. Both require one confirmation before chmod. Wrong-owner, symlink, shared, and otherwise ineligible paths stay unchanged. Doctor never enrolls host keys, rewrites config, adopts processes, or stops tunnels.
 
 ## List and select HostEntries
 
@@ -109,9 +111,26 @@ After selection, supplied forwarding values appear in the Session or Tunnel work
 
 If a selected source changes or disappears, the continuation shows the error without starting the action. Failed rediscovery removes stale choices but leaves cancellation available with the same pending status.
 
+## Update, rename, and delete HostEntries
+
+```sh
+sshx host update db-prod --hostname db.internal
+sshx host rename db-prod --alias database
+sshx host delete database
+```
+
+Duplicate aliases need `--id`, or alias plus `--source` and `--line`. Complete CLI mutations keep preview and consent behavior. `--preview` writes nothing; `--yes` confirms explicitly.
+
 In Hosts, press `Ctrl+U` to update the selected HostEntry or `Ctrl+R` to rename only its selected alias. `sshx host update HOST` and `sshx host rename HOST` continue in the editor when no change is supplied; `sshx tui host update HOST --hostname DESTINATION` and `sshx tui host rename HOST --alias ALIAS` open it even with complete fields. Fields show `keep`, `replace`, or `clear`; a password marked `keep` is never revealed, typing replaces it, and `Ctrl+X` clears it. Interactive review always requires `Enter`, including with `--yes`; `--no-input`, password stdin, and JSON/YAML output never open the editor.
 
 On compact terminals, the update and rename editors keep review and cancellation controls visible. Move between update fields with `Tab` or the arrow keys; the field list scrolls to keep the selected field visible.
+
+With usable terminals, incomplete `sshx host update` opens an exact HostEntry picker and editor. The editor pre-fills current values. Leave password blank to keep it. Use Ctrl-X on an optional field to clear it. Partial update and rename commands carry supplied values into the editor. Rename edits only the selected alias.
+
+Press `Ctrl-S` to review the exact source diff in the same workspace. Press `Enter` to apply, or `E`/`Esc` to edit again. Invalid values keep entered fields for correction. Hosts also offers Update, Rename, and Delete after selecting a HostEntry. Delete review shows the exact source block with passwords redacted; press `Enter` to delete or `Esc` to cancel. Pair references and active managed use block unsafe deletion. Changed sources, cancellation, or decline leave config unchanged.
+
+If Pair metadata blocks deletion, the blocker review shows the selected source block and linked gateway and VM aliases, IDs, sources, and transit. It never applies a deletion.
+
 
 ## Direct shell
 
@@ -128,6 +147,10 @@ sshx connect db-prod --password-fd 3 --no-input 3<"$HOME/.ssh/password"
 ```
 
 The selected HostEntry's `IdentityFile`, agent options, and supported OpenSSH settings stay in effect. Host-key enrollment is separate from authentication. On first use, interactive mode shows the OpenSSH fingerprint and asks for explicit confirmation; non-interactive mode returns `HOST_KEY_TRUST_REQUIRED`.
+
+With `sshx connect` and no selector, an interactive terminal opens a focused HostEntry selector and then its Session workspace. Use `sshx tui connect HOST` to edit a complete request before connecting; complete `sshx connect HOST` remains direct. Copy actions remain available with explicit `--action copy-ssh`, `--action copy-sshx`, or `--action copy-password`. Copy SSH applies to direct HostEntries, and Copy sshx supports direct and Pair routes. Copy password requires an eligible stored direct password, immediate confirmation, and a supported clipboard backend. The secret never appears in terminal output, command arguments, or environment variables. Backends are `pbcopy` on macOS and `wl-copy`, `xclip`, or `xsel` on Linux. Clipboard managers may retain copied passwords.
+
+The picker keeps alias rows concise. Select a row and use Tab to inspect its HostEntry ID, source file, Host line and byte ranges, and scope/project provenance. Duplicate aliases show source and ID in their rows. Selecting a secondary alias preserves it for copy actions.
 
 ## Create HostEntries
 
@@ -196,15 +219,30 @@ sshx connect vm-alias --forward 5432=5432 --forward 6379=6378 --forward 3001=300
 sshx tunnel direct start db-prod --forward 5432=5432 --forward 6379=6378 --forward 3001=3001 --no-input
 ```
 
-From Hosts, press `Enter` on either a direct HostEntry or a Pair VM to open the same connection workspace. Select rows with `Space`, edit local ports with `E`, and switch Session/Tunnel mode with `M`. Review shows exact source identity and, for a Pair, both gateway and VM identities. `Enter` opens review; a second `Enter` starts the request. Session permits no selected services; Tunnel requires at least one. A failed start keeps edited rows available for correction, and `Esc` returns to Hosts without starting another request.
+From Hosts, press `Enter` on a direct HostEntry or Pair VM to open one connection workspace. It shows Session/Tunnel mode, exact route and source identity, declared service rows, and supplied direct forwarding rows; Pair review identifies both gateway and VM. Use `m` to switch mode, `Space` to select rows, `a` to add custom `-L`, `r` to add `-R`, and `d` to add `-D` rows. Use `e` to edit a declared service listener port or a custom row's complete specification, and `x` to remove custom rows. Remote rows label the server listener and your-side destination; SOCKS rows show local bind address and port. `Enter` opens review; a second `Enter` starts the request. Session permits no selected services; Tunnel requires at least one. A failed start keeps edited rows available for correction, and `Esc` returns to Hosts without starting another request.
+
+Direct Session and standalone Tunnel commands can mix declared services with custom `-L`, `-R`, and `-D` rows:
+
+```sh
+sshx connect db-prod --forward 5432=5432 -L 127.0.0.1:6378:cache.internal:6379 -R 127.0.0.1:15432:db.internal:5432 -D 127.0.0.1:1080 --no-input
+sshx tunnel direct start db-prod --forward 5432=5432 -L 127.0.0.1:6378:cache.internal:6379 -R 127.0.0.1:15432:db.internal:5432 -D 127.0.0.1:1080 --no-input
+```
 
 `-R` listens on the server. Connections go to the destination on your side. Local preflight cannot prove the server listener is available; OpenSSH reports server bind failures. Remote listeners can expose services beyond loopback. A specific non-loopback remote bind requires `--allow-bind` in both Session and Tunnel mode; sshx warns about that exposure before launching OpenSSH. Review bind address and server policy before starting.
 
-`--forward REMOTE[=LOCAL]` keeps listeners on `127.0.0.1` by default. `--bind` selects declared `##PORT` services. A requested local port conflict returns a stage-specific error; sshx does not close an unrelated process or silently choose another port.
+`-D` opens a local SOCKS proxy. Configure applications explicitly to use its bind address and port; sshx does not configure application proxy settings.
+
+Custom listeners in direct Session and standalone Tunnel mode accept IPv4 and IPv6 loopback addresses. Specific non-loopback addresses require `--allow-bind`; wildcard binds remain rejected. Pair routes accept only declared VM services and reject custom `-L`, `-R`, or `-D` rows before startup.
+
+Session mode closes its session-bound master and forwards when the shell exits. Connections started from Hosts return to Hosts at the same HostEntry; CLI continuation returns to the connection workspace with edited rows. A standalone Tunnel remains active after leaving the TUI; use its displayed Tunnel ID to manage it.
+
+`--bind` selects declared `##PORT` services interactively. A requested local port conflict returns a row-specific error; sshx does not close an unrelated process or silently choose another port.
 
 ## Standalone tunnel lifecycle
 
 A **standalone tunnel** owns its detached OpenSSH master, control socket, runtime config, listeners, and Pair dependencies. Ownership is recorded in the locked registry; a PID alone never proves ownership.
+
+Open the Tunnels workspace from Hosts with `Ctrl+T`; Hosts shows the registered active count. The workspace lists persisted Tunnel IDs from earlier runs, including active, down, stopped, or stale registry evidence. It shows route, exact HostEntry source, mappings, master responsiveness, and listener readiness as separate evidence. It does not report application health. Use Page Up/Down to scroll details on smaller terminals. Select an active, responsive Tunnel and press `s` to stop it; press `r` to restart it. Unproved or unavailable actions report why and never use a PID alone.
 
 `sshx tunnel HOST` and `sshx tunnel start HOST` select the HostEntry's route automatically. Host aliases named `direct` or `paired` remain valid in the automatic form. Use `tunnel direct start HOST` or `tunnel paired start HOST` to require a route; a mismatch returns `TUNNEL_ROUTE_MISMATCH` without starting a Tunnel. Route-specific lists contain only that route's records, and status, stop, and restart reject IDs belonging to the other route before changing owned resources. All forms use the same persisted registry.
 

@@ -150,6 +150,9 @@ fn doctor_reports_config_stages_without_secret_or_repair() {
     assert_eq!(human.status.code(), Some(2), "{human:?}");
     let human_text = String::from_utf8_lossy(&human.stdout);
     assert!(human_text.contains("Next:"));
+    assert!(human_text.contains("[error] config"));
+    assert!(human_text.contains("Path:"));
+    assert!(human_text.contains("Evidence: local"));
     assert!(human_text.contains("remote server validation: not run"));
     assert!(!human_text.contains("secret-value"));
 
@@ -221,6 +224,50 @@ fn doctor_checks_sshpass_only_when_password_auth_is_needed() {
     fs::remove_dir_all(root).expect("fixture should be removed");
 }
 
+#[test]
+fn doctor_accepts_tokenized_user_known_hosts_file_and_proxycommand() {
+    let (root, home) = fixture();
+    write(
+        &home.join(".ssh/config"),
+        concat!(
+            "Host direct\n",
+            "  HostName direct.example\n",
+            "  UserKnownHostsFile /dev/null %d/known_hosts\n",
+            "  ProxyCommand cloudflared access ssh --hostname %h\n",
+        ),
+    );
+
+    let report = report_for(&home);
+    assert!(
+        !report.findings.iter().any(|finding| {
+            finding.code == "unsupported_semantics"
+                && (finding.message.contains("UserKnownHostsFile")
+                    || finding.message.contains("ProxyCommand"))
+        }),
+        "directives should remain supported: {:?}",
+        report.findings
+    );
+    fs::remove_dir_all(root).expect("fixture directory should be removed");
+}
+
+#[test]
+fn doctor_accepts_session_type_none_for_transport_hosts() {
+    let (root, home) = fixture();
+    write(
+        &home.join(".ssh/config"),
+        "Host gateway\n  HostName gateway.example\n  SessionType none\n  LocalForward 2200 vm.internal:22\n",
+    );
+
+    let report = report_for(&home);
+    assert!(
+        !report.findings.iter().any(|finding| {
+            finding.code == "unsupported_semantics" && finding.message.contains("SessionType")
+        }),
+        "SessionType should remain supported: {:?}",
+        report.findings
+    );
+    fs::remove_dir_all(root).expect("fixture directory should be removed");
+}
 #[test]
 fn doctor_reports_stale_runtime_without_repairing_registry() {
     let (root, home) = fixture();
