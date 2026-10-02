@@ -89,6 +89,22 @@ pub struct PairedCredentials {
     pub vm_password_fd: Option<i32>,
 }
 
+/// Retains standalone-tunnel password attempts across workspace retries.
+pub struct StandaloneCredentials {
+    input: Option<i32>,
+    attempt: Option<PasswordAttempt>,
+}
+
+impl StandaloneCredentials {
+    /// Stores the password descriptor without reading it until tunnel startup.
+    pub fn new(input: Option<i32>) -> Self {
+        Self {
+            input,
+            attempt: None,
+        }
+    }
+}
+
 /// Retains paired-session password attempts across workspace retries.
 pub struct PairedSessionCredentials {
     input: PairedCredentials,
@@ -902,14 +918,14 @@ fn spawn_master(
 pub(crate) fn launch_standalone(
     runtime: &StandaloneRuntime,
     no_input: bool,
-    password_fd: Option<i32>,
+    credentials: &mut StandaloneCredentials,
     forwards: &[(char, String)],
     local_listeners: &[(String, u16)],
 ) -> Result<(), String> {
     SIGNAL.store(0, Ordering::Relaxed);
     install_signal_handlers();
     let result =
-        launch_standalone_session(runtime, no_input, password_fd, forwards, local_listeners);
+        launch_standalone_session(runtime, no_input, credentials, forwards, local_listeners);
     reset_signal_handlers();
     result
 }
@@ -917,24 +933,19 @@ pub(crate) fn launch_standalone(
 fn launch_standalone_session(
     runtime: &StandaloneRuntime,
     no_input: bool,
-    password_fd: Option<i32>,
+    credentials: &mut StandaloneCredentials,
     forwards: &[(char, String)],
     local_listeners: &[(String, u16)],
 ) -> Result<(), String> {
-    let mut attempt = match password_fd {
-        Some(fd) => Some(read_password_fd(fd)?),
-        None => runtime
-            .runtime
-            .configured_password
-            .clone()
-            .map(PasswordAttempt::configured),
-    };
+    if credentials.attempt.is_none() {
+        credentials.attempt = password_attempt(&runtime.runtime, credentials.input)?;
+    }
     let mut enrolled = false;
     loop {
         match launch_standalone_once(
             runtime,
             no_input,
-            attempt.as_ref(),
+            credentials.attempt.as_ref(),
             forwards,
             local_listeners,
         ) {
@@ -949,20 +960,20 @@ fn launch_standalone_session(
                 let can_prompt = !no_input
                     && io::stdin().is_terminal()
                     && error.starts_with("SSH_AUTH_FAILED")
-                    && attempt
+                    && credentials.attempt
                         .as_ref()
                         .is_none_or(|value| value.source != PasswordSource::Prompted);
                 if can_prompt
-                    && let Some(next) = prompt_password(&runtime.runtime.alias, attempt.is_some())?
+                    && let Some(next) = prompt_password(&runtime.runtime.alias, credentials.attempt.is_some())?
                 {
-                    attempt = Some(next);
+                    credentials.attempt = Some(next);
                     continue;
                 }
                 return Err(error);
             }
         }
     }
-    if let Some(attempt) = attempt.as_ref()
+    if let Some(attempt) = credentials.attempt.as_ref()
         && attempt.source == PasswordSource::Prompted
     {
         save_replacement(&runtime.runtime, attempt, no_input)?;

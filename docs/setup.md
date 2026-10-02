@@ -208,6 +208,8 @@ A **standalone tunnel** owns its detached OpenSSH master, control socket, runtim
 
 `sshx tunnel HOST` and `sshx tunnel start HOST` select the HostEntry's route automatically. Host aliases named `direct` or `paired` remain valid in the automatic form. Use `tunnel direct start HOST` or `tunnel paired start HOST` to require a route; a mismatch returns `TUNNEL_ROUTE_MISMATCH` without starting a Tunnel. Route-specific lists contain only that route's records, and status, stop, and restart reject IDs belonging to the other route before changing owned resources. All forms use the same persisted registry.
 
+An incomplete route-specific start continues in Tunnel mode. After a failed direct startup, retrying the same unchanged HostEntry reuses a supplied password descriptor's retained value rather than reading the consumed descriptor again. Selecting another HostEntry or changing its source discards that value. A route-specific retry still rejects the opposite route. Leaving the completed continuation closes sshx's piped stdout without stopping its standalone Tunnel; stop that Tunnel explicitly by ID.
+
 Start a direct tunnel and return to the shell:
 
 ```sh

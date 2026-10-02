@@ -8563,3 +8563,441 @@ fn tui_reuses_exact_active_tunnel_before_listener_preflight() {
     assert!(!root.join("master-started").exists());
     fs::remove_dir_all(root).unwrap();
 }
+
+#[cfg(unix)]
+#[test]
+fn interactive_tunnel_piped_stdout_closes_before_tunnel_stops() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let local_port = listener.local_addr().unwrap().port();
+    drop(listener);
+    write(
+        &config,
+        &format!(
+            "Host direct\n  HostName direct.example\n  ##PORT 5432\n  ##SSHX SERVICE 5432 LOCAL={local_port}\n"
+        ),
+    );
+    let bin = fake_tunnel_ssh(&root);
+    let mut master_fd = -1;
+    let mut slave_fd = -1;
+    let mut dimensions = unsafe { std::mem::zeroed::<libc::winsize>() };
+    dimensions.ws_col = 80;
+    dimensions.ws_row = 24;
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut dimensions,
+            )
+        },
+        0
+    );
+    let slave = unsafe { fs::File::from_raw_fd(slave_fd) };
+    let stdin = slave.try_clone().unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sshx"))
+        .env("HOME", &home)
+        .env("PATH", path)
+        .env("SSHX_CAPTURE", root.join("runtime-config"))
+        .env("SSHX_STARTED", root.join("master-started"))
+        .env("SSHX_CLOSED", root.join("master-closed"))
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "tunnel",
+            "direct",
+            "start",
+            "direct",
+        ])
+        .stdin(Stdio::from(stdin))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::from(slave))
+        .spawn()
+        .unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let (stdout_tx, stdout_rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = stdout.read_to_end(&mut bytes).map(|_| bytes);
+        let _ = stdout_tx.send(result);
+    });
+    let mut master = unsafe { fs::File::from_raw_fd(master_fd) };
+    let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+    assert!(flags >= 0);
+    assert_eq!(
+        unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let interactions: &[(&[u8], &[u8])] = &[
+        (b"Search:", b"\r"),
+        (b"Connection workspace", b" \r"),
+        (b"Enter confirm", b"\r"),
+        (b"dt-", b"\x1b"),
+        (b"Search:", b"\x1b"),
+    ];
+    let mut output = Vec::new();
+    for (header, input) in interactions {
+        let stage_start = output.len();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut buffer = [0; 4096];
+            let bytes_before_read = output.len();
+            match master.read(&mut buffer) {
+                Ok(size) => output.extend_from_slice(&buffer[..size]),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => panic!("interactive Tunnel PTY read failed: {error}"),
+            }
+            if output.len() > bytes_before_read
+                && contains_tui_text(&output[stage_start..], header)
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Tunnel UI did not render {header:?}: {}",
+                String::from_utf8_lossy(&strip_ansi(&output))
+            );
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "sshx exited before rendering {header:?}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        master.write_all(input).unwrap();
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        let mut buffer = [0; 4096];
+        match master.read(&mut buffer) {
+            Ok(size) => output.extend_from_slice(&buffer[..size]),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => {}
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            break child.wait().unwrap();
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    let tunnel_list = run_fake_ssh(
+        &home,
+        &["tunnel", "direct", "list", "--format", "json"],
+        &bin,
+        &root,
+    );
+    assert!(tunnel_list.status.success(), "{tunnel_list:?}");
+    let tunnel_document: serde_json::Value =
+        serde_json::from_slice(&tunnel_list.stdout).expect("Tunnel list JSON should parse");
+    let id = tunnel_document["tunnels"][0]["id"]
+        .as_str()
+        .expect("interactive Tunnel should remain listed");
+    let eof_before_stop = stdout_rx.recv_timeout(Duration::from_secs(5));
+    let tunnel_running = TcpListener::bind(("127.0.0.1", local_port)).is_err();
+    let stopped = run_fake_ssh(
+        &home,
+        &["tunnel", "direct", "stop", id, "--format", "json"],
+        &bin,
+        &root,
+    );
+    let released = TcpListener::bind(("127.0.0.1", local_port));
+    let listener_released = released.is_ok();
+    if let Ok(listener) = released {
+        drop(listener);
+    }
+    if eof_before_stop.is_err() {
+        let _ = stdout_rx.recv_timeout(Duration::from_secs(2));
+    }
+    assert!(status.success(), "status={status:?} output={output:?}");
+    assert!(tunnel_running, "Tunnel stopped before stdout EOF check");
+    assert!(stopped.status.success(), "{stopped:?}");
+    assert!(listener_released, "stopping Tunnel should release its listener");
+    eof_before_stop
+        .expect("sshx stdout must reach EOF while Tunnel remains running")
+        .expect("reading sshx stdout should succeed");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn interrupted_tunnel_start_stays_cancellable_and_cleans_resources() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let local_port = listener.local_addr().unwrap().port();
+    drop(listener);
+    write(
+        &config,
+        &format!(
+            "Host direct\n  HostName direct.example\n  ##PORT 5432\n  ##SSHX SERVICE 5432 LOCAL={local_port}\n"
+        ),
+    );
+    let bin = fake_tunnel_ssh(&root);
+    let ssh = bin.join("ssh");
+    let script = fs::read_to_string(&ssh).unwrap();
+    let needle = "    printf '%s\\n' \"$*\" > \"$SSHX_CAPTURE.args\"\n";
+    let interrupt = concat!(
+        "    printf '%s\\n' \"$*\" > \"$SSHX_CAPTURE.args\"\n",
+        "    kill -INT \"$PPID\"\n",
+    );
+    assert!(script.contains(needle));
+    fs::write(&ssh, script.replacen(needle, interrupt, 1)).unwrap();
+
+    let (status, output) = run_with_pty_interactions(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "tunnel",
+            "direct",
+            "start",
+            "direct",
+        ],
+        &bin,
+        &root,
+        &[
+            (b"Search:", b"\r"),
+            (b"Connection workspace", b" \r"),
+            (b"Enter confirm", b"\r"),
+            (b"SESSION_INTERRUPTED", b"\x1b"),
+            (b"Search:", b"\x1b"),
+        ],
+        None,
+        Some((80, 24)),
+    );
+    assert_eq!(status.code(), Some(130), "status={status:?} output={output}");
+    assert!(output.contains("SESSION_INTERRUPTED"), "{output}");
+    assert!(!root.join("master-started").exists());
+    assert!(root.join("master-closed").exists());
+    let released = TcpListener::bind(("127.0.0.1", local_port))
+        .expect("interrupted Tunnel startup must release its listener");
+    drop(released);
+    let registry: serde_json::Value = serde_json::from_slice(
+        &fs::read(home.join(".config/sshx/tunnels/registry.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(registry["tunnels"][0]["state"], "failed", "{registry}");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn tunnel_retry_keeps_tunnel_mode_and_reuses_password_fd() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let local_port = listener.local_addr().unwrap().port();
+    drop(listener);
+    write(
+        &config,
+        &format!(
+            "Host direct\n  HostName direct.example\n  ##PORT 5432\n  ##SSHX SERVICE 5432 LOCAL={local_port}\n"
+        ),
+    );
+    let bin = fake_tunnel_ssh(&root);
+    fake_sshpass(&root);
+    let ssh = bin.join("ssh");
+    let script = fs::read_to_string(&ssh).unwrap();
+    let needle = "  *\" -N \"*)\n";
+    let fail_once = concat!(
+        "  *\" -N \"*)\n",
+        "    if [ ! -f \"$SSHX_CAPTURE.failed-once\" ]; then\n",
+        "      : > \"$SSHX_CAPTURE.failed-once\"\n",
+        "      echo \"Permission denied, please try again.\" >&2\n",
+        "      exit 5\n",
+        "    fi\n",
+    );
+    assert!(script.contains(needle));
+    fs::write(&ssh, script.replacen(needle, fail_once, 1)).unwrap();
+
+    let sshpass = root.join("bin/sshpass");
+    let script = fs::read_to_string(&sshpass).unwrap();
+    let capture = r#"[ -n "$SSHX_PASSWORD_CAPTURE" ] && eval "cat <&$password_fd" > "$SSHX_PASSWORD_CAPTURE""#;
+    let replacement = r#"eval "cat <&$password_fd" >> "$SSHX_CAPTURE.passwords""#;
+    assert!(script.contains(capture));
+    fs::write(&sshpass, script.replace(capture, replacement)).unwrap();
+
+    let mut fds = [-1; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    let mut writer = unsafe { fs::File::from_raw_fd(fds[1]) };
+    writer.write_all(b"retry-secret\n").unwrap();
+    drop(writer);
+    let flags = unsafe { libc::fcntl(fds[0], libc::F_GETFD) };
+    assert!(flags >= 0);
+    assert_eq!(
+        unsafe { libc::fcntl(fds[0], libc::F_SETFD, flags & !libc::FD_CLOEXEC) },
+        0
+    );
+    let password_fd = fds[0].to_string();
+    let (status, output) = run_with_pty_interactions(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "tunnel",
+            "direct",
+            "start",
+            "direct",
+            "--password-fd",
+            &password_fd,
+        ],
+        &bin,
+        &root,
+        &[
+            (b"Search:", b"\r"),
+            (b"Connection workspace", b" \r"),
+            (b"Enter confirm", b"\r"),
+            (b"Password for direct host `direct` (replacement):", b"\n"),
+            (b"Connection workspace", b"\x1b"),
+            (b"Search:", b"\r"),
+            (b"Connection workspace", b" \r"),
+            (b"Enter confirm", b"\r"),
+            (b"dt-", b"\x1b"),
+            (b"Search:", b"\x1b"),
+        ],
+        None,
+        Some((48, 18)),
+    );
+    unsafe {
+        libc::close(fds[0]);
+    }
+    assert!(status.success(), "status={status:?} output={output}");
+    let retry_screen = output
+        .rsplit_once("SSH_AUTH_FAILED")
+        .map(|(_, tail)| tail)
+        .expect("first startup failure should be reported");
+    assert!(
+        contains_tui_text(retry_screen.as_bytes(), b"Tunnel mode"),
+        "{output}"
+    );
+    assert!(!output.contains("direct-shell"), "{output}");
+    assert!(!output.contains("retry-secret"), "password must not appear in the TUI");
+    assert_eq!(
+        fs::read_to_string(root.join("runtime-config.passwords"))
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["retry-secret", "retry-secret"]
+    );
+    let listed = run_fake_ssh(
+        &home,
+        &["tunnel", "direct", "list", "--format", "json"],
+        &bin,
+        &root,
+    );
+    assert!(listed.status.success(), "{listed:?}");
+    let document: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    let id = document["tunnels"].as_array().unwrap().iter()
+        .find(|tunnel| tunnel["state"] == "active")
+        .and_then(|tunnel| tunnel["id"].as_str())
+        .expect("retry should leave an active standalone Tunnel");
+    assert!(contains_tui_text(output.as_bytes(), id.as_bytes()), "{output}");
+    let stopped = run_fake_ssh(
+        &home,
+        &["tunnel", "direct", "stop", id, "--format", "json"],
+        &bin,
+        &root,
+    );
+    assert!(stopped.status.success(), "{stopped:?}");
+    let listener = TcpListener::bind(("127.0.0.1", local_port))
+        .expect("stopping the retry Tunnel should release its listener");
+    drop(listener);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn tunnel_retry_rejects_host_with_wrong_explicit_route() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let local_port = listener.local_addr().unwrap().port();
+    drop(listener);
+    write(
+        &config,
+        &format!(
+            concat!(
+                "Host direct\n  HostName direct.example\n  ##PORT 5432\n",
+                "  ##SSHX SERVICE 5432 LOCAL={local_port}\n",
+                "Host gateway\n  HostName gateway.example\n",
+                "  LocalForward 2200 vm.internal:22\n",
+                "Host vm\n  HostName vm.internal\n  Port 22\n"
+            ),
+            local_port = local_port,
+        ),
+    );
+    let setup = run(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "pair",
+            "setup",
+            "gateway",
+            "vm",
+            "--yes",
+            "--no-input",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(setup.status.success(), "{setup:?}");
+    let bin = fake_tunnel_ssh(&root);
+    let ssh = bin.join("ssh");
+    let script = fs::read_to_string(&ssh).unwrap();
+    let needle = "  *\" -N \"*)\n";
+    let fail_start = concat!(
+        "  *\" -N \"*)\n",
+        "    echo \"Permission denied, please try again.\" >&2\n",
+        "    exit 5\n",
+    );
+    assert!(script.contains(needle));
+    fs::write(&ssh, script.replacen(needle, fail_start, 1)).unwrap();
+
+    let choose_vm = format!("{}vm\r", "\x7f".repeat("direct".len()));
+    let (status, output) = run_with_pty_interactions(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "tunnel",
+            "direct",
+            "start",
+            "direct",
+        ],
+        &bin,
+        &root,
+        &[
+            (b"Search:", b"\r"),
+            (b"Connection workspace", b" \r"),
+            (b"Enter confirm", b"\r"),
+            (b"Password for direct host `direct`:", b"\n"),
+            (b"Connection workspace", b"\x1b"),
+            (b"Search:", choose_vm.as_bytes()),
+            (b"TUNNEL_ROUTE_MISMATCH", b"\x1b"),
+        ],
+        None,
+        Some((80, 24)),
+    );
+    assert_eq!(status.code(), Some(130), "status={status:?} output={output}");
+    assert!(output.contains("TUNNEL_ROUTE_MISMATCH"), "{output}");
+    assert!(!output.contains("direct-shell"), "{output}");
+    assert!(!root.join("master-started").exists());
+    let listener = TcpListener::bind(("127.0.0.1", local_port))
+        .expect("wrong-route selection must not start a listener");
+    drop(listener);
+    fs::remove_dir_all(root).unwrap();
+}

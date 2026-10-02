@@ -476,8 +476,9 @@ fn start_direct_tunnel(
         local.push(specification);
     }
     local.extend(cli.local_forwards.iter().cloned());
+    let mut credentials = sshx::connect::StandaloneCredentials::new(cli.password_fd);
     sshx::tunnel::start(
-        entry, home, alias, cli.no_input, cli.password_fd,
+        entry, home, alias, cli.no_input, &mut credentials,
         &local, &cli.remote_forwards, &cli.dynamic_forwards, cli.allow_bind,
     )
 }
@@ -639,8 +640,10 @@ fn run_hosts(
                 Some("UNSUPPORTED_MATCH: Match prevents exact runtime configuration".to_string());
             continue;
         }
+        let mut standalone_credentials = sshx::connect::StandaloneCredentials::new(None);
         status = match run_connection_workspace(
-            cli, &catalog, selection, home, picker::ConnectionMode::Session, false, &sources, true,
+            cli, &catalog, selection, home, picker::ConnectionMode::Session, false,
+            &mut standalone_credentials, &sources, true,
         ) {
             Ok(outcome) if outcome.quit => return Ok(()),
             Ok(outcome) if outcome.completed => outcome.status,
@@ -866,6 +869,7 @@ fn run_tui_operation(cli: &Cli) -> Result<(), String> {
                 .map(|selection| selection.entry.source.clone());
             let mut completed = false;
             let mut status = None;
+            let mut standalone_credentials = sshx::connect::StandaloneCredentials::new(cli.password_fd);
             loop {
                 let filtered = catalog.entries.iter()
                     .filter(|entry| entry_matches_provenance(entry, cli)).collect::<Vec<_>>();
@@ -910,6 +914,11 @@ fn run_tui_operation(cli: &Cli) -> Result<(), String> {
                 let unchanged = entry_sources_unchanged(selected.entry, &sources);
                 if !unchanged {
                     use_password_fds = false;
+                }
+                if !use_password_fds {
+                    standalone_credentials = sshx::connect::StandaloneCredentials::new(None);
+                }
+                if !unchanged {
                     status = Some("HOST_SOURCE_CHANGED: select the current HostEntry before continuing.".to_string());
                 } else if let Some(action) = cli.action.filter(|action| *action != HostAction::Connect) {
                     status = match run_host_action(action, &selected, &catalog.entries, cli) {
@@ -917,7 +926,10 @@ fn run_tui_operation(cli: &Cli) -> Result<(), String> {
                         Err(error) => Some(error),
                     };
                 } else {
-                    status = match run_connection_workspace(cli, &catalog, selected, &home, mode, use_password_fds, &sources, false) {
+                    status = match run_connection_workspace(
+                        cli, &catalog, selected, &home, mode, use_password_fds,
+                        &mut standalone_credentials, &sources, false,
+                    ) {
                         Ok(outcome) => {
                             completed |= outcome.completed;
                             if outcome.quit {
@@ -943,6 +955,9 @@ fn run_tui_operation(cli: &Cli) -> Result<(), String> {
                             None => error.to_string(),
                         });
                     }
+                }
+                if !use_password_fds {
+                    standalone_credentials = sshx::connect::StandaloneCredentials::new(None);
                 }
             }
         }
@@ -999,6 +1014,7 @@ fn run_connection_workspace(
     home: &Path,
     mode: picker::ConnectionMode,
     use_password_fds: bool,
+    standalone_credentials: &mut sshx::connect::StandaloneCredentials,
     sources: &HashMap<&str, Option<Vec<u8>>>,
     return_to_hosts: bool,
 ) -> Result<ConnectionOutcome, String> {
@@ -1165,7 +1181,7 @@ fn run_connection_workspace(
                     sshx::session::write_local_forward_spec(&mut specification, forward);
                     local.push(specification);
                 }
-                sshx::tunnel::start(entry, home, alias, false, cli.password_fd.filter(|_| use_password_fds), &local, &remote, &dynamic, cli.allow_bind)
+                sshx::tunnel::start(entry, home, alias, false, standalone_credentials, &local, &remote, &dynamic, cli.allow_bind)
                     .map(|response| format!("Tunnel started: {}", response.tunnels[0].id))
             }
         };

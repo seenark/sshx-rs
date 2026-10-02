@@ -174,7 +174,7 @@ pub fn start(
     home: &Path,
     selected_alias: &str,
     no_input: bool,
-    password_fd: Option<i32>,
+    credentials: &mut connect::StandaloneCredentials,
     local: &[String],
     remote: &[String],
     dynamic: &[String],
@@ -258,7 +258,7 @@ pub fn start(
     if let Err(error) = connect::launch_standalone(
         &runtime,
         no_input,
-        password_fd,
+        credentials,
         &command_forwards,
         &listeners,
     ) {
@@ -661,12 +661,13 @@ pub fn restart(
             _ => return Err("TUNNEL_INVALID: registry has unknown forward kind".to_string()),
         }
     }
+    let mut credentials = connect::StandaloneCredentials::new(password_fd.or(vm_password_fd));
     start(
         entry,
         home,
         &record.selected_alias,
         no_input,
-        password_fd.or(vm_password_fd),
+        &mut credentials,
         &local,
         &remote,
         &dynamic,
