@@ -9001,3 +9001,97 @@ fn tunnel_retry_rejects_host_with_wrong_explicit_route() {
     drop(listener);
     fs::remove_dir_all(root).unwrap();
 }
+
+#[cfg(unix)]
+#[test]
+fn tunnel_retry_allows_correcting_a_previously_prompted_password() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let local_port = listener.local_addr().unwrap().port();
+    drop(listener);
+    write(
+        &config,
+        &format!(
+            "Host direct\n  HostName direct.example\n  ##PORT 5432\n  ##SSHX SERVICE 5432 LOCAL={local_port}\n"
+        ),
+    );
+    let config_before = fs::read(&config).unwrap();
+    let bin = fake_tunnel_ssh(&root);
+    fake_sshpass(&root);
+    let ssh = bin.join("ssh");
+    let script = fs::read_to_string(&ssh).unwrap();
+    let needle = "  *\" -N \"*)\n";
+    let fail_until_corrected = concat!(
+        "  *\" -N \"*)\n",
+        "    count=0\n",
+        "    [ ! -f \"$SSHX_CAPTURE.attempts\" ] || count=$(cat \"$SSHX_CAPTURE.attempts\")\n",
+        "    count=$((count + 1))\n",
+        "    printf '%s' \"$count\" > \"$SSHX_CAPTURE.attempts\"\n",
+        "    if [ \"$count\" -lt 4 ]; then\n",
+        "      echo \"Permission denied, please try again.\" >&2\n",
+        "      exit 5\n",
+        "    fi\n",
+    );
+    assert!(script.contains(needle));
+    fs::write(&ssh, script.replacen(needle, fail_until_corrected, 1)).unwrap();
+    let sshpass = bin.join("sshpass");
+    let script = fs::read_to_string(&sshpass).unwrap();
+    let capture = r#"[ -n "$SSHX_PASSWORD_CAPTURE" ] && eval "cat <&$password_fd" > "$SSHX_PASSWORD_CAPTURE""#;
+    assert!(script.contains(capture));
+    fs::write(
+        &sshpass,
+        script.replace(capture, r#"eval "cat <&$password_fd" >> "$SSHX_CAPTURE.passwords""#),
+    ).unwrap();
+
+    let (status, output) = run_with_pty_interactions(
+        &home,
+        &["tunnel", "direct", "start", "direct"],
+        &bin,
+        &root,
+        &[
+            (b"Search:", b"\r"),
+            (b"Connection workspace", b" \r"),
+            (b"Enter confirm", b"\r"),
+            (b"Password for direct host `direct`:", b"first-wrong\n"),
+            (b"Connection workspace", b"\r"),
+            (b"Enter confirm", b"\r"),
+            (b"Password for direct host `direct` (replacement):", b"second-correct\n"),
+            (b"Save replacement password", b"n\n"),
+            (b"dt-", b"\x1b"),
+            (b"Search:", b"\x1b"),
+        ],
+        None,
+        Some((80, 24)),
+    );
+    assert!(status.success(), "status={status:?} output={output}");
+    assert!(!output.contains("first-wrong") && !output.contains("second-correct"));
+    assert_eq!(
+        fs::read_to_string(root.join("runtime-config.passwords")).unwrap(),
+        "first-wrong\nfirst-wrong\nsecond-correct\n"
+    );
+    assert_eq!(fs::read(&config).unwrap(), config_before);
+    let listed = run_fake_ssh(
+        &home,
+        &["tunnel", "direct", "list", "--format", "json"],
+        &bin,
+        &root,
+    );
+    assert!(listed.status.success(), "{listed:?}");
+    let document: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    let id = document["tunnels"].as_array().unwrap().iter()
+        .find(|tunnel| tunnel["state"] == "active")
+        .and_then(|tunnel| tunnel["id"].as_str())
+        .expect("corrected password should start an owned standalone Tunnel");
+    let stopped = run_fake_ssh(
+        &home,
+        &["tunnel", "direct", "stop", id, "--format", "json"],
+        &bin,
+        &root,
+    );
+    assert!(stopped.status.success(), "{stopped:?}");
+    let released = TcpListener::bind(("127.0.0.1", local_port))
+        .expect("stopping corrected-password Tunnel should release its listener");
+    drop(released);
+    fs::remove_dir_all(root).unwrap();
+}

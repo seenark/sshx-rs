@@ -941,6 +941,7 @@ fn launch_standalone_session(
         credentials.attempt = password_attempt(&runtime.runtime, credentials.input)?;
     }
     let mut enrolled = false;
+    let mut prompted = false;
     loop {
         match launch_standalone_once(
             runtime,
@@ -960,13 +961,12 @@ fn launch_standalone_session(
                 let can_prompt = !no_input
                     && io::stdin().is_terminal()
                     && error.starts_with("SSH_AUTH_FAILED")
-                    && credentials.attempt
-                        .as_ref()
-                        .is_none_or(|value| value.source != PasswordSource::Prompted);
+                    && !prompted;
                 if can_prompt
                     && let Some(next) = prompt_password(&runtime.runtime.alias, credentials.attempt.is_some())?
                 {
                     credentials.attempt = Some(next);
+                    prompted = true;
                     continue;
                 }
                 return Err(error);
