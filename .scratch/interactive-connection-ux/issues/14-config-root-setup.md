@@ -4,7 +4,8 @@
 
 **Blocked by:** 01: Browse HostEntries and return from a Session; 02: Continue incomplete CLI operations in the TUI.
 
-**Status:** ready-for-agent
+**Status:** ready-for-human
+**Integrated verification:** Serialized, fresh-target full suite passed 325 tests across nine suites (`artifact://1802`); earlier pending-suite notes are superseded.
 
 - [x] An empty Hosts view provides a clear route to Setup and Doctor; Setup lists current roots and can select scope, project, and a real SSH config file.
 - [x] Explicit CLI setup inputs are prefilled when interactive continuation is needed; a fully specified CLI setup retains its existing direct behavior.

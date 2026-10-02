@@ -4,7 +4,8 @@
 
 **Blocked by:** 01: Browse HostEntries and return from a Session.
 
-**Status:** ready-for-agent
+**Status:** ready-for-human
+**Integrated verification:** Serialized, fresh-target full suite passed 325 tests across nine suites (`artifact://1802`); earlier pending-suite notes are superseded.
 
 - [x] Findings are grouped by severity and stage in the TUI and human CLI output; each finding retains its evidence, affected path, and actionable guidance without repeated boilerplate.
 - [x] Doctor remains report-only until the user requests repair and confirms one plan listing eligible paths, existing modes, and target modes; each attempted repair has a visible result.

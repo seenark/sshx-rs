@@ -4,7 +4,8 @@
 
 **Blocked by:** 01: Browse HostEntries and return from a Session.
 
-**Status:** ready-for-agent
+**Status:** ready-for-human
+**Integrated verification:** Serialized, fresh-target full suite passed 325 tests across nine suites (`artifact://1802`); earlier pending-suite notes are superseded.
 
 - [x] Explicit TUI invocation opens either Hosts or a focused, prefilled operation; a connect command missing its HostEntry and a host-show command missing its selector open the appropriate focused selection.
 - [x] Values supplied on the command line remain visible and editable in the TUI; explicit selectors retain exact semantics and never become fuzzy matches or guessed values.

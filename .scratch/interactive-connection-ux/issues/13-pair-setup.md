@@ -4,7 +4,8 @@
 
 **Blocked by:** 01: Browse HostEntries and return from a Session; 02: Continue incomplete CLI operations in the TUI.
 
-**Status:** ready-for-agent
+**Status:** ready-for-human
+**Integrated verification:** Serialized, fresh-target full suite passed 325 tests across nine suites (`artifact://1802`); earlier pending-suite notes are superseded.
 
 - [x] Gateway selection filters ineligible VM choices; duplicate aliases remain distinguishable by source. A partial CLI Pair command keeps its supplied gateway or VM selection visible and editable.
 - [x] Ambiguous or missing transit inference shows candidates or accepts explicit transit host and port; no candidate is silently selected.

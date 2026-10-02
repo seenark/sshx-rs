@@ -4,7 +4,8 @@
 
 **Blocked by:** 01: Browse HostEntries and return from a Session; 02: Continue incomplete CLI operations in the TUI.
 
-**Status:** ready-for-agent
+**Status:** ready-for-human
+**Integrated verification:** Serialized, fresh-target full suite passed 325 tests across nine suites (`artifact://1802`); earlier pending-suite notes are superseded.
 
 - [x] One connection workspace shows mode, exact HostEntry or Pair route, several editable service-forward rows, and a single review/confirmation without replacing the whole screen for each field.
 - [x] The example server ports 5432, 6379, and 3001 can map respectively to local ports 5432, 6378, and 3001 in one request; repeated declared-service CLI options express the same request.

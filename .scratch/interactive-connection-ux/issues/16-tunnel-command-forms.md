@@ -4,7 +4,8 @@
 
 **Blocked by:** None (can start immediately).
 
-**Status:** ready-for-agent
+**Status:** ready-for-human
+**Integrated verification:** Serialized, fresh-target full suite passed 325 tests across nine suites (`artifact://1802`); earlier pending-suite notes are superseded.
 
 - [x] Documented direct and paired start forms reach the appropriate existing execution path; a route-specific form rejects a HostEntry whose route does not match instead of silently starting a different kind of Tunnel.
 - [x] Route-specific list, status, stop, and restart forms operate on persisted Tunnel IDs with the existing ownership checks and do not create a second registry.

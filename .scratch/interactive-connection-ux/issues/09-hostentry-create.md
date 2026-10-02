@@ -4,7 +4,8 @@
 
 **Blocked by:** 01: Browse HostEntries and return from a Session; 02: Continue incomplete CLI operations in the TUI.
 
-**Status:** ready-for-agent
+**Status:** ready-for-human
+**Integrated verification:** Serialized, fresh-target full suite passed 325 tests across nine suites (`artifact://1802`); earlier pending-suite notes are superseded.
 
 - [x] The workspace selects an existing config root, scope and project as applicable, destination file, alias and host destination; supplied CLI values are prefilled and editable, while optional password input remains masked.
 - [x] Preview shows the intended filesystem change without applying it; applying the reviewed plan requires consent and preserves existing private-file and mutation safety rules.
