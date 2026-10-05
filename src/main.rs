@@ -584,12 +584,20 @@ fn run_hosts(
         let entry = selection.entry;
         let alias = selection.alias;
         let edit_action = state.edit_action.take();
+        let copy_password = std::mem::take(&mut state.copy_password);
         let unchanged = entry_sources_unchanged(entry, &sources);
         if !unchanged {
             status = Some(format!(
                 "HOST_SOURCE_CHANGED: {} changed; select its current HostEntry again",
                 entry.source.path
             ));
+            continue;
+        }
+        if copy_password {
+            status = Some(match run_host_action(HostAction::CopyPassword, &selection, &catalog.entries, cli) {
+                Ok(()) => "Password copied to clipboard.".to_string(),
+                Err(error) => error,
+            });
             continue;
         }
         if let Some(operation) = edit_action {
@@ -969,12 +977,38 @@ fn run_tui_operation(cli: &Cli) -> Result<(), String> {
             }
             let mut result = None;
             loop {
+                let filtered = catalog.entries.iter()
+                    .filter(|entry| entry_matches_provenance(entry, cli)).collect::<Vec<_>>();
+                let sources = catalog_source_snapshots(&catalog);
                 let selection = picker::browse_hosts(&filtered, &catalog.entries, &mut state, result.as_deref())?;
                 let Some(selected) = selection else {
                     return if result.is_some() { Ok(()) } else { Err(picker::CANCELLED.to_string()) };
                 };
-                result = Some(format!("Host show:\n{}", render_human(&[selected.entry])));
-                state.prefill(selected.entry, selected.alias, "");
+                let copy_password = std::mem::take(&mut state.copy_password);
+                if !entry_sources_unchanged(selected.entry, &sources) {
+                    result = Some(format!(
+                        "HOST_SOURCE_CHANGED: {} changed; select its current HostEntry again",
+                        selected.entry.source.path
+                    ));
+                } else if copy_password {
+                    result = Some(match run_host_action(HostAction::CopyPassword, &selected, &catalog.entries, cli) {
+                        Ok(()) => "Password copied to clipboard.".to_string(),
+                        Err(error) => error,
+                    });
+                } else {
+                    result = Some(format!("Host show:\n{}", render_human(&[selected.entry])));
+                    state.prefill(selected.entry, selected.alias, "");
+                }
+                match discover_roots(&settings::discovery_roots(&roots)) {
+                    Ok(refreshed) => catalog = refreshed,
+                    Err(error) => {
+                        catalog.entries.clear();
+                        result = Some(match result.take() {
+                            Some(result) => format!("{result}\n{error}"),
+                            None => error.to_string(),
+                        });
+                    }
+                }
             }
         }
         _ => Err("TUI_UNAVAILABLE: this operation has no focused TUI workspace yet".to_string()),

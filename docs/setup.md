@@ -50,6 +50,8 @@ Default personal root is `~/.ssh/config`. This environment also supports the exi
 
 Run `sshx` with no arguments to open Hosts. Run `sshx --config PATH` to open Hosts against an explicit config root; this also requires usable terminals.
 
+In Hosts, select a HostEntry and press **Ctrl+Y** to copy its stored password. This shortcut also works in `sshx tui host show`. It requires a direct HostEntry with a non-empty stored password and a supported clipboard backend. After the clipboard-history warning, answer `y` to `Copy stored password now? [y/N]:` to confirm. Copying, declining, or an unavailable action returns to Hosts with the same search and selection; it never starts SSH or displays the password. Clipboard managers may retain the password, and `sshx` does not automatically clear the clipboard.
+
 Let setup discover existing roots:
 
 ```sh

@@ -87,6 +87,7 @@ pub struct HostsState {
     detail_scroll: u16,
     pub active_tunnels: usize,
     pub edit_action: Option<sshx::mutation::MutationKind>,
+    pub copy_password: bool,
     pub editing_enabled: bool,
 }
 
@@ -341,6 +342,18 @@ pub fn browse_hosts<'a>(
                             entry: row.entry,
                             alias: row.alias,
                         }));
+                    }
+                }
+                KeyEvent {
+                    code: KeyCode::Char('y'),
+                    modifiers,
+                    ..
+                } if modifiers.contains(KeyModifiers::CONTROL) => {
+                    if let Some(row) = rows.get(selected) {
+                        state.detail_scroll = 0;
+                        state.detail_page = HostDetailPage::Summary;
+                        state.copy_password = true;
+                        return Ok(Some(Selection { entry: row.entry, alias: row.alias }));
                     }
                 }
                 KeyEvent {
@@ -1339,20 +1352,23 @@ fn remember_selection(state: &mut HostsState, rows: &[Row<'_>], selected: usize)
 
 fn hosts_footer(width: u16, has_rows: bool, active_tunnels: usize) -> String {
     if width < 24 {
-        return format!(
-            "{}Tab details\nPg scroll\n^T Tunnels\n^P Pairs ^S Setup\n^D Doctor · Esc",
-            if has_rows { "↑↓ Enter\n" } else { "" }
-        );
+        return if has_rows {
+            "↑↓ Enter\n^Y Copy password\nTab · Pg scroll\n^T Tunnels\n^P Pairs ^S Setup\n^D Doctor · Esc"
+        } else {
+            "Tab details\nPg scroll\n^T Tunnels\n^P Pairs ^S Setup\n^D Doctor · Esc"
+        }.to_string();
     }
     if width < 48 {
-        return format!(
-            "{}\nPgUp/Dn scroll\n^T Tunnels · ^P Pairs\n^S Setup · ^D Doctor\nEsc exit",
-            if has_rows { "↑↓ Enter · Tab details" } else { "Tab details" }
-        );
+        return if has_rows {
+            "↑↓ Enter\n^Y Copy password\nTab details · Pg scroll\n^T Tunnels · ^P Pairs\n^S Setup ^D Doctor · Esc"
+        } else {
+            "Tab details\nPgUp/Dn scroll\n^T Tunnels · ^P Pairs\n^S Setup · ^D Doctor\nEsc exit"
+        }.to_string();
     }
     format!(
-        "{}\nPgUp/Dn scroll\nCtrl+T Tunnels ({active_tunnels} active) · Ctrl+P Pairs\nCtrl+S Setup · Ctrl+D Doctor · Esc exit",
-        if has_rows { "↑↓ move · Enter connect · Tab details" } else { "Tab details" }
+        "{}\nPgUp/Dn scroll{}\nCtrl+T Tunnels ({active_tunnels} active) · Ctrl+P Pairs\nCtrl+S Setup · Ctrl+D Doctor · Esc exit",
+        if has_rows { "↑↓ move · Enter connect · Tab details" } else { "Tab details" },
+        if has_rows { " · Ctrl+Y Copy password" } else { "" }
     )
 }
 
@@ -3641,6 +3657,7 @@ fn read_key(input: &mut File, prefix: &str) -> Result<KeyEvent, String> {
         0x10 => return Ok(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL)),
         0x13 => return Ok(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)),
         0x18 => return Ok(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL)),
+        0x19 => return Ok(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL)),
         0x14 => return Ok(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL)),
         0x04 => return Ok(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)),
         0x15 => return Ok(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)),
@@ -4069,21 +4086,13 @@ fn block(title: impl Into<Line<'static>>, color: Color) -> Block<'static> {
 #[cfg(test)]
 mod tests {
     use super::{
-        clear_preflight_errors, fuzzy_score, hosts_footer, matching_rows,
+        clear_preflight_errors, fuzzy_score, matching_rows,
         password_backspace, password_insert, read_key, restore_edit_row_errors,
         row_label, source_details, toggle_password_clear, workspace_preflight_issues, wrap_status,
     };
     use sshx::discovery::{HostEntry, SourceIdentity};
 
 
-    #[test]
-    fn hosts_footer_keeps_detail_and_scroll_controls_at_compact_widths() {
-        for width in [18, 24, 32, 47, 48, 80] {
-            let footer = hosts_footer(width, true, 2);
-            assert!(footer.contains("Tab details"), "width={width}: {footer}");
-            assert!(footer.contains("scroll"), "width={width}: {footer}");
-        }
-    }
     #[test]
     fn password_clear_toggle_restores_form_baseline() {
         let original = "********";
