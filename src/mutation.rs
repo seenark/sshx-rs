@@ -139,6 +139,12 @@ pub struct PairMutationRequest {
     pub transit_port: u16,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PairMutationKind {
+    Setup,
+    Delete,
+}
+
 #[derive(Debug)]
 pub struct PairPlan {
     pub gateway_id: String,
@@ -373,12 +379,19 @@ pub fn apply_edit(plan: &EditPlan) -> Result<(), String> {
     apply_writes(&plan.lock_path, &plan.writes)
 }
 
-pub fn plan_pair(request: &PairMutationRequest) -> Result<PairPlan, String> {
+pub fn plan_pair(request: &PairMutationRequest, kind: PairMutationKind) -> Result<PairPlan, String> {
     validate_value("gateway_id", &request.gateway_id)?;
     validate_value("vm_id", &request.vm_id)?;
     validate_value("transit_host", &request.transit_host)?;
     if request.transit_port == 0 {
-        return Err("TRANSIT_PORT_INVALID: transit port must be non-zero".to_string());
+        return Err(match kind {
+            PairMutationKind::Setup => {
+                "TRANSIT_PORT_INVALID: transit port must be non-zero".to_string()
+            }
+            PairMutationKind::Delete => {
+                "PAIR_INVALID: selected Pair has conflicting metadata".to_string()
+            }
+        });
     }
     let gateway_request = UpdateRequest {
         path: request.gateway_path.clone(),
@@ -410,34 +423,52 @@ pub fn plan_pair(request: &PairMutationRequest) -> Result<PairPlan, String> {
         clear_port: false,
         clear_password: false,
     };
-    let gateway = load_block_with_span(
-        &gateway_request,
-        request.gateway_byte_start,
-        request.gateway_byte_end,
-    )?;
-    let vm = load_block_with_span(&vm_request, request.vm_byte_start, request.vm_byte_end)?;
-    let mut gateway_changes = pair_identity_changes(&gateway, &request.gateway_id, false, "", 0)?;
-    gateway_changes.push(insert_metadata(
-        &gateway,
-        &format!("##SSHX VM={}", request.vm_id),
-    ));
-    let vm_changes = pair_identity_changes(
-        &vm,
-        &request.vm_id,
-        true,
-        &request.gateway_id,
-        request.transit_port,
-    )
-    .map(|mut changes| {
-        changes.push(insert_metadata(
-            &vm,
-            &format!(
-                "##SSHX TRANSIT={}:{}",
-                request.transit_host, request.transit_port
-            ),
-        ));
-        changes
-    })?;
+    let (gateway, vm, gateway_changes, vm_changes) = match kind {
+        PairMutationKind::Setup => {
+            let gateway = load_block_with_span(
+                &gateway_request,
+                request.gateway_byte_start,
+                request.gateway_byte_end,
+            )?;
+            let vm = load_block_with_span(&vm_request, request.vm_byte_start, request.vm_byte_end)?;
+            let mut gateway_changes =
+                pair_identity_changes(&gateway, &request.gateway_id, false, "", 0)?;
+            gateway_changes.push(insert_metadata(
+                &gateway,
+                &format!("##SSHX VM={}", request.vm_id),
+            ));
+            let vm_changes = pair_identity_changes(
+                &vm,
+                &request.vm_id,
+                true,
+                &request.gateway_id,
+                request.transit_port,
+            )
+            .map(|mut changes| {
+                changes.push(insert_metadata(
+                    &vm,
+                    &format!(
+                        "##SSHX TRANSIT={}:{}",
+                        request.transit_host, request.transit_port
+                    ),
+                ));
+                changes
+            })?;
+            (gateway, vm, gateway_changes, vm_changes)
+        }
+        PairMutationKind::Delete => {
+            let gateway = load_block_source_span(
+                &gateway_request,
+                request.gateway_byte_start,
+                request.gateway_byte_end,
+            )?;
+            let vm =
+                load_block_source_span(&vm_request, request.vm_byte_start, request.vm_byte_end)?;
+            let gateway_changes = pair_delete_changes(&gateway, request, false)?;
+            let vm_changes = pair_delete_changes(&vm, request, true)?;
+            (gateway, vm, gateway_changes, vm_changes)
+        }
+    };
 
     let same_file = gateway.path == vm.path;
     let mut files = Vec::new();
@@ -783,6 +814,94 @@ fn sync_parent(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn pair_delete_changes(
+    loaded: &LoadedBlock,
+    request: &PairMutationRequest,
+    vm: bool,
+) -> Result<Vec<Change>, String> {
+    let conflict = || "PAIR_INVALID: selected Pair has conflicting metadata".to_string();
+    let block_start_line = (0..loaded.host_line)
+        .rev()
+        .take_while(|index| {
+            let line = loaded.lines[*index];
+            let text = String::from_utf8_lossy(&loaded.before[line.start..line.content_end]);
+            let trimmed = text.trim();
+            trimmed.is_empty() || trimmed.starts_with("##SSHX")
+        })
+        .last()
+        .unwrap_or(loaded.host_line);
+    let mut parse_end_line = loaded.block_end_line;
+    while parse_end_line > loaded.host_line + 1 {
+        let line = loaded.lines[parse_end_line - 1];
+        let text = String::from_utf8_lossy(&loaded.before[line.start..line.content_end]);
+        if text.trim_start().starts_with("##SSHX") {
+            parse_end_line -= 1;
+        } else {
+            break;
+        }
+    }
+    let (expected_id, selected_id) = if vm {
+        (&request.vm_expected_id, &request.vm_id)
+    } else {
+        (&request.gateway_expected_id, &request.gateway_id)
+    };
+    let mut counts = [0; 4];
+    let mut changes = Vec::new();
+    for line in &loaded.lines[block_start_line..parse_end_line] {
+        let text = String::from_utf8_lossy(&loaded.before[line.start..line.content_end]);
+        let Some(rest) = text.trim().strip_prefix("##SSHX") else {
+            continue;
+        };
+        let (key, value) = crate::pair::metadata_key_value(rest.trim());
+        let valid = match key.as_deref() {
+            Some("ID") => {
+                counts[0] += 1;
+                value.as_deref().is_some_and(|id| {
+                    crate::pair::valid_id(id)
+                        && id.eq_ignore_ascii_case(expected_id)
+                        && id.eq_ignore_ascii_case(selected_id)
+                })
+            }
+            Some("GATEWAY") => {
+                counts[1] += 1;
+                vm && value
+                    .as_deref()
+                    .is_some_and(|id| id.eq_ignore_ascii_case(&request.gateway_id))
+            }
+            Some("VM") => {
+                counts[2] += 1;
+                !vm && value
+                    .as_deref()
+                    .is_some_and(|id| id.eq_ignore_ascii_case(&request.vm_id))
+            }
+            Some("TRANSIT") => {
+                counts[3] += 1;
+                vm && value
+                    .as_deref()
+                    .and_then(crate::pair::parse_transit)
+                    .is_some_and(|(host, port)| {
+                        host == request.transit_host && port == request.transit_port
+                    })
+            }
+            _ => continue,
+        };
+        if !valid {
+            return Err(conflict());
+        }
+        if key.as_deref() != Some("ID") {
+            changes.push(Change {
+                start: line.start,
+                end: line.end,
+                replacement: Vec::new(),
+            });
+        }
+    }
+    if counts != if vm { [1, 1, 0, 1] } else { [1, 0, 1, 0] } {
+        return Err(conflict());
+    }
+    Ok(changes)
+}
+
 fn pair_identity_changes(
     loaded: &LoadedBlock,
     id: &str,
@@ -1051,6 +1170,37 @@ fn load_block_with_span(
     byte_start: usize,
     byte_end: usize,
 ) -> Result<LoadedBlock, String> {
+    let mut loaded = load_block_source_span_inner(request, byte_start, byte_end, false)?;
+    loaded.marker_range = (loaded.block_start_line..loaded.host_line).find_map(|index| {
+        let line = loaded.lines[index];
+        let text = String::from_utf8_lossy(&loaded.before[line.start..line.content_end]);
+        (existing_id(&text) == Some(request.expected_id.clone())).then_some((line.start, line.end))
+    });
+    let actual_id = loaded
+        .marker_range
+        .as_ref()
+        .map(|_| request.expected_id.clone())
+        .unwrap_or_else(|| synthetic_entry_id(&loaded.path, byte_start, byte_end));
+    if actual_id != request.expected_id {
+        return Err("CONFIG_CHANGED: selected Host identity is stale".to_string());
+    }
+    Ok(loaded)
+}
+
+fn load_block_source_span(
+    request: &UpdateRequest,
+    byte_start: usize,
+    byte_end: usize,
+) -> Result<LoadedBlock, String> {
+    load_block_source_span_inner(request, byte_start, byte_end, true)
+}
+
+fn load_block_source_span_inner(
+    request: &UpdateRequest,
+    byte_start: usize,
+    byte_end: usize,
+    deletion: bool,
+) -> Result<LoadedBlock, String> {
     let path = absolute_path(&request.path)?;
     validate_path_components(&path, "SOURCE_FILE")?;
     let before = read_regular_file(&path, "SOURCE_FILE")?;
@@ -1062,14 +1212,40 @@ fn load_block_with_span(
         .iter()
         .position(|line| line.start == byte_start)
         .ok_or_else(|| "CONFIG_CHANGED: selected Host line no longer exists".to_string())?;
-    if !is_host_boundary(&before, lines[host_line]) {
+    let normalized_tokens = |line: ByteLine| {
+        crate::pair::directive_tokens(&String::from_utf8_lossy(
+            &before[line.start..line.content_end],
+        ))
+    };
+    let host_is_valid = if deletion {
+        let tokens = normalized_tokens(lines[host_line]);
+        tokens
+            .first()
+            .is_some_and(|keyword| keyword.eq_ignore_ascii_case("host"))
+            && tokens.len() > 1
+    } else {
+        is_host_boundary(&before, lines[host_line])
+    };
+    if !host_is_valid {
         return Err("CONFIG_CHANGED: selected span is no longer a Host block".to_string());
     }
+    let boundary = |line: ByteLine| {
+        if deletion {
+            let tokens = normalized_tokens(line);
+            match tokens.first().map(String::as_str) {
+                Some(keyword) if keyword.eq_ignore_ascii_case("match") => true,
+                Some(keyword) if keyword.eq_ignore_ascii_case("host") => tokens.len() > 1,
+                _ => false,
+            }
+        } else {
+            is_boundary(&before, line)
+        }
+    };
     let block_end_line = lines
         .iter()
         .enumerate()
         .skip(host_line + 1)
-        .find(|(_, line)| is_boundary(&before, **line))
+        .find(|(_, line)| boundary(**line))
         .map_or(lines.len(), |(index, _)| index);
     let block_end = lines
         .get(block_end_line.saturating_sub(1))
@@ -1077,34 +1253,31 @@ fn load_block_with_span(
     if block_end != byte_end {
         return Err("CONFIG_CHANGED: selected Host block span is stale".to_string());
     }
-    let spans = token_spans(&before[lines[host_line].start..lines[host_line].content_end]);
-    let aliases = spans
-        .iter()
-        .skip(1)
-        .map(|(start, end)| {
-            decode_token(&before[lines[host_line].start + *start..lines[host_line].start + *end])
+    let raw = &before[lines[host_line].start..lines[host_line].content_end];
+    let spans = token_spans(raw);
+    let embedded_alias = if deletion {
+        spans.first().and_then(|(start, end)| {
+            raw[*start..*end]
+                .iter()
+                .position(|byte| *byte == b'=')
+                .map(|equal| (*start + equal + 1, *end))
+                .filter(|(start, end)| start < end)
         })
-        .collect::<Vec<_>>();
-    if !aliases.iter().any(|alias| alias == &request.selected_alias) {
+    } else {
+        None
+    };
+    if !embedded_alias
+        .into_iter()
+        .chain(spans.iter().copied().skip(1))
+        .any(|(start, end)| decode_token(&raw[start..end]) == request.selected_alias)
+    {
         return Err("CONFIG_CHANGED: selected alias no longer exists".to_string());
     }
 
     let block_start_line = (0..host_line)
         .rev()
-        .find(|index| is_boundary(&before, lines[*index]))
+        .find(|index| boundary(lines[*index]))
         .map_or(0, |index| index + 1);
-    let marker_range = (block_start_line..host_line).find_map(|index| {
-        let line = lines[index];
-        let text = String::from_utf8_lossy(&before[line.start..line.content_end]);
-        (existing_id(&text) == Some(request.expected_id.clone())).then_some((line.start, line.end))
-    });
-    let actual_id = marker_range
-        .as_ref()
-        .map(|_| request.expected_id.clone())
-        .unwrap_or_else(|| synthetic_entry_id(&path, byte_start, byte_end));
-    if actual_id != request.expected_id {
-        return Err("CONFIG_CHANGED: selected Host identity is stale".to_string());
-    }
     Ok(LoadedBlock {
         path,
         before,
@@ -1115,7 +1288,7 @@ fn load_block_with_span(
         block_start_line,
         block_end_line,
         block_end,
-        marker_range,
+        marker_range: None,
     })
 }
 

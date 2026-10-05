@@ -1,0 +1,1 @@
+-S /private/var/folders/9f/nj_60wj11x74n9nrxp49_t8m0000gn/T/sshx-ticket-02-1790615398520270000-0/manual.sock -N -L 127.0.0.1:58911:127.0.0.1:5432 -L 127.0.0.1:58912:db.internal:5433 -L localhost:58913:cache.internal:5434

@@ -173,13 +173,19 @@ A **Pair** links exact gateway and VM HostEntries. The gateway OpenSSH master op
 
 In the Hosts TUI, press `Ctrl+P` to open Pairs, or run `sshx tui pair list` or `sshx tui pair validate`. Use Up/Down to select a Pair or a diagnostic group. The detail pane shows exact gateway and VM aliases, IDs, source paths and Host lines, approved transit, and route validity. Diagnostic groups show evidence and guidance; use Page Up/Page Down to scroll details. Press `V` to rediscover and validate current SSH config without changing files, repairing permissions, or starting OpenSSH. Press `Esc` to return to Hosts, or `S` to begin Pair setup.
 
+Press `D` on an exact Pair record to review deletion. Review shows both aliases, immutable IDs, source paths and Host lines, stored transit, and a redacted diff. `Enter` deletes the relationship; `Esc` or `Ctrl+C` cancels and returns to Pairs. Both HostEntries, IDs, passwords, comments, and OpenSSH directives—including existing forwards—remain unchanged. Pairs refreshes after deletion, and the unlinked HostEntries can be paired again. Diagnostic groups and empty rows cannot be deleted.
+
+Active, starting, or stopping managed use of either endpoint blocks Pair deletion. Unsafe or invalid registries, conflicting relationship metadata, and pending recovery journals also block it. Changed route directives alone do not prevent unlinking an unambiguous reciprocal relationship. Deletion rechecks current discovery, exact sources, journals, and managed use after review, then applies only the reviewed plan; changed source bytes are rejected without writes. It never starts or stops OpenSSH.
+
 Create a Pair when one route is unambiguous:
 
 ```sh
 sshx pair setup gateway-alias vm-alias
 ```
 
-Provide the transit destination when inference finds multiple candidates. Explicit destination must match exactly one gateway `LocalForward`, and its port must match the VM `Port`:
+Provide the transit destination when inference finds multiple candidates. An explicit destination must match exactly one gateway `LocalForward` remote destination.
+
+For a VM whose `HostName` is loopback or `localhost`, a gateway listener matching the VM address and `Port` supplies the remote transit destination. The remote port may differ from the VM `Port`: `LocalForward 2222 vm.internal:22` matches a VM at `127.0.0.1:2222`, with transit `vm.internal:22`. If no local listener matches, the transit destination port must match the VM `Port`. Pair setup preserves the original directives and VM port.
 
 ```sh
 sshx pair setup gateway-alias vm-alias \
@@ -189,13 +195,15 @@ sshx pair setup gateway-alias vm-alias \
 
 An incomplete command such as `sshx pair setup gateway-alias`, or a route with unresolved transit, opens one Pair workspace when stdin and stderr are usable terminals. Run `sshx tui pair setup gateway-alias vm-alias` to edit even a complete operation. Supplied exact selections remain visible and editable; explicit unknown or ambiguous selectors fail before the workspace opens. Machine output, piped input, and `--no-input` never open it.
 
-Use `Tab` or `Shift+Tab` to move between gateway, VM, transit host, and transit port. Type to search alias rows and press `Enter` to choose an exact entry. Rows and details identify source files and Host lines, including duplicate and secondary aliases. Gateway selection excludes the same HostEntry, already-paired entries, unsafe proxy routes, and VMs without compatible transit. Press `Ctrl+N` to choose and cycle transit candidates explicitly, or edit host and port inline. Ambiguous transit is never silently selected.
+Pair setup is one form with **Gateway**, **VM**, and **Transit** sections. At 80 columns and 20 rows or larger, the form and active editor appear side by side; smaller terminals stack them and keep the focused field visible. Committed gateway and VM aliases remain separate from the active `Search:` query. Type to search eligible aliases and press `Enter` to choose an exact HostEntry. A search with no matches does not replace the committed selection. Candidate context identifies the exact source and ID; use Page Up/Page Down to scroll context on small terminals.
 
-Press `Ctrl+S` to review both exact sources, transit, and metadata changes in the same workspace; use Page Up/Page Down to scroll. Only `Enter` during review applies the existing atomic Pair mutation. `Esc` returns to editing, then cancels; `Ctrl+C` cancels immediately. Validation errors retain values. Changed sources require reopening setup, and cancellation or failed validation writes no relationship. A successful result leaves the workspace open. `--yes` skips only the complete CLI consent prompt, not TUI review.
+Use `Tab` or `Shift+Tab` to move between gateway, VM, transit host, and transit port. Gateway selection excludes the same HostEntry, already-paired entries, and unsafe proxy routes. Missing, ambiguous, or incompatible transit does not hide an otherwise eligible VM; setup validates transit before review. If a changed gateway makes the selected VM structurally ineligible, setup retains the VM and warns until you replace it. The Transit section keeps host and port together and shows automatic, ambiguous, or missing transit candidates. Press `Ctrl+N` to choose and cycle candidates explicitly, or edit host and port inline. Ambiguous transit is never silently selected.
+
+Press `Ctrl+S` to replace the form with a full-width review of both exact sources, transit, and metadata changes; use Page Up/Page Down to scroll. Only `Enter` during review applies the existing atomic Pair mutation. `Esc` returns to the unchanged draft, then cancels; `Ctrl+C` cancels immediately. Editing invalidates review and requires another `Ctrl+S`. Validation errors retain values. Changed sources require reopening setup, and cancellation or failed validation writes no relationship. A successful result leaves the workspace open. `--yes` skips only the complete CLI consent prompt, not TUI review. At 32×10, focused editing and review/cancel hints remain visible; below that size, cancellation remains available but not all context fits.
 
 Use `--preview` or `--dry-run` to render Pair changes without writing config. In the workspace, a successful review completes preview without allowing Apply. Complete CLI commands retain direct preview and consent behavior.
 
-When a recovery journal is pending, Pair setup lists the affected files and asks separately for explicit recovery consent before opening setup. Declining changes nothing. Confirming restores the interrupted transaction's saved content, then rediscovers HostEntries. `--yes` does not bypass recovery review; non-interactive or machine-output setup remains blocked until interactive recovery completes.
+When a recovery journal is pending, Pairs blocks both setup and deletion. Press `R` to inspect affected files and give separate explicit recovery consent; recovery returns to the refreshed Pairs list without starting setup or deletion. Pair setup from the CLI likewise lists affected files and asks for explicit recovery consent before opening setup. Declining changes nothing. Confirming restores the interrupted transaction's saved content, then rediscovers HostEntries. `--yes` does not bypass recovery review; non-interactive or machine-output setup remains blocked until interactive recovery completes.
 
 Inspect Pair records and validation diagnostics from the CLI:
 

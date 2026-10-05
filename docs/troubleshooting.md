@@ -40,7 +40,7 @@ If Pair setup reports a pending recovery journal, run `sshx pair setup` in an in
    ```
 
 2. Ensure the Pair names the intended gateway and VM HostEntries, not aliases that happen to match another source.
-3. If transit inference has multiple candidates, select an exact `--transit-host` and `--transit-port` from the gateway's `LocalForward` directives. Transit port must match VM `Port`.
+3. If transit inference has multiple candidates, select an exact `--transit-host` and `--transit-port` from the gateway's `LocalForward` remote destinations. For a loopback VM, first check whether a gateway listener matches the VM address and `Port`: `LocalForward 2222 vm.internal:22` maps `127.0.0.1:2222` to transit `vm.internal:22`. Without a matching listener, the transit destination port must match the VM `Port`. A VM remains selectable when transit is missing or incompatible, but setup rejects an invalid route before review or Apply.
 4. Confirm the gateway can reach the transit destination and that the requested temporary loopback port is free.
 5. Treat gateway and VM authentication as separate checks. Supply separate password file descriptors when needed; do not retry a rejected password automatically.
 6. A paired shell requires the gateway master first, then VM trust and authentication. A local listener or gateway master response is not end-to-end VM success.

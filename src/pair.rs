@@ -1,13 +1,16 @@
 use crate::discovery::{Diagnostic, HostEntry};
-use crate::mutation::{self, PairMutationRequest, PairPlan};
+use crate::mutation::{self, PairMutationKind, PairMutationRequest, PairPlan};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 const DEFAULT_SSH_PORT: u16 = 22;
 
 #[derive(Clone, Debug)]
 struct LocalForward {
+    // A missing listener address means the default localhost binding.
+    listener: Option<(Option<IpAddr>, u16)>,
     host: String,
     port: u16,
 }
@@ -23,9 +26,14 @@ struct ParsedEntry {
     paired_vm_marker: bool,
     transit: Option<(String, u16)>,
     transit_marker: bool,
+    pair_marker_counts: [usize; 3],
+    additional_references: Vec<String>,
     port: u16,
     port_set: bool,
     invalid_port: bool,
+    hostname_set: bool,
+    loopback_address: Option<IpAddr>,
+    localhost: bool,
     forwards: Vec<LocalForward>,
     proxy_command: bool,
     proxy_jump: bool,
@@ -92,7 +100,7 @@ pub fn paired_route(
     if vm_data.transit_marker && vm_data.transit.is_none() {
         return Err("PAIR_BROKEN: VM transit metadata is malformed".to_string());
     }
-    if vm_data.invalid_port || vm_data.port != transit.1 {
+    if vm_data.invalid_port {
         return Err("PAIR_ROUTE_CHANGED: VM Port no longer matches approved transit".to_string());
     }
 
@@ -149,6 +157,15 @@ pub fn paired_route(
         return Err(
             "PAIR_ROUTE_UNSAFE: ProxyCommand and ProxyJump are not allowed for paired routes"
                 .to_string(),
+        );
+    }
+    let matches_route = forward_matcher(gateway_data, vm_data);
+    if !gateway_data.forwards.iter().any(|candidate| {
+        matches_route(candidate) && candidate.host == transit.0 && candidate.port == transit.1
+    })
+    {
+        return Err(
+            "PAIR_ROUTE_CHANGED: VM route no longer matches approved transit".to_string(),
         );
     }
     let candidates = gateway_data
@@ -331,12 +348,18 @@ pub fn diagnostics(entries: &[HostEntry]) -> Vec<Diagnostic> {
                         forward.host == *transit_host && forward.port == *transit_port
                     })
                     .count();
-                if entry.invalid_port || entry.port != *transit_port || forward_count != 1 {
+                let matches_route = forward_matcher(gateway, entry);
+                let route_matches = gateway.forwards.iter().any(|forward| {
+                    matches_route(forward)
+                        && forward.host == *transit_host
+                        && forward.port == *transit_port
+                });
+                if !route_matches || forward_count != 1 {
                     push_diagnostic(
                         &mut diagnostics,
                         "PAIR_ROUTE_CHANGED",
                         format!(
-                            "route changed between {} and {}: VM Port is {}; approved transit is {}:{}; gateway LocalForward match count is {forward_count}. Evidence: {} and {}. Guidance: restore VM Port and exactly one gateway LocalForward to the approved transit destination.",
+                            "route changed between {} and {}: VM Port is {}; approved transit is {}:{}; gateway LocalForward match count is {forward_count}. Evidence: {} and {}. Guidance: restore a matching VM route and exactly one gateway LocalForward to the approved transit destination.",
                             source_label(&entries[*gateway_index]),
                             source_label(&entries[index]),
                             if entry.invalid_port {
@@ -557,24 +580,18 @@ pub fn plan_setup(
         return Err(format!("PAIR_VM_IN_USE: VM `{vm_id}` is already paired"));
     }
 
+    let matches_route = forward_matcher(gateway_data, vm_data);
     let (transit_host, transit_port) = match (transit_host, transit_port) {
         (Some(host), Some(port)) => {
             validate_transit_host(host)?;
             validate_transit_port(port)?;
-            if vm_data.invalid_port || vm_data.port != port {
+            if !gateway_data.forwards.iter().any(|candidate| {
+                matches_route(candidate) && candidate.host == host && candidate.port == port
+            })
+            {
                 return Err(format!(
-                    "TRANSIT_MISMATCH: explicit transit port {port} must match VM Port {}",
+                    "TRANSIT_MISMATCH: explicit transit {host}:{port} must match VM route at Port {}",
                     if vm_data.invalid_port { "invalid".to_string() } else { vm_data.port.to_string() }
-                ));
-            }
-            let matches = gateway_data
-                .forwards
-                .iter()
-                .filter(|candidate| candidate.host == host && candidate.port == port)
-                .count();
-            if matches != 1 {
-                return Err(format!(
-                    "TRANSIT_MISMATCH: explicit transit {host}:{port} matches {matches} gateway LocalForward directives"
                 ));
             }
             (host.to_string(), port)
@@ -590,56 +607,207 @@ pub fn plan_setup(
             } else {
                 vm_data.port
             };
-            let candidates = gateway_data
-                .forwards
-                .iter()
-                .filter(|candidate| candidate.port == vm_port)
-                .collect::<Vec<_>>();
-            let [candidate] = candidates.as_slice() else {
+            let mut candidates = gateway_data.forwards.iter().filter(|candidate| matches_route(candidate));
+            let candidate = candidates.next();
+            let remaining = candidates.count();
+            let Some(candidate) = candidate.filter(|_| remaining == 0) else {
                 return Err(format!(
                     "TRANSIT_REQUIRED: VM port {vm_port} matches {} gateway LocalForward candidates; provide --transit-host and --transit-port",
-                    candidates.len()
+                    usize::from(candidate.is_some()) + remaining
                 ));
             };
             (candidate.host.clone(), candidate.port)
         }
     };
+    let destination_matches = gateway_data
+        .forwards
+        .iter()
+        .filter(|candidate| candidate.host == transit_host && candidate.port == transit_port)
+        .count();
+    if destination_matches != 1 {
+        return Err(format!(
+            "TRANSIT_MISMATCH: approved transit {transit_host}:{transit_port} matches {destination_matches} gateway LocalForward directives"
+        ));
+    }
 
 
-    mutation::plan_pair(&PairMutationRequest {
-        gateway_path: gateway.source.path.clone().into(),
-        gateway_expected_id: gateway.id.clone(),
-        gateway_id,
-        gateway_alias: gateway_alias.to_string(),
-        gateway_byte_start: gateway.source.byte_start,
-        gateway_byte_end: gateway.source.byte_end,
-        vm_path: vm.source.path.clone().into(),
-        vm_expected_id: vm.id.clone(),
-        vm_id,
-        vm_alias: vm_alias.to_string(),
-        vm_byte_start: vm.source.byte_start,
-        vm_byte_end: vm.source.byte_end,
-        transit_host,
-        transit_port,
-    })
+    mutation::plan_pair(
+        &PairMutationRequest {
+            gateway_path: gateway.source.path.clone().into(),
+            gateway_expected_id: gateway.id.clone(),
+            gateway_id,
+            gateway_alias: gateway_alias.to_string(),
+            gateway_byte_start: gateway.source.byte_start,
+            gateway_byte_end: gateway.source.byte_end,
+            vm_path: vm.source.path.clone().into(),
+            vm_expected_id: vm.id.clone(),
+            vm_id,
+            vm_alias: vm_alias.to_string(),
+            vm_byte_start: vm.source.byte_start,
+            vm_byte_end: vm.source.byte_end,
+            transit_host,
+            transit_port,
+        },
+        PairMutationKind::Setup,
+    )
 }
+
+pub fn plan_delete(entries: &[HostEntry], selected: &PairRecord) -> Result<PairPlan, String> {
+    let stale = || "PAIR_SELECTION: selected Pair is no longer current".to_string();
+    let conflict = || "PAIR_INVALID: selected Pair has conflicting metadata".to_string();
+    if !valid_id(&selected.gateway_id)
+        || !valid_id(&selected.vm_id)
+        || selected.gateway_id.eq_ignore_ascii_case(&selected.vm_id)
+    {
+        return Err(conflict());
+    }
+    let parsed = entries
+        .iter()
+        .map(parse_entry)
+        .collect::<Result<Vec<_>, _>>()?;
+    let resolve = |selected_id: &str| -> Result<usize, String> {
+        let mut found = None;
+        for (index, metadata) in parsed.iter().enumerate() {
+            for id in metadata.id.iter().chain(metadata.additional_ids.iter()) {
+                if id.eq_ignore_ascii_case(selected_id) && found.replace(index).is_some() {
+                    return Err(conflict());
+                }
+            }
+        }
+        found.ok_or_else(stale)
+    };
+    let gateway_index = resolve(&selected.gateway_id)?;
+    let vm_index = resolve(&selected.vm_id)?;
+    let gateway = &entries[gateway_index];
+    let vm = &entries[vm_index];
+    let gateway_data = &parsed[gateway_index];
+    let vm_data = &parsed[vm_index];
+    if same_entry(gateway, vm)
+        || gateway_data.id_markers != 1
+        || vm_data.id_markers != 1
+        || !gateway.id.eq_ignore_ascii_case(&selected.gateway_id)
+        || !vm.id.eq_ignore_ascii_case(&selected.vm_id)
+    {
+        return Err(conflict());
+    }
+    for (index, metadata) in parsed.iter().enumerate() {
+        if same_entry(&entries[index], gateway) || same_entry(&entries[index], vm) {
+            continue;
+        }
+        if metadata
+            .gateway_id
+            .iter()
+            .chain(metadata.paired_vm_id.iter())
+            .chain(metadata.additional_references.iter())
+            .any(|id| {
+                id.eq_ignore_ascii_case(&selected.gateway_id)
+                    || id.eq_ignore_ascii_case(&selected.vm_id)
+            })
+        {
+            return Err(conflict());
+        }
+    }
+    if gateway_data.pair_marker_counts == [0, 0, 0]
+        && vm_data.pair_marker_counts == [0, 0, 0]
+    {
+        return Err(stale());
+    }
+    if gateway_data.pair_marker_counts != [0, 1, 0]
+        || vm_data.pair_marker_counts != [1, 0, 1]
+        || !gateway_data
+            .paired_vm_id
+            .as_deref()
+            .is_some_and(|id| id.eq_ignore_ascii_case(&selected.vm_id))
+        || !vm_data
+            .gateway_id
+            .as_deref()
+            .is_some_and(|id| id.eq_ignore_ascii_case(&selected.gateway_id))
+    {
+        return Err(conflict());
+    }
+    let Some((transit_host, transit_port)) = vm_data.transit.as_ref() else {
+        return Err(conflict());
+    };
+    if transit_host != &selected.transit_host || *transit_port != selected.transit_port {
+        return Err(stale());
+    }
+    mutation::plan_pair(
+        &PairMutationRequest {
+            gateway_path: gateway.source.path.clone().into(),
+            gateway_expected_id: gateway.id.clone(),
+            gateway_id: selected.gateway_id.clone(),
+            gateway_alias: gateway.aliases.first().cloned().unwrap_or_default(),
+            gateway_byte_start: gateway.source.byte_start,
+            gateway_byte_end: gateway.source.byte_end,
+            vm_path: vm.source.path.clone().into(),
+            vm_expected_id: vm.id.clone(),
+            vm_id: selected.vm_id.clone(),
+            vm_alias: vm.aliases.first().cloned().unwrap_or_default(),
+            vm_byte_start: vm.source.byte_start,
+            vm_byte_end: vm.source.byte_end,
+            transit_host: transit_host.clone(),
+            transit_port: *transit_port,
+        },
+        PairMutationKind::Delete,
+    )
+}
+
 pub fn transit_candidates(
     gateway: &HostEntry,
     vm: &HostEntry,
 ) -> Result<Vec<(String, u16)>, String> {
     let gateway_data = parse_entry(gateway)?;
     let vm_data = parse_entry(vm)?;
-    let gateway_port = if vm_data.invalid_port {
+    if vm_data.invalid_port {
         return Err("PORT_INVALID: VM Port must be a number".to_string());
-    } else {
-        vm_data.port
-    };
+    }
+    let matches_route = forward_matcher(&gateway_data, &vm_data);
     Ok(gateway_data
         .forwards
         .into_iter()
-        .filter(|candidate| candidate.port == gateway_port)
+        .filter(matches_route)
         .map(|candidate| (candidate.host, candidate.port))
         .collect())
+}
+
+fn forward_matcher(
+    gateway: &ParsedEntry,
+    vm: &ParsedEntry,
+) -> impl Fn(&LocalForward) -> bool + use<> {
+    let vm_port = vm.port;
+    let vm_address = vm.loopback_address;
+    let vm_localhost = vm.localhost;
+    let valid_port = !vm.invalid_port;
+    let listener_matches = move |forward: &LocalForward| {
+        let Some((address, port)) = forward.listener else {
+            return false;
+        };
+        let is_localhost = |address: IpAddr| {
+            address == IpAddr::V4(Ipv4Addr::LOCALHOST)
+                || address == IpAddr::V6(Ipv6Addr::LOCALHOST)
+        };
+        port == vm_port
+            && match (address, vm_address) {
+                (Some(listener), Some(vm)) => {
+                    listener == vm
+                        || (listener.is_unspecified() && listener.is_ipv4() == vm.is_ipv4())
+                }
+                (None, Some(vm)) => is_localhost(vm),
+                (Some(listener), None) => {
+                    vm_localhost && (is_localhost(listener) || listener.is_unspecified())
+                }
+                (None, None) => vm_localhost,
+            }
+    };
+    let mapped = valid_port && gateway.forwards.iter().any(listener_matches);
+    move |candidate: &LocalForward| {
+        valid_port
+            && if mapped {
+                listener_matches(candidate)
+            } else {
+                candidate.port == vm_port
+            }
+    }
 }
 
 pub fn setup_eligible(entry: &HostEntry) -> bool {
@@ -760,9 +928,14 @@ fn parse_entry(entry: &HostEntry) -> Result<ParsedEntry, String> {
         paired_vm_marker: false,
         transit: None,
         transit_marker: false,
+        pair_marker_counts: [0; 3],
+        additional_references: Vec::new(),
         port: DEFAULT_SSH_PORT,
         port_set: false,
         invalid_port: false,
+        hostname_set: false,
+        loopback_address: None,
+        localhost: false,
         forwards: Vec::new(),
         proxy_command: global_proxy,
         proxy_jump: global_proxy,
@@ -790,14 +963,19 @@ fn parse_entry(entry: &HostEntry) -> Result<ParsedEntry, String> {
                     }
                 }
                 Some("GATEWAY") => {
+                    result.pair_marker_counts[0] += 1;
+                    result.additional_references.extend(result.gateway_id.take());
                     result.gateway_marker = true;
                     result.gateway_id = value.filter(|value| !value.is_empty());
                 }
                 Some("VM") => {
+                    result.pair_marker_counts[1] += 1;
+                    result.additional_references.extend(result.paired_vm_id.take());
                     result.paired_vm_marker = true;
                     result.paired_vm_id = value.filter(|value| !value.is_empty());
                 }
                 Some("TRANSIT") => {
+                    result.pair_marker_counts[2] += 1;
                     result.transit_marker = true;
                     result.transit = value.as_deref().and_then(parse_transit);
                 }
@@ -821,9 +999,16 @@ fn parse_entry(entry: &HostEntry) -> Result<ParsedEntry, String> {
                 Some(port) if port > 0 => result.port = port,
                 _ => result.invalid_port = true,
             }
+        } else if keyword.eq_ignore_ascii_case("hostname") && !result.hostname_set {
+            result.hostname_set = true;
+            if let Some(host) = tokens.get(1) {
+                result.localhost = host.eq_ignore_ascii_case("localhost");
+                result.loopback_address = host.parse::<IpAddr>().ok().filter(IpAddr::is_loopback);
+            }
         } else if keyword.eq_ignore_ascii_case("localforward") {
             if let Some(candidate) = tokens.get(2).and_then(|value| parse_endpoint(value)) {
                 result.forwards.push(LocalForward {
+                    listener: tokens.get(1).and_then(|value| parse_listener(value)),
                     host: candidate.0,
                     port: candidate.1,
                 });
@@ -866,7 +1051,7 @@ fn push_diagnostic(diagnostics: &mut Vec<Diagnostic>, code: &str, message: Strin
     });
 }
 
-fn metadata_key_value(value: &str) -> (Option<String>, Option<String>) {
+pub(crate) fn metadata_key_value(value: &str) -> (Option<String>, Option<String>) {
     let mut parts = value.splitn(2, |character: char| character.is_whitespace());
     let first = parts.next().unwrap_or_default().trim();
     let trailing = parts.next().unwrap_or_default().trim();
@@ -882,11 +1067,11 @@ fn metadata_key_value(value: &str) -> (Option<String>, Option<String>) {
     )
 }
 
-fn parse_transit(value: &str) -> Option<(String, u16)> {
+pub(crate) fn parse_transit(value: &str) -> Option<(String, u16)> {
     let mut parts = value.split_whitespace();
     let first = parts.next()?;
     if let Some((host, port)) = split_host_port(first) {
-        return Some((host, port));
+        return Some((host.to_string(), port));
     }
     let port = parts.next()?.parse().ok()?;
     Some((first.to_string(), port))
@@ -894,25 +1079,38 @@ fn parse_transit(value: &str) -> Option<(String, u16)> {
 
 fn parse_endpoint(value: &str) -> Option<(String, u16)> {
     if let Some((host, port)) = split_host_port(value) {
-        return Some((host, port));
+        return Some((host.to_string(), port));
     }
     let port = value.parse().ok()?;
     Some(("127.0.0.1".to_string(), port))
 }
 
-fn split_host_port(value: &str) -> Option<(String, u16)> {
+fn parse_listener(value: &str) -> Option<(Option<IpAddr>, u16)> {
+    if let Ok(port) = value.parse::<u16>() {
+        return Some((None, port));
+    }
+    let (host, port) = split_host_port(value)?;
+    let address = if host.eq_ignore_ascii_case("localhost") {
+        None
+    } else {
+        Some(host.parse().ok()?)
+    };
+    Some((address, port))
+}
+
+fn split_host_port(value: &str) -> Option<(&str, u16)> {
     if let Some(rest) = value.strip_prefix('[') {
         let (host, port) = rest.split_once("]:")?;
-        return Some((host.to_string(), port.parse().ok()?));
+        return Some((host, port.parse().ok()?));
     }
     let (host, port) = value.rsplit_once(':')?;
     if host.is_empty() {
         return None;
     }
-    Some((host.to_string(), port.parse().ok()?))
+    Some((host, port.parse().ok()?))
 }
 
-fn directive_tokens(line: &str) -> Vec<String> {
+pub(crate) fn directive_tokens(line: &str) -> Vec<String> {
     let mut tokens = line
         .split('#')
         .next()

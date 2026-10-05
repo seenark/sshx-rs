@@ -648,6 +648,7 @@ pub fn tunnels_workspace(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PairWorkspaceAction {
     Setup,
+    Delete(usize),
     Recover,
     Validate,
     Exit,
@@ -677,7 +678,7 @@ pub fn pairs_workspace(
             "Remove ProxyCommand and ProxyJump from the paired route and its inherited configuration, then press V."
         }
         "PAIR_RECOVERY_PENDING" => {
-            "Press R to recover the pending Pair transaction before starting another setup."
+            "Press R to recover the pending Pair transaction before setup or deletion."
         }
         _ => "Inspect the reported source and metadata, correct the finding, then press V to validate.",
     };
@@ -790,16 +791,6 @@ pub fn pairs_workspace(
         .iter()
         .map(|label| ListItem::new(label.as_str()))
         .collect::<Vec<_>>();
-    let footer = if recovery_available {
-        "↑↓ select · PgUp/PgDn detail · V validate · R recover · setup blocked pending recovery · Esc Hosts"
-    } else {
-        "↑↓ select · PgUp/PgDn detail · V validate · S setup Pair · Esc Hosts"
-    };
-    let compact_footer = if recovery_available {
-        "↑↓ select · PgUp/PgDn\nV validate · R recover\nS blocked · Esc Hosts"
-    } else {
-        "↑↓ select · PgUp/PgDn\nV validate · S setup\nEsc Hosts"
-    };
     let list_title = if pairs.is_empty() {
         " Pairs: no exact records · findings "
     } else {
@@ -818,9 +809,23 @@ pub fn pairs_workspace(
                     .draw(|frame| {
                         let area = frame.area();
                         let compact = area.width < 100 || area.height < 16;
-                        let footer_height = if compact { 3 } else { 1 };
-                        let list_height = (area.height / 3).clamp(1, 7);
-                        let status_height = u16::from(status.is_some() && area.height >= 8);
+                        let footer = match (recovery_available, compact, selected < pairs.len()) {
+                            (true, true, _) => "V validate · R recover\nSetup and delete blocked\nEsc Hosts · PgUp/PgDn",
+                            (true, false, _) => "↑↓ select · PgUp/PgDn detail · V validate · R recover · setup and delete blocked pending recovery · Esc Hosts",
+                            (false, true, true) => "↑↓ select · PgUp/PgDn\nV validate · S setup · D delete\nEsc Hosts",
+                            (false, true, false) => "↑↓ select · PgUp/PgDn\nV validate · S setup\nEsc Hosts",
+                            (false, false, true) => "↑↓ select · PgUp/PgDn detail · V validate · S setup Pair · D delete · Esc Hosts",
+                            (false, false, false) => "↑↓ select · PgUp/PgDn detail · V validate · S setup Pair · Esc Hosts",
+                        };
+                        let footer_lines = wrap_status(footer, area.width as usize);
+                        let footer_height = (footer_lines.len() as u16).min(area.height.saturating_sub(2));
+                        let list_height = (area.height / 3).clamp(1, 7)
+                            .min(area.height.saturating_sub(footer_height + 1));
+                        let status_lines = status.map(|text| wrap_status(text, area.width as usize));
+                        let status_height = status_lines.as_ref().map_or(0, |lines| {
+                            (lines.len().min(3) as u16)
+                                .min(area.height.saturating_sub(footer_height + list_height + 1))
+                        });
                         let chunks = Layout::default()
                             .direction(Direction::Vertical)
                             .constraints([
@@ -857,16 +862,16 @@ pub fn pairs_workspace(
                             },
                             chunks[1],
                         );
-                        if let Some(status) = status {
+                        if let Some(lines) = status_lines {
                             frame.render_widget(
-                                Paragraph::new(status)
+                                Paragraph::new(lines)
                                     .style(Style::default().fg(Color::Green))
                                     .wrap(Wrap { trim: false }),
                                 chunks[2],
                             );
                         }
                         frame.render_widget(
-                            Paragraph::new(if compact { compact_footer } else { footer }),
+                            Paragraph::new(footer_lines),
                             chunks[3],
                         );
                     })
@@ -884,6 +889,11 @@ pub fn pairs_workspace(
                     KeyEvent { code: KeyCode::Char('s' | 'S'), .. } if recovery_available => {}
                     KeyEvent { code: KeyCode::Char('s' | 'S'), .. } => {
                         return Ok(PairWorkspaceAction::Setup);
+                    }
+                    KeyEvent { code: KeyCode::Char('d' | 'D'), .. }
+                        if !recovery_available && selected < pairs.len() =>
+                    {
+                        return Ok(PairWorkspaceAction::Delete(selected));
                     }
                     KeyEvent { code: KeyCode::Char('r' | 'R'), .. } if recovery_available => {
                         return Ok(PairWorkspaceAction::Recover);
@@ -966,11 +976,7 @@ fn pair_setup_vm_eligible(
     routes: &[(usize, Result<Vec<(String, u16)>, String>)],
 ) -> Vec<usize> {
     if gateway.is_none() { return eligible.to_vec(); }
-    routes.iter().filter_map(|(index, result)| {
-        result.as_ref().is_ok_and(|values| values.iter().any(|candidate| {
-            values.iter().filter(|other| *other == candidate).count() == 1
-        })).then_some(*index)
-    }).collect()
+    routes.iter().map(|(index, _)| *index).collect()
 }
 
 pub fn pair_setup_workspace(
@@ -1032,177 +1038,244 @@ pub fn pair_setup_workspace(
                 }
                 let gateway = pair_setup_entry(entries, draft.gateway);
                 let vm = pair_setup_entry(entries, draft.vm);
+                let vm_ineligible = draft.gateway.is_some()
+                    && draft.vm.is_some_and(|(index, _)| !vm_eligible.contains(&index));
+                let vm_warning = "Selected VM is not a distinct eligible HostEntry; value kept. Select another HostEntry.";
+                let transit_status = match candidates {
+                    Ok(values) if values.len() == 1 => {
+                        format!("Automatic transit: {}:{}", values[0].0, values[0].1)
+                    }
+                    Ok(values) if values.len() > 1 => {
+                        "Ambiguous transit: Ctrl-N chooses a candidate; or enter host and port.".to_string()
+                    }
+                    Ok(_) => "No transit candidates: check gateway LocalForward and VM Port; enter matching transit host and port.".to_string(),
+                    Err(error) => format!("Transit: {error}"),
+                };
                 let mut details = String::new();
-                for (label, row, pick) in [
-                    ("Gateway", gateway.as_ref(), draft.gateway),
-                    ("VM", vm.as_ref(), draft.vm),
-                ] {
-                    if let Some(row) = row {
+                if focus < 2 {
+                    if let Some(pick) = options.get(selected[focus]) {
+                        let row = pair_setup_entry(entries, Some(*pick)).unwrap();
                         details.push_str(&format!(
-                            "{label}: {}\nSource: {}:{}\nID: {}\n",
-                            row.alias, row.entry.source.path, row.entry.source.line_start, row.entry.id,
+                            "Source: {}:{}\nID: {}\nChoose: {}\n",
+                            row.entry.source.path, row.entry.source.line_start, row.entry.id, row.alias,
                         ));
-                        if !eligible.iter().any(|index| std::ptr::eq(entries[*index], row.entry)) {
-                            details.push_str("Ineligible for Pair setup; select another HostEntry.\n");
-                        }
-                        if label == "VM" && draft.gateway.is_some()
-                            && !vm_eligible.iter().any(|index| std::ptr::eq(entries[*index], row.entry))
-                        {
-                            details.push_str("VM has no compatible unambiguous gateway transit; select another HostEntry.\n");
-                        }
                     } else {
-                        details.push_str(&format!("{label}: {}\n", if pick.is_some() {
-                            "invalid selection; choose a current HostEntry"
-                        } else {
-                            "not selected"
-                        }));
-                    }
-                }
-                details.push('\n');
-                match &candidates {
-                    Ok(values) if values.len() == 1 && draft.transit_host.is_empty() && draft.transit_port.is_empty() => {
-                        details.push_str(&format!("Automatic transit: {}:{} (unique inference)\n", values[0].0, values[0].1));
-                    }
-                    Ok(values) if !values.is_empty() => {
-                        details.push_str("Transit candidates (Ctrl-N explicitly chooses next):\n");
-                        for (index, (host, port)) in values.iter().enumerate() {
-                            details.push_str(&format!("{} {host}:{port}\n", if Some(index) == candidate_index { ">" } else { " " }));
-                        }
-                        if values.len() > 1 && draft.transit_host.is_empty() && draft.transit_port.is_empty() {
-                            details.push_str("Ambiguous transit: select a candidate or enter host and port.\n");
-                        }
-                    }
-                    Ok(_) => details.push_str("No transit candidates: enter transit host and port.\n"),
-                    Err(error) => details.push_str(&format!("Transit: {error}\n")),
-                }
-                if let Some(review) = &review {
-                    details = format!("Review Pair changes\n{review}\n\n{details}");
-                } else if let Some((text, _)) = &status {
-                    details = format!("{text}\n\n{details}");
-                }
-                let success = status.as_ref().is_some_and(|(_, success)| *success);
-                let applied = success && !preview;
-                let size = terminal.backend().size().ok();
-                let compact = size.is_some_and(|size| size.width < 48 || size.height < 14);
-                let footer = if review.is_some() && !preview {
-                    if compact { "Enter apply · Esc edit\nTab/S-Tab fields · type edits\nPgUp/Dn scroll · ^C cancel" }
-                    else { "Enter apply · Esc edit\nTab/Shift-Tab fields · type edits\nPgUp/PgDn details · Ctrl-C cancel" }
-                } else if review.is_some() {
-                    if compact { "Preview done · Esc edit\nTab/S-Tab fields · type edits\nPgUp/Dn scroll · ^C exit" }
-                    else { "Preview complete · Esc edit\nTab/Shift-Tab fields · type edits\nPgUp/PgDn details · Ctrl-C exit" }
-                } else if success {
-                    if preview {
-                        if compact { "Preview done · Esc exit · type edits\nTab/S-Tab fields · ↑↓ options\nPgUp/Dn scroll · ^N transit" }
-                        else { "Preview complete · Esc exit · type to edit\nTab/Shift-Tab fields · ↑↓ options\nPgUp/PgDn details · Ctrl-N transit" }
-                    } else if compact {
-                        "Applied · Esc exit · type edits\nTab/S-Tab fields · ↑↓ options\nPgUp/Dn scroll · ^N transit"
-                    } else {
-                        "Applied · Esc exit · type to edit\nTab/Shift-Tab fields · ↑↓ options\nPgUp/PgDn details · Ctrl-N transit"
+                        details.push_str("No eligible matching HostEntry aliases.\n");
                     }
                 } else {
-                    if compact { "^S review · Esc cancel\nTab/S-Tab fields · type search/edit\n↑↓/Enter choose · ^N transit\nPgUp/Dn scroll · ^C cancel" }
-                    else { "Ctrl-S review · Esc cancel · Ctrl-C cancel\nTab/Shift-Tab fields · type search/edit\n↑↓ options · Enter choose · Ctrl-N transit · PgUp/PgDn details" }
-                };
-                terminal.draw(|frame| {
-                    let area = frame.area();
-                    let footer_lines = wrap_status(footer, area.width as usize);
-                    let footer_height = (footer_lines.len() as u16).min(area.height.saturating_sub(4));
-                    let status_lines = status.as_ref().map(|(text, _)| wrap_status(text, area.width as usize));
-                    let status_height = status_lines.as_ref().map_or(0, |lines| {
-                        (lines.len() as u16).min(3).min(area.height.saturating_sub(footer_height + 5))
-                    });
-                    let available = area.height.saturating_sub(footer_height + status_height + 1);
-                    let visible_fields = if available >= 6 { 4 } else { available.saturating_sub(1).min(4) };
-                    let rows = Layout::default().direction(Direction::Vertical).constraints([
-                        Constraint::Length(u16::from(area.height > 2)),
-                        Constraint::Length(visible_fields),
-                        Constraint::Min(1),
-                        Constraint::Length(status_height),
-                        Constraint::Length(footer_height),
-                    ]).split(area);
-                    frame.render_widget(
-                        Paragraph::new(if preview { "Pair setup · preview" } else { "Pair setup" })
-                            .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                        rows[0],
-                    );
-                    let first_field = focus.saturating_sub(visible_fields.saturating_sub(1) as usize);
-                    for offset in 0..visible_fields {
-                        let index = first_field + offset as usize;
-                        let value = match index {
-                            0 => gateway.as_ref().map_or("not selected", |row| row.alias),
-                            1 => vm.as_ref().map_or("not selected", |row| row.alias),
-                            2 => if draft.transit_host.is_empty() { "(infer)" } else { &draft.transit_host },
-                            _ => if draft.transit_port.is_empty() { "(infer)" } else { &draft.transit_port },
-                        };
-                        let label = format!("{}{}: ", if index == focus { "> " } else { "  " },
-                            ["Gateway", "VM", "Transit host", "Transit port"][index]);
-                        let label_width = (Span::raw(&label).width() as u16).min(rows[1].width.saturating_sub(1));
-                        let value_width = rows[1].width.saturating_sub(label_width);
-                        let text = if index == focus && index < 2 && !queries[index].is_empty() {
-                            format!("{value} · search: {}", queries[index])
-                        } else {
-                            value.to_string()
-                        };
-                        let horizontal_scroll = if index == focus {
-                            Span::raw(&text).width().saturating_sub(value_width as usize).min(u16::MAX as usize) as u16
-                        } else { 0 };
-                        let style = if index == focus {
-                            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-                        } else { Style::default() };
-                        frame.render_widget(
-                            Paragraph::new(label).style(style),
-                            Rect::new(rows[1].x, rows[1].y + offset, label_width, 1),
-                        );
-                        frame.render_widget(
-                            Paragraph::new(text).style(style).scroll((0, horizontal_scroll)),
-                            Rect::new(rows[1].x + label_width, rows[1].y + offset, value_width, 1),
-                        );
-                    }
-                    let option_height = if focus < 2 && review.is_none() && rows[2].height >= 4 {
-                        (rows[2].height / 2).min(8)
-                    } else { 0 };
-                    let body = Layout::default().direction(Direction::Vertical).constraints([
-                        Constraint::Length(option_height),
-                        Constraint::Min(1),
-                    ]).split(rows[2]);
-                    if option_height > 0 {
-                        let items = options.iter().map(|pick| {
-                            let row = pair_setup_entry(entries, Some(*pick)).unwrap();
-                            ListItem::new(vec![
-                                Line::from(row.alias),
-                                Line::from(format!("{}:{} · ID {}", row.entry.source.path, row.entry.source.line_start, row.entry.id)),
-                            ])
-                        }).collect::<Vec<_>>();
-                        list_state.select(Some(selected[focus]));
-                        frame.render_stateful_widget(
-                            List::new(items).highlight_symbol("> ")
-                                .highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White)),
-                            body[0], &mut list_state,
-                        );
-                    }
-                    if focus < 2 && review.is_none() && status.is_none() {
-                        if let Some(pick) = options.get(selected[focus]) {
-                            let row = pair_setup_entry(entries, Some(*pick)).unwrap();
-                            details.insert_str(0, &format!(
-                                "Choose: {}\nSource: {}:{}\nID: {}\n\n",
+                    for (label, row) in [("Gateway", gateway.as_ref()), ("VM", vm.as_ref())] {
+                        if let Some(row) = row {
+                            details.push_str(&format!(
+                                "{label}: {}\nSource: {}:{}\nID: {}\n",
                                 row.alias, row.entry.source.path, row.entry.source.line_start, row.entry.id,
                             ));
                         }
                     }
-                    if focus < 2 && review.is_none() && options.is_empty() {
-                        details.insert_str(0, "No eligible matching HostEntry aliases.\n\n");
+                }
+                if vm_ineligible {
+                    details.push_str(vm_warning);
+                    details.push('\n');
+                }
+                details.push_str(&transit_status);
+                details.push('\n');
+                if let Ok(values) = candidates {
+                    for (host, port) in values {
+                        details.push_str(&format!("Transit choice: {host}:{port}\n"));
                     }
-                    let detail_lines = wrap_status(&details, body[1].width as usize);
-                    scroll_step = body[1].height.max(1);
-                    scroll = scroll.min(detail_lines.len().saturating_sub(body[1].height as usize).min(u16::MAX as usize) as u16);
-                    frame.render_widget(Paragraph::new(detail_lines).scroll((scroll, 0)), body[1]);
+                }
+                let success = status.as_ref().is_some_and(|(_, success)| *success);
+                let applied = success && !preview;
+                terminal.draw(|frame| {
+                    let area = frame.area();
+                    let wide = area.width >= 80 && area.height >= 20;
+                    let tiny = area.width < 48 || area.height < 14;
+                    let header = if preview { "Pair setup · preview" } else { "Pair setup" };
+                    let footer = if review.is_some() {
+                        if preview {
+                            if tiny { "Preview done · Esc edit\nTab/S-Tab · type edits\nPgUp/Dn details · ^C exit" }
+                            else { "Preview complete · Esc edit · Ctrl-C exit\nTab/Shift-Tab fields · type edits\nPgUp/PgDn review" }
+                        } else if tiny {
+                            "Enter apply · Esc edit\nTab/S-Tab · type edits\nPgUp/Dn details · ^C cancel"
+                        } else {
+                            "Enter apply · Esc edit · Ctrl-C cancel\nTab/Shift-Tab fields · type edits\nPgUp/PgDn review"
+                        }
+                    } else if success {
+                        if preview {
+                            if tiny { "Preview done · Esc exit\nTab/S-Tab · type edits\n^S review · PgUp/Dn details" }
+                            else { "Preview complete · Esc exit · Ctrl-C exit\nTab/Shift-Tab fields · type to edit\nCtrl-S review · PgUp/PgDn details" }
+                        } else if tiny {
+                            "Applied · Esc exit\nTab/S-Tab · type edits\nPgUp/Dn details · ^N transit"
+                        } else {
+                            "Applied · Esc exit · Ctrl-C exit\nTab/Shift-Tab fields · type to edit\nPgUp/PgDn details · Ctrl-N transit"
+                        }
+                    } else if tiny {
+                        "^S review · Esc cancel\nTab/S-Tab · ↑↓/Enter choose\n^N transit · PgUp/Dn details"
+                    } else {
+                        "Ctrl-S review · Esc cancel · Ctrl-C cancel\nTab/Shift-Tab fields · type search/edit\n↑↓ options · Enter choose · Ctrl-N transit · PgUp/PgDn details"
+                    };
+                    let header_lines = wrap_status(header, area.width as usize);
+                    let footer_lines = wrap_status(footer, area.width as usize);
+                    let header_height = (header_lines.len() as u16).min(area.height.saturating_sub(1));
+                    let footer_height = (footer_lines.len() as u16)
+                        .min(area.height.saturating_sub(header_height + 1));
+                    let status_text = status.as_ref().map(|(text, _)| text.as_str())
+                        .or_else(|| vm_ineligible.then_some(vm_warning));
+                    let status_lines = status_text.map(|text| wrap_status(text, area.width as usize));
+                    let status_height = status_lines.as_ref().map_or(0, |lines| {
+                        (lines.len() as u16).min(3)
+                            .min(area.height.saturating_sub(header_height.saturating_add(footer_height).saturating_add(5)))
+                    });
+                    let rows = Layout::default().direction(Direction::Vertical).constraints([
+                        Constraint::Length(header_height),
+                        Constraint::Min(0),
+                        Constraint::Length(status_height),
+                        Constraint::Length(footer_height),
+                    ]).split(area);
+                    let title_style = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+                    let focus_style = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+                    frame.render_widget(Paragraph::new(header_lines).style(title_style), rows[0]);
+                    if let Some(review) = &review {
+                        let review_lines = wrap_status(
+                            &format!("Review Pair changes\n{review}"), rows[1].width as usize,
+                        );
+                        scroll_step = rows[1].height.max(1);
+                        scroll = scroll.min(review_lines.len().saturating_sub(rows[1].height as usize)
+                            .min(u16::MAX as usize) as u16);
+                        frame.render_widget(Paragraph::new(review_lines).scroll((scroll, 0)), rows[1]);
+                    } else {
+                        let form_height = if wide { rows[1].height } else {
+                            // Leave Search/edit, a candidate, and scrollable provenance visible.
+                            rows[1].height.saturating_sub(4).min(5)
+                                .max(u16::from(rows[1].height >= 3))
+                        };
+                        let panes = if wide {
+                            Layout::default().direction(Direction::Horizontal).constraints([
+                                Constraint::Length(((u32::from(area.width) * 42 / 100) as u16).clamp(32, 44)),
+                                Constraint::Length(1),
+                                Constraint::Min(0),
+                            ]).split(rows[1])
+                        } else {
+                            Layout::default().direction(Direction::Vertical).constraints([
+                                Constraint::Length(form_height),
+                                Constraint::Length(0),
+                                Constraint::Min(0),
+                            ]).split(rows[1])
+                        };
+                        let form = panes[0];
+                        let editor = panes[2];
+                        if wide {
+                            for (label, y, active) in [
+                                ("Gateway", 0, focus == 0),
+                                ("VM", 3, focus == 1),
+                                ("Transit", 6, focus >= 2),
+                            ] {
+                                frame.render_widget(
+                                    Paragraph::new(label).style(if active { focus_style } else { title_style }),
+                                    Rect::new(form.x, form.y + y, form.width, 1),
+                                );
+                            }
+                        }
+                        let field_count = if wide { 4 } else { form.height.min(4) };
+                        let first_field = if wide { 0 } else if focus >= 2 && field_count >= 2 {
+                            4usize.saturating_sub(field_count as usize)
+                        } else {
+                            focus.saturating_sub(field_count.saturating_sub(1) as usize)
+                                .min(4usize.saturating_sub(field_count as usize))
+                        };
+                        for offset in 0..field_count {
+                            let index = first_field + offset as usize;
+                            let y = if wide { [1, 4, 7, 8][index] } else { offset };
+                            let value = match index {
+                                0 => gateway.as_ref().map_or("not selected", |row| row.alias),
+                                1 => vm.as_ref().map_or("not selected", |row| row.alias),
+                                2 => if draft.transit_host.is_empty() { "(infer)" } else { &draft.transit_host },
+                                _ => if draft.transit_port.is_empty() { "(infer)" } else { &draft.transit_port },
+                            };
+                            let label = format!("{}{}: ", if index == focus { "> " } else { "  " },
+                                ["Gateway", "VM", "Transit host", "Transit port"][index]);
+                            let label_width = (Span::raw(&label).width() as u16).min(form.width);
+                            let value_width = form.width.saturating_sub(label_width);
+                            let style = if index == focus { focus_style } else { Style::default() };
+                            let horizontal_scroll = if index == focus && index >= 2 {
+                                Span::raw(value).width().saturating_sub(value_width as usize)
+                                    .min(u16::MAX as usize) as u16
+                            } else { 0 };
+                            frame.render_widget(Paragraph::new(label).style(style),
+                                Rect::new(form.x, form.y + y, label_width, 1));
+                            frame.render_widget(Paragraph::new(value).style(style).scroll((0, horizontal_scroll)),
+                                Rect::new(form.x + label_width, form.y + y, value_width, 1));
+                        }
+                        if wide || form.height > 4 {
+                            frame.render_widget(Paragraph::new(transit_status.as_str()),
+                                Rect::new(form.x, form.y + if wide { 9 } else { 4 }, form.width, 1));
+                        }
+                        let heading_height = u16::from(editor.height >= 6);
+                        let input_height = u16::from(editor.height > heading_height);
+                        let remaining = editor.height.saturating_sub(heading_height + input_height);
+                        let has_choices = if focus < 2 { !options.is_empty() } else {
+                            candidates.as_ref().is_ok_and(|values| !values.is_empty())
+                        };
+                        let option_height = if has_choices {
+                            (remaining / 2).min(8)
+                        } else { 0 };
+                        let editor_rows = Layout::default().direction(Direction::Vertical).constraints([
+                            Constraint::Length(heading_height),
+                            Constraint::Length(input_height),
+                            Constraint::Length(option_height),
+                            Constraint::Min(0),
+                        ]).split(editor);
+                        let heading = ["Gateway aliases", "VM aliases", "Transit choices", "Transit choices"][focus];
+                        frame.render_widget(Paragraph::new(heading).style(title_style), editor_rows[0]);
+                        let value = match focus {
+                            0 | 1 => queries[focus].as_str(),
+                            2 => draft.transit_host.as_str(),
+                            _ => draft.transit_port.as_str(),
+                        };
+                        let input_width = editor_rows[1].width as usize;
+                        let input_label = if focus < 2 { "Search: " } else if focus == 2 { "Transit host: " } else { "Transit port: " };
+                        let label_width = (input_label.len() as u16).min(editor_rows[1].width);
+                        let value_scroll = Span::raw(value).width()
+                            .saturating_sub(input_width.saturating_sub(label_width as usize))
+                            .min(u16::MAX as usize) as u16;
+                        frame.render_widget(Paragraph::new(input_label).style(focus_style),
+                            Rect::new(editor_rows[1].x, editor_rows[1].y, label_width, editor_rows[1].height));
+                        frame.render_widget(Paragraph::new(value).style(focus_style).scroll((0, value_scroll)),
+                            Rect::new(editor_rows[1].x + label_width, editor_rows[1].y,
+                                editor_rows[1].width.saturating_sub(label_width), editor_rows[1].height));
+                        if option_height > 0 {
+                            let items = if focus < 2 {
+                                options.iter().map(|pick| {
+                                    let row = pair_setup_entry(entries, Some(*pick)).unwrap();
+                                    if wide {
+                                        ListItem::new(format!("{} · {}:{} · ID {}", row.alias,
+                                            row.entry.source.path, row.entry.source.line_start, row.entry.id))
+                                    } else { ListItem::new(row.alias) }
+                                }).collect::<Vec<_>>()
+                            } else {
+                                candidates.as_ref().unwrap().iter()
+                                    .map(|(host, port)| ListItem::new(format!("{host}:{port}")))
+                                    .collect::<Vec<_>>()
+                            };
+                            list_state.select(if focus < 2 { Some(selected[focus]) } else { candidate_index });
+                            frame.render_stateful_widget(
+                                List::new(items).highlight_symbol("> ")
+                                    .highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White)),
+                                editor_rows[2], &mut list_state,
+                            );
+                        }
+                        let detail_lines = wrap_status(&details, editor_rows[3].width as usize);
+                        scroll_step = editor_rows[3].height.max(1);
+                        scroll = scroll.min(detail_lines.len().saturating_sub(editor_rows[3].height as usize)
+                            .min(u16::MAX as usize) as u16);
+                        frame.render_widget(Paragraph::new(detail_lines).scroll((scroll, 0)), editor_rows[3]);
+                    }
                     if let Some(lines) = status_lines {
                         frame.render_widget(
                             Paragraph::new(lines).style(Style::default().fg(if success { Color::Green } else { Color::Red })),
-                            rows[3],
+                            rows[2],
                         );
                     }
-                    frame.render_widget(Paragraph::new(footer_lines).style(Style::default().fg(Color::Cyan)), rows[4]);
+                    frame.render_widget(Paragraph::new(footer_lines).style(Style::default().fg(Color::Cyan)), rows[3]);
                 }).map_err(|error| format!("PAIR_REQUIRED: cannot render Pair setup: {error}"))?;
                 let mut edited = false;
                 match read_key(input, "PAIR_REQUIRED")? {
@@ -1229,7 +1302,7 @@ pub fn pair_setup_workspace(
                         if pair_setup_entry(entries, draft.vm).is_none()
                             || !draft.vm.is_some_and(|(index, _)| vm_eligible.contains(&index))
                         {
-                            status = Some(("PAIR_SELECTION: select a different eligible VM with compatible gateway transit".to_string(), false));
+                            status = Some(("PAIR_SELECTION: select a different eligible VM HostEntry".to_string(), false));
                             focus = 1;
                             continue;
                         }
@@ -3469,65 +3542,69 @@ pub enum MutationReviewMode {
 }
 
 pub fn mutation_review_workspace(
+    title: &str,
     review: &str,
     mode: MutationReviewMode,
 ) -> Result<MutationReviewAction, String> {
-    let title = if mode == MutationReviewMode::Blocked {
-        "HostEntry deletion blocked"
-    } else {
-        "Review HostEntry mutation"
-    };
     with_terminal(
         title,
-        "HOST_REVIEW_REQUIRED: reviewing a HostEntry mutation requires usable stdin and stderr terminals"
+        "MUTATION_REVIEW_REQUIRED: reviewing a mutation requires usable stdin and stderr terminals"
             .to_string(),
         |terminal, input| {
             let mut scroll = 0u16;
+            let mut scroll_step = 1u16;
+            let footer = match mode {
+                MutationReviewMode::EditApply => {
+                    "Enter apply · E/Esc edit · Ctrl-C cancel · PgUp/PgDn scroll"
+                }
+                MutationReviewMode::Delete => {
+                    "Enter delete · Esc/Ctrl-C cancel · PgUp/PgDn scroll"
+                }
+                MutationReviewMode::PreviewOnly => {
+                    "Enter finish preview · Esc/Ctrl-C cancel · PgUp/PgDn scroll"
+                }
+                MutationReviewMode::Blocked => {
+                    "Enter/Esc return · Ctrl-C cancel · PgUp/PgDn scroll"
+                }
+            };
             loop {
                 terminal
                     .draw(|frame| {
+                        let area = frame.area();
+                        let footer_lines = wrap_status(footer, area.width as usize);
+                        let footer_height = (footer_lines.len() as u16)
+                            .min(area.height.saturating_sub(2));
                         let rows = Layout::default()
                             .direction(Direction::Vertical)
                             .constraints([
                                 Constraint::Length(1),
                                 Constraint::Min(1),
-                                Constraint::Length(1),
+                                Constraint::Length(footer_height),
                             ])
-                            .split(frame.area());
+                            .split(area);
                         frame.render_widget(
                             Paragraph::new(title)
                                 .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
                             rows[0],
                         );
+                        let review_lines = wrap_status(review, rows[1].width as usize);
+                        scroll_step = rows[1].height.max(1);
+                        scroll = scroll.min(review_lines.len()
+                            .saturating_sub(rows[1].height as usize)
+                            .min(u16::MAX as usize) as u16);
                         frame.render_widget(
-                            Paragraph::new(review)
-                                .wrap(Wrap { trim: false })
-                                .scroll((scroll, 0)),
+                            Paragraph::new(review_lines).scroll((scroll, 0)),
                             rows[1],
                         );
-                        let footer = match mode {
-                            MutationReviewMode::EditApply => {
-                                "Enter apply · E/Esc edit · Ctrl-C cancel · PgUp/PgDn scroll"
-                            }
-                            MutationReviewMode::Delete => {
-                                "Enter delete · Esc/Ctrl-C cancel · PgUp/PgDn scroll"
-                            }
-                            MutationReviewMode::PreviewOnly => {
-                                "Enter finish preview · Esc/Ctrl-C cancel · PgUp/PgDn scroll"
-                            }
-                            MutationReviewMode::Blocked => {
-                                "Enter/Esc return · Ctrl-C cancel · PgUp/PgDn scroll"
-                            }
-                        };
                         frame.render_widget(
-                            Paragraph::new(footer).style(Style::default().fg(Color::Cyan)),
+                            Paragraph::new(footer_lines).style(Style::default().fg(Color::Cyan)),
                             rows[2],
                         );
                     })
                     .map_err(|error| {
-                        format!("HOST_REVIEW_REQUIRED: cannot render mutation review: {error}")
+                        format!("MUTATION_REVIEW_REQUIRED: cannot render mutation review: {error}")
                     })?;
-                match read_key(input, "HOST_REVIEW_REQUIRED")? {
+                match read_key(input, "MUTATION_REVIEW_REQUIRED")? {
                     KeyEvent {
                         code: KeyCode::Enter, ..
                     } if mode == MutationReviewMode::Blocked
@@ -3571,10 +3648,10 @@ pub fn mutation_review_workspace(
                     } => scroll = scroll.saturating_sub(1),
                     KeyEvent {
                         code: KeyCode::PageDown, ..
-                    } => scroll = scroll.saturating_add(10),
+                    } => scroll = scroll.saturating_add(scroll_step),
                     KeyEvent {
                         code: KeyCode::PageUp, ..
-                    } => scroll = scroll.saturating_sub(10),
+                    } => scroll = scroll.saturating_sub(scroll_step),
                     KeyEvent {
                         code: KeyCode::Home, ..
                     } => scroll = 0,

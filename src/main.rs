@@ -670,6 +670,23 @@ fn run_pairs_workspace(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), String
         let pairs = sshx::pair::records(&catalog.entries);
         let mut findings = catalog.diagnostics;
         findings.extend(sshx::pair::diagnostics(&catalog.entries));
+        let mut journal_paths = configured.iter().map(|root| root.path.clone()).collect::<Vec<_>>();
+        journal_paths.extend(catalog.entries.iter().map(|entry| PathBuf::from(&entry.source.path)));
+        for path in &mut journal_paths {
+            if let Ok(canonical) = std::fs::canonicalize(&path) {
+                *path = canonical;
+            }
+        }
+        let pending = mutation::pending_pair_journals(&journal_paths);
+        findings.extend(pending.iter().map(|journal| {
+            sshx::discovery::Diagnostic {
+                code: "PAIR_RECOVERY_PENDING".to_string(),
+                message: format!(
+                    "{} requires explicit recovery before Pair setup or deletion; complete recovery first",
+                    journal.display()
+                ),
+            }
+        }));
         match picker::pairs_workspace(&pairs, &catalog.entries, &findings, status.as_deref())? {
             picker::PairWorkspaceAction::Exit => return Ok(()),
             picker::PairWorkspaceAction::Validate => {
@@ -687,8 +704,132 @@ fn run_pairs_workspace(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), String
                     Err(error) => Some(error),
                 };
             }
-            picker::PairWorkspaceAction::Recover => {}
+            picker::PairWorkspaceAction::Delete(index) => {
+                status = match pairs.get(index)
+                    .ok_or_else(|| "PAIR_SELECTION: selected Pair is no longer current".to_string())
+                    .and_then(|selected| run_pair_delete_workspace(roots, selected)) {
+                    Ok(()) => Some("Pair deleted. Both HostEntries kept.".to_string()),
+                    Err(error) if error == picker::CANCELLED => {
+                        Some("Pair deletion cancelled.".to_string())
+                    }
+                    Err(error) => Some(error),
+                };
+            }
+            picker::PairWorkspaceAction::Recover => {
+                let recovered = (|| {
+                    mutation::validate_mutation_roots(&configured)?;
+                    let targets = mutation::pair_recovery_targets(&pending)?;
+                    if cli.no_input || cli.format.is_machine() || cli.password_stdin
+                        || !io::stdin().is_terminal() || !io::stderr().is_terminal()
+                    {
+                        return Err("PAIR_RECOVERY_REVIEW_REQUIRED: review pending Pair mutation targets in an interactive terminal before recovery".to_string());
+                    }
+                    eprintln!("Pending Pair mutation affects:");
+                    for path in &targets {
+                        eprintln!("  {}", path.display());
+                    }
+                    if !prompt_yes("Recover pending Pair mutation? [y/N]: ")? {
+                        return Err("PAIR_RECOVERY_DECLINED: pending Pair mutation was not recovered".to_string());
+                    }
+                    mutation::recover_pair_journals(&journal_paths, &targets)
+                })();
+                status = match recovered {
+                    Ok(()) => Some("Pair recovery complete.".to_string()),
+                    Err(error) => Some(error),
+                };
+            }
         }
+    }
+}
+
+fn run_pair_delete_workspace(
+    roots: &[RegisteredRoot], selected: &sshx::pair::PairRecord,
+) -> Result<(), String> {
+    let configured = settings::discovery_roots(roots);
+    let mut review = format!(
+        "Gateway: {} ({})\nVM: {} ({})\nTransit: {}:{}\n\
+         Delete this Pair relationship only. Both HostEntries, IDs, and OpenSSH directives are kept.\n",
+        selected.gateway_alias, selected.gateway_id, selected.vm_alias, selected.vm_id,
+        selected.transit_host, selected.transit_port,
+    );
+    let current_catalog = || {
+        mutation::validate_mutation_roots(&configured)?;
+        discover_roots(&configured).map_err(|error| error.to_string())
+    };
+    let current_plan = |catalog: &Catalog| {
+        for entry in catalog.entries.iter().filter(|entry| {
+            entry.id.eq_ignore_ascii_case(&selected.gateway_id)
+                || entry.id.eq_ignore_ascii_case(&selected.vm_id)
+        }) {
+            mutation::validate_entry_paths(entry)?;
+        }
+        let mut paths = configured.iter().map(|root| root.path.clone()).collect::<Vec<_>>();
+        paths.extend(catalog.entries.iter().map(|entry| PathBuf::from(&entry.source.path)));
+        for path in &mut paths {
+            if let Ok(canonical) = std::fs::canonicalize(&path) {
+                *path = canonical;
+            }
+        }
+        if let Some(journal) = mutation::pending_pair_journals(&paths).first() {
+            return Err(format!(
+                "PAIR_RECOVERY_PENDING: {} requires explicit recovery before Pair deletion; complete recovery first",
+                journal.display()
+            ));
+        }
+        let plan = sshx::pair::plan_delete(&catalog.entries, selected)?;
+        let home = home_dir()?;
+        ensure_no_active_use(&home, &selected.gateway_id)?;
+        ensure_no_active_use(&home, &selected.vm_id)?;
+        Ok(plan)
+    };
+    let planned = current_catalog().and_then(|catalog| {
+        for (role, id) in [("Gateway", &selected.gateway_id), ("VM", &selected.vm_id)] {
+            for entry in catalog.entries.iter().filter(|entry| entry.id.eq_ignore_ascii_case(id)) {
+                review.push_str(&format!(
+                    "{role} HostEntry: {}\nID: {}\nSource: {}:{}\n",
+                    entry.aliases.join(" "), entry.id, entry.source.path, entry.source.line_start,
+                ));
+            }
+        }
+        let plan = current_plan(&catalog)?;
+        let source = |id: &str| {
+            catalog.entries.iter().find(|entry| entry.id.eq_ignore_ascii_case(id))
+                .map(|entry| entry.source.clone())
+                .ok_or_else(|| "PAIR_SELECTION: selected Pair is no longer current".to_string())
+        };
+        Ok((plan, [source(&selected.gateway_id)?, source(&selected.vm_id)?]))
+    });
+    let (reviewed_plan, reviewed_sources) = match planned {
+        Ok((plan, sources)) => {
+            review.push_str(&render_pair(&plan, OutputFormat::Human, false)?);
+            (plan, sources)
+        }
+        Err(error) => {
+            review.push_str(&format!("\n{error}\n"));
+            picker::mutation_review_workspace(
+                "Pair deletion blocked", &review, picker::MutationReviewMode::Blocked,
+            )?;
+            return Err(error);
+        }
+    };
+    if picker::mutation_review_workspace(
+        "Review Pair deletion", &review, picker::MutationReviewMode::Delete,
+    )? == picker::MutationReviewAction::Apply {
+        let catalog = current_catalog()?;
+        current_plan(&catalog)?;
+        // Bind endpoint paths; the original plan's snapshots guard same-path bytes and spans.
+        for (id, source) in [&selected.gateway_id, &selected.vm_id].iter().zip(&reviewed_sources) {
+            if !catalog.entries.iter().any(|entry| {
+                entry.id.eq_ignore_ascii_case(id)
+                    && entry.source.path == source.path
+            }) {
+                return Err("PAIR_SELECTION: selected Pair is no longer current".to_string());
+            }
+        }
+        mutation::apply_pair(&reviewed_plan)?;
+        Ok(())
+    } else {
+        Err(picker::CANCELLED.to_string())
     }
 }
 
@@ -2004,7 +2145,12 @@ fn run_host_delete_workspace(
     } else {
         picker::MutationReviewMode::Delete
     };
-    let action = picker::mutation_review_workspace(&review, mode)?;
+    let title = if mode == picker::MutationReviewMode::Blocked {
+        "HostEntry deletion blocked"
+    } else {
+        "Review HostEntry mutation"
+    };
+    let action = picker::mutation_review_workspace(title, &review, mode)?;
     if let Some(error) = blocker { return Err(error); }
     safety(&current_catalog()?)?;
     if action == picker::MutationReviewAction::Apply {
@@ -2143,16 +2289,8 @@ fn select_mutation_entry<'a>(
     select_connect_entry(entries, positional, cli, picker_label)
 }
 
-fn ensure_delete_allowed(home: &std::path::Path, entry: &HostEntry) -> Result<(), String> {
-    let id = &entry.id;
-    let mut paths = entry
-        .provenance
-        .iter()
-        .flat_map(|provenance| provenance.paths.iter().cloned())
-        .map(PathBuf::from)
-        .collect::<Vec<_>>();
-    let metadata_root = home.join(".config/sshx");
-    let registry_path = metadata_root.join("tunnels/registry.json");
+fn ensure_no_active_use(home: &Path, id: &str) -> Result<(), String> {
+    let registry_path = home.join(".config/sshx/tunnels/registry.json");
     match std::fs::symlink_metadata(&registry_path) {
         Ok(metadata) => {
             if !metadata.is_file() || metadata.file_type().is_symlink() {
@@ -2171,6 +2309,20 @@ fn ensure_delete_allowed(home: &std::path::Path, entry: &HostEntry) -> Result<()
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(format!("DELETE_REGISTRY_INVALID: {}: {error}", registry_path.display())),
     }
+    Ok(())
+}
+
+fn ensure_delete_allowed(home: &std::path::Path, entry: &HostEntry) -> Result<(), String> {
+    let id = &entry.id;
+    ensure_no_active_use(home, id)?;
+    let mut paths = entry
+        .provenance
+        .iter()
+        .flat_map(|provenance| provenance.paths.iter().cloned())
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    let metadata_root = home.join(".config/sshx");
+    let registry_path = metadata_root.join("tunnels/registry.json");
     collect_regular_files(&metadata_root, &mut paths);
     paths.sort();
     paths.dedup();
