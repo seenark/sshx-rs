@@ -107,7 +107,7 @@ fn open_repair_target(path: &Path, target: PermissionTarget, mode: u32) -> io::R
 fn repair_opened_target(
     dir: &OwnedFd,
     name: &CString,
-    path: &Path,
+    _path: &Path,
     target: PermissionTarget,
     mode: u32,
 ) -> io::Result<u32> {
@@ -118,7 +118,7 @@ fn repair_opened_target(
     #[cfg(target_os = "linux")]
     let metadata = target_file.metadata()?;
     #[cfg(not(target_os = "linux"))]
-    let metadata = fs::symlink_metadata(path)?;
+    let metadata = fs::symlink_metadata(_path)?;
     check_metadata(&metadata, target)?;
     let current = metadata.permissions().mode() & 0o7777;
     if current == mode {
@@ -130,7 +130,7 @@ fn repair_opened_target(
         libc::syscall(
             libc::SYS_fchmodat2,
             target_file.as_raw_fd(),
-            b"\0".as_ptr(),
+            c"".as_ptr(),
             mode,
             libc::AT_EMPTY_PATH,
         )
@@ -160,7 +160,7 @@ fn repair_opened_target(
     #[cfg(target_os = "linux")]
     let verified = target_file.metadata()?;
     #[cfg(not(target_os = "linux"))]
-    let verified = fs::symlink_metadata(path)?;
+    let verified = fs::symlink_metadata(_path)?;
     check_metadata(&verified, target)?;
     #[cfg(not(target_os = "linux"))]
     if metadata.dev() != verified.dev() || metadata.ino() != verified.ino() {

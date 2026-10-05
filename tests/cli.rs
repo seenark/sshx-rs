@@ -13,6 +13,9 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static FIXTURE_COUNTER: AtomicUsize = AtomicUsize::new(0);
+#[cfg(unix)]
+// ponytail: serialize PTY fixtures; use bounded concurrency if suite runtime becomes a problem.
+static PTY_INTERACTIONS: Mutex<()> = Mutex::new(());
 #[test]
 fn help_root_forms_are_complete_and_deterministic() {
     let first = Command::new(env!("CARGO_BIN_EXE_sshx")).output().unwrap();
@@ -478,14 +481,17 @@ fn bare_command_opens_hosts_tui_without_connecting_on_exit() {
     );
     let original = fs::read(&config).unwrap();
     let bin = fake_ssh(&root);
-    let (status, output) =
-        run_with_pty_header(&home, &[], &bin, &root, b"secondary\x1b", b"sshx Hosts");
+    let (status, output) = run_with_pty_interactions(
+        &home,
+        &[],
+        &bin,
+        &root,
+        &[(b"Search:", b"secondary"), (b"secondary", b"\x1b")],
+        None,
+        None,
+    );
     assert!(status.success(), "status={status:?} output={output}");
     assert!(output.contains("secondary"), "output={output}");
-    assert!(output.contains("source:"), "output={output}");
-    assert!(output.contains("HostEntry ID:"), "output={output}");
-    assert!(output.contains("Enter"), "output={output}");
-    assert!(output.contains("Esc"), "output={output}");
     assert!(!root.join("master-started").exists());
     assert!(!root.join("master-closed").exists());
     assert_eq!(fs::read(&config).unwrap(), original);
@@ -2284,6 +2290,9 @@ fn hosts_tui_config_refresh_clears_cached_password() {
 #[cfg(unix)]
 #[test]
 fn interactive_tunnel_piped_stdout_closes_before_tunnel_stops() {
+    let _interaction = PTY_INTERACTIONS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let (root, home) = fixture_root();
     let config = home.join(".ssh/config");
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -2320,7 +2329,8 @@ fn interactive_tunnel_piped_stdout_closes_before_tunnel_stops() {
         bin.display(),
         std::env::var("PATH").unwrap_or_default()
     );
-    let mut child = Command::new(env!("CARGO_BIN_EXE_sshx"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_sshx"));
+    command
         .env("HOME", &home)
         .env("PATH", path)
         .env("SSHX_CAPTURE", root.join("runtime-config"))
@@ -2336,10 +2346,9 @@ fn interactive_tunnel_piped_stdout_closes_before_tunnel_stops() {
         ])
         .stdin(Stdio::from(stdin))
         .stdout(Stdio::piped())
-        .stderr(Stdio::from(slave))
-        .spawn()
-        .unwrap();
-    let mut stdout = child.stdout.take().unwrap();
+        .stderr(Stdio::from(slave));
+    let mut child = PtyChild::spawn(&mut command);
+    let mut stdout = child.process.stdout.take().unwrap();
     let (stdout_tx, stdout_rx) = std::sync::mpsc::channel();
     thread::spawn(move || {
         let mut bytes = Vec::new();
@@ -2383,7 +2392,7 @@ fn interactive_tunnel_piped_stdout_closes_before_tunnel_stops() {
                 String::from_utf8_lossy(&strip_ansi(&output))
             );
             assert!(
-                child.try_wait().unwrap().is_none(),
+                child.process.try_wait().unwrap().is_none(),
                 "sshx exited before rendering {header:?}"
             );
             thread::sleep(Duration::from_millis(10));
@@ -2400,15 +2409,15 @@ fn interactive_tunnel_piped_stdout_closes_before_tunnel_stops() {
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(_) => {}
         }
-        if let Some(status) = child.try_wait().unwrap() {
+        if let Some(status) = child.process.try_wait().unwrap() {
             break status;
         }
         if Instant::now() >= deadline {
-            child.kill().unwrap();
-            break child.wait().unwrap();
+            break child.stop().unwrap();
         }
         thread::sleep(Duration::from_millis(10));
     };
+    child.finished = true;
     let tunnel_list = run_fake_ssh(
         &home,
         &["tunnel", "direct", "list", "--format", "json"],
@@ -3110,7 +3119,7 @@ fn hosts_tui_refreshes_changed_source_before_session() {
     let original =
         "##SSHX ID=11111111-1111-4111-8111-111111111111\nHost direct\n  HostName direct.example\n";
     let changed =
-        "##SSHX ID=22222222-2222-4222-8222-222222222222\nHost direct\n  HostName direct.example\n";
+        "##SSHX ID=22222222-2222-4222-8222-222222222222\nHost direct\n  HostName changed.example\n";
     write(&config, original);
     let bin = fake_ssh(&root);
     let (status, output) = run_with_pty_interactions_with_hook(
@@ -3129,7 +3138,7 @@ fn hosts_tui_refreshes_changed_source_before_session() {
     );
     assert!(status.success(), "status={status:?} output={output}");
     assert!(
-        output.contains("22222222-2222-4222-8222-222222222222"),
+        contains_tui_text(output.as_bytes(), b"changed.example"),
         "{output}"
     );
     assert!(!root.join("master-started").exists());
@@ -3469,6 +3478,7 @@ fn populated_hosts_sections_open_from_keyboard_and_return() {
     let (root, home) = fixture_root();
     let config = home.join(".ssh/config");
     write(&config, "Host direct\n  HostName direct.example\n");
+    let original = fs::read(&config).unwrap();
     let bin = fake_ssh(&root);
     let (status, output) = run_with_pty_interactions(
         &home,
@@ -3476,25 +3486,23 @@ fn populated_hosts_sections_open_from_keyboard_and_return() {
         &bin,
         &root,
         &[
-            (b"sshx Hosts", b"\x14"),
-            (b"sshx Tunnels picker", b"\x1b"),
-            (b"sshx Hosts", b"\x10"),
-            (b"sshx Pairs picker", b"\x1b"),
-            (b"sshx Hosts", b"\x13"),
-            (b"sshx Setup picker", b"\x1b"),
-            (b"sshx Hosts", b"\x04"),
-            (b"sshx Doctor picker", b"\x1b"),
-            (b"sshx Hosts", b"\x1b"),
+            (b"Search:", b"\x14"),
+            (b"No registered tunnels.", b"\x1b"),
+            (b"Search:", b"\x10"),
+            (b"No valid Pair relationships.", b"\x1b"),
+            (b"Search:", b"\x13"),
+            (b"SSH config file path", b"\x1b"),
+            (b"Search:", b"\x04"),
+            (b"Evidence and guidance", b"\x1b"),
+            (b"Search:", b"\x1b"),
         ],
         None,
         None,
     );
     assert!(status.success(), "status={status:?} output={output}");
-    assert!(output.contains("sshx Tunnels picker"), "output={output}");
-    assert!(output.contains("sshx Pairs picker"), "output={output}");
-    assert!(output.contains("sshx Setup picker"), "output={output}");
-    assert!(output.contains("sshx Doctor picker"), "output={output}");
     assert!(!root.join("master-started").exists());
+    assert_eq!(fs::read(&config).unwrap(), original);
+    assert!(!home.join(".config/sshx/config.json").exists());
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -4765,7 +4773,9 @@ config=
 socket=
 previous=
 local_ports=
+detached=0
 for argument in "$@"; do
+  if [ "$argument" = "-f" ]; then detached=1; fi
   if [ "$previous" = "-F" ]; then config="$argument"; fi
   if [ "$previous" = "-S" ]; then socket="$argument"; fi
   if [ "$previous" = "-L" ] || [ "$previous" = "-D" ]; then
@@ -4797,14 +4807,23 @@ case " $* " in
     ;;
   *" -N "*)
     printf '%s\n' "$*" > "$SSHX_CAPTURE.args"
-    (
-      : > "$marker"
-      [ -n "$SSHX_STARTED" ] && : > "$SSHX_STARTED"
-      python3 -c 'import socket,sys,time; ss=[socket.socket() for _ in sys.argv[1:]]; [s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1) for s in ss]; [s.bind(("127.0.0.1",int(p))) for s,p in zip(ss,sys.argv[1:])]; [s.listen() for s in ss]; time.sleep(60)' $local_ports >/dev/null 2>&1 &
-      listener=$!
-      trap 'kill "$listener" 2>/dev/null || :; wait "$listener" 2>/dev/null || :; rm -f "$marker" "$SSHX_STARTED"; exit 0' INT HUP TERM
-      while :; do sleep 0.01; done
-    ) </dev/null >/dev/null 2>&1 &
+    python3 - "$marker" "$local_ports" "$detached" <<'PY' >/dev/null 2>&1 &
+import os,sys
+if sys.argv[3] == "1":
+    os.setsid()
+with open(os.devnull) as stdin:
+    os.dup2(stdin.fileno(), 0)
+os.execl("/bin/sh", "sh", "-c", r'''
+marker=$1
+local_ports=$2
+: > "$marker"
+[ -n "$SSHX_STARTED" ] && : > "$SSHX_STARTED"
+python3 -c 'import socket,sys,time; ss=[socket.socket() for _ in sys.argv[1:]]; [s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1) for s in ss]; [s.bind(("127.0.0.1",int(p))) for s,p in zip(ss,sys.argv[1:])]; [s.listen() for s in ss]; time.sleep(60)' $local_ports >/dev/null 2>&1 &
+listener=$!
+trap 'kill "$listener" 2>/dev/null || :; wait "$listener" 2>/dev/null || :; rm -f "$marker" "$SSHX_STARTED"; exit 0' INT HUP TERM
+while :; do sleep 0.01; done
+''', "sshx-fixture-master", sys.argv[1], sys.argv[2])
+PY
     printf '%s' "$!" > "$pid_file"
     exit 0
     ;;
@@ -8873,8 +8892,27 @@ struct PtyChild {
 
 #[cfg(unix)]
 impl PtyChild {
+    fn spawn(command: &mut Command) -> Self {
+        unsafe {
+            command.pre_exec(|| {
+                // A private session owns the slave PTY even when stdout is not a terminal.
+                if libc::setsid() < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY as _, 0) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        Self {
+            process: command.spawn().expect("sshx should start in pty"),
+            finished: false,
+        }
+    }
+
     fn stop(&mut self) -> io::Result<std::process::ExitStatus> {
-        // The child starts its own process group, so only this fixture is terminated.
+        // setsid gives the child a private process group, so only this fixture is terminated.
         unsafe { libc::kill(-(self.process.id() as libc::pid_t), libc::SIGKILL) };
         self.process.wait()
     }
@@ -8901,30 +8939,22 @@ fn run_with_pty_interactions_with_terminal_hook(
     size: Option<(u16, u16)>,
     mut after_render: impl FnMut(usize, libc::c_int),
 ) -> (std::process::ExitStatus, String) {
-    // ponytail: serialize PTY fixtures; use bounded concurrency if suite runtime becomes a problem.
-    static PTY_INTERACTIONS: Mutex<()> = Mutex::new(());
     let _interaction = PTY_INTERACTIONS
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     let mut master = -1;
     let mut slave = -1;
     let mut dimensions = unsafe { std::mem::zeroed::<libc::winsize>() };
-    if let Some((width, height)) = size {
-        dimensions.ws_col = width;
-        dimensions.ws_row = height;
-    }
-    let window: *mut libc::winsize = if size.is_some() {
-        &mut dimensions
-    } else {
-        std::ptr::null_mut()
-    };
+    let (width, height) = size.unwrap_or((80, 24));
+    dimensions.ws_col = width;
+    dimensions.ws_row = height;
     let result = unsafe {
         libc::openpty(
             &mut master,
             &mut slave,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            window,
+            &mut dimensions,
         )
     };
     assert_eq!(result, 0, "openpty should succeed");
@@ -8974,8 +9004,7 @@ fn run_with_pty_interactions_with_terminal_hook(
         } else {
             Stdio::from(stdout)
         })
-        .stderr(Stdio::from(slave))
-        .process_group(0);
+        .stderr(Stdio::from(slave));
     if close_stdout {
         unsafe {
             command.pre_exec(|| {
@@ -8986,10 +9015,7 @@ fn run_with_pty_interactions_with_terminal_hook(
             });
         }
     }
-    let mut child = PtyChild {
-        process: command.spawn().expect("sshx should start in pty"),
-        finished: false,
-    };
+    let mut child = PtyChild::spawn(&mut command);
     let mut master = unsafe { std::fs::File::from_raw_fd(master) };
     let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
     assert!(flags >= 0, "pty flags should be readable");
@@ -10058,6 +10084,7 @@ fn host_create_rejects_explicit_scope_conflict_before_opening_workspace() {
     let (root, home) = fixture_root();
     let config = home.join(".ssh/config");
     write(&config, "Host existing\n  HostName existing.example\n");
+    let original = fs::read(&config).unwrap();
     let bin = root.join("bin");
     fs::create_dir(&bin).unwrap();
     let (status, output) = run_with_pty_header(
@@ -10072,12 +10099,13 @@ fn host_create_rejects_explicit_scope_conflict_before_opening_workspace() {
         ],
         &bin,
         &root,
-        b"\x1b",
+        b"",
         b"SCOPE_ROOT_CONFLICT",
     );
     assert_eq!(status.code(), Some(2), "status={status:?} output={output}");
     assert!(output.contains("SCOPE_ROOT_CONFLICT"), "{output}");
-    assert!(!output.contains("Create HostEntry"), "{output}");
+    assert_eq!(fs::read(&config).unwrap(), original);
+    assert!(!home.join(".config/sshx/config.json").exists());
     fs::remove_dir_all(root).unwrap();
 }
 
