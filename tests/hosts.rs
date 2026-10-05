@@ -273,7 +273,7 @@ fn missing_show_selector_and_tunnel_id_cancel_without_effect() {
                     &mut slave,
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
-                    &mut size,
+                    &raw mut size,
                 )
             },
             0
@@ -1770,7 +1770,7 @@ impl HostEditTerminal {
                     &mut slave,
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
-                    &mut size,
+                    &raw mut size,
                 )
             },
             0

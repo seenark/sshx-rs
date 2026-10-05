@@ -2317,7 +2317,7 @@ fn interactive_tunnel_piped_stdout_closes_before_tunnel_stops() {
                 &mut slave_fd,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &mut dimensions,
+                &raw mut dimensions,
             )
         },
         0
@@ -8954,7 +8954,7 @@ fn run_with_pty_interactions_with_terminal_hook(
             &mut slave,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            &mut dimensions,
+            &raw mut dimensions,
         )
     };
     assert_eq!(result, 0, "openpty should succeed");
