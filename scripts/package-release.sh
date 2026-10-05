@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
     printf 'Usage: %s VERSION TARGET [OUTPUT_DIR]\n' "$0" >&2
-    printf 'Targets: aarch64-apple-darwin, x86_64-apple-darwin, aarch64-unknown-linux-gnu, x86_64-unknown-linux-gnu\n' >&2
+    printf 'Targets: aarch64-apple-darwin, aarch64-unknown-linux-gnu, x86_64-unknown-linux-gnu\n' >&2
 }
 
 if [[ $# -lt 2 || $# -gt 3 ]]; then
@@ -23,7 +23,7 @@ case "$version" in
 esac
 
 case "$target" in
-    aarch64-apple-darwin|x86_64-apple-darwin|aarch64-unknown-linux-gnu|x86_64-unknown-linux-gnu)
+    aarch64-apple-darwin|aarch64-unknown-linux-gnu|x86_64-unknown-linux-gnu)
         ;;
     *)
         printf 'unsupported release target: %s\n' "$target" >&2

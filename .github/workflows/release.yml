@@ -13,7 +13,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-22.04, macos-14]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -42,11 +42,9 @@ jobs:
         include:
           - runner: macos-14
             target: aarch64-apple-darwin
-          - runner: macos-13
-            target: x86_64-apple-darwin
-          - runner: ubuntu-24.04-arm
+          - runner: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
-          - runner: ubuntu-latest
+          - runner: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
     runs-on: ${{ matrix.runner }}
     steps:
@@ -86,34 +84,60 @@ jobs:
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
-          test "$(find dist -type f | wc -l | tr -d ' ')" -eq 8
+          version="${GITHUB_REF_NAME#v}"
+          expected="$(
+            for target in aarch64-apple-darwin aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu; do
+              printf '%s\n' "sshx-v${version}-${target}.tar.gz" "sshx-v${version}-${target}.tar.gz.sha256"
+            done | sort
+          )"
+          actual="$(find dist -type f -printf '%f\n' | sort)"
+          test "$actual" = "$expected"
           gh release create "$GITHUB_REF_NAME" dist/* \
-            --verify-tag \
-            --title "$GITHUB_REF_NAME" \
-            --generate-notes
+            --draft --verify-tag --title "$GITHUB_REF_NAME" --generate-notes
+          uploaded="$(gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name' | sort)"
+          test "$uploaded" = "$expected"
+          gh release edit "$GITHUB_REF_NAME" --draft=false --latest
 
   mise-smoke:
     needs: publish
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [macos-14, ubuntu-22.04-arm, ubuntu-22.04]
     runs-on: ${{ matrix.os }}
     env:
       HOME: ${{ runner.temp }}/sshx-mise-home
+      XDG_CONFIG_HOME: ${{ runner.temp }}/sshx-xdg-config
+      XDG_DATA_HOME: ${{ runner.temp }}/sshx-xdg-data
       MISE_CONFIG_DIR: ${{ runner.temp }}/sshx-mise-config
       MISE_DATA_DIR: ${{ runner.temp }}/sshx-mise-data
       MISE_CACHE_DIR: ${{ runner.temp }}/sshx-mise-cache
       MISE_STATE_DIR: ${{ runner.temp }}/sshx-mise-state
+      MISE_GITHUB_TOKEN: ${{ github.token }}
       MISE_YES: '1'
     steps:
+      - name: Create isolated mise directories
+        run: mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$MISE_CONFIG_DIR" "$MISE_DATA_DIR" "$MISE_CACHE_DIR" "$MISE_STATE_DIR"
       - uses: jdx/mise-action@v2
+        with:
+          install: false
+          cache: false
+          cache_save: false
+          mise_dir: ${{ runner.temp }}/sshx-mise-data
       - name: Install published release in fresh mise environment
+        working-directory: ${{ env.HOME }}
         run: |
-          mkdir -p "$HOME" "$MISE_CONFIG_DIR" "$MISE_DATA_DIR" "$MISE_CACHE_DIR" "$MISE_STATE_DIR"
           version="${GITHUB_REF_NAME#v}"
-          mise ls-remote github:seenark/sshx-rs
           mise use -g github:seenark/sshx-rs
-          actual="$(mise exec -- sshx --version)"
-          test "$actual" = "sshx $version"
+          selected="$(mise which sshx)"
+          case "$selected" in
+            "$MISE_DATA_DIR"/installs/*) ;;
+            *) printf 'sshx resolved outside isolated mise install: %s\n' "$selected" >&2; exit 1 ;;
+          esac
+          test -x "$selected"
+          test "$(mise exec -- sh -c 'command -v sshx')" = "$selected"
+          test "$(mise exec -- sshx --version)" = "sshx $version"
+          mise use -g "github:seenark/sshx-rs@$version"
+          test "$(mise exec -- sshx --version)" = "sshx $version"

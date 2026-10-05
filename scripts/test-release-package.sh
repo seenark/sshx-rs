@@ -6,7 +6,7 @@ target=${2:-$(rustc -vV | awk '/^host:/{print $2}')}
 output_dir=${3:-"$(mktemp -d "${TMPDIR:-/tmp}/sshx-release-smoke.XXXXXX")"}
 
 case "$target" in
-    aarch64-apple-darwin|x86_64-apple-darwin|aarch64-unknown-linux-gnu|x86_64-unknown-linux-gnu)
+    aarch64-apple-darwin|aarch64-unknown-linux-gnu|x86_64-unknown-linux-gnu)
         ;;
     *)
         printf 'release smoke supports macOS/Linux targets only, got %s\n' "$target" >&2

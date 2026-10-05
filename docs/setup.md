@@ -40,7 +40,15 @@ To pin a version:
 mise use -g github:seenark/sshx-rs@0.1.0
 ```
 
-The release contains one archive for each supported OS/architecture pair. mise selects the matching target asset and extracts executable `sshx` from archive root.
+Supported release targets are:
+
+- `aarch64-apple-darwin` for Apple Silicon M1 and later;
+- `aarch64-unknown-linux-gnu` for GNU/Linux arm64;
+- `x86_64-unknown-linux-gnu` for GNU/Linux x86_64.
+
+GNU/Linux uses Ubuntu 22.04 as its compatibility baseline. Mac Intel, Windows, and Alpine/musl are not supported. Apple Silicon support does not promise compatibility with every historical macOS version.
+
+Each release contains exactly three `.tar.gz` archives and three companion `.sha256` files. mise selects the matching target asset and extracts executable `sshx` from archive root. Archives do not bundle the system OpenSSH engine or optional `sshpass`; the prerequisites above still apply.
 
 ## Register config roots
 
