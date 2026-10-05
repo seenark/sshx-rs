@@ -17,6 +17,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: jdx/mise-action@v2
+      - name: Install Rust verification components
+        run: mise exec -- rustup component add rustfmt clippy
       - name: Install Linux prerequisites
         if: runner.os == 'Linux'
         run: |

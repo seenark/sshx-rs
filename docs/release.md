@@ -1,6 +1,7 @@
 # Build and publish releases
 
 Releases use `vX.Y.Z` tags. GitHub Actions runs the full behavior suite on Ubuntu 22.04 and macOS Apple Silicon before publishing assets.
+Verification installs the pinned Rust toolchain's `rustfmt` and `clippy` components before running the formatting, linting, and behavior gates.
 
 ## Local package smoke test
 
