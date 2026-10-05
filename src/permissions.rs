@@ -77,7 +77,10 @@ fn open_repair_target(path: &Path, target: PermissionTarget, mode: u32) -> io::R
         match component {
             Component::RootDir | Component::CurDir if !is_final => {}
             Component::RootDir | Component::CurDir => {
-                return Err(io::Error::new(io::ErrorKind::InvalidInput, "path has no filename"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "path has no filename",
+                ));
             }
             Component::ParentDir if !is_final => {
                 let parent = CString::new("..").unwrap();
@@ -94,7 +97,10 @@ fn open_repair_target(path: &Path, target: PermissionTarget, mode: u32) -> io::R
             Component::Prefix(_) => unreachable!("prefix components are not Unix paths"),
         }
     }
-    Err(io::Error::new(io::ErrorKind::InvalidInput, "path has no filename"))
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "path has no filename",
+    ))
 }
 
 #[cfg(unix)]
@@ -108,11 +114,7 @@ fn repair_opened_target(
     use std::os::unix::fs::PermissionsExt;
 
     #[cfg(target_os = "linux")]
-    let target_file = open_target_fd(
-        dir,
-        name,
-        libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-    )?;
+    let target_file = open_target_fd(dir, name, libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW)?;
     #[cfg(target_os = "linux")]
     let metadata = target_file.metadata()?;
     #[cfg(not(target_os = "linux"))]
@@ -162,7 +164,10 @@ fn repair_opened_target(
     check_metadata(&verified, target)?;
     #[cfg(not(target_os = "linux"))]
     if metadata.dev() != verified.dev() || metadata.ino() != verified.ino() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "target changed during repair"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "target changed during repair",
+        ));
     }
     let verified_mode = verified.permissions().mode() & 0o7777;
     if verified_mode != mode {
@@ -190,7 +195,10 @@ fn check_metadata(metadata: &fs::Metadata, target: PermissionTarget) -> io::Resu
         || (target.is_file() && !metadata.is_file())
         || (!target.is_file() && !metadata.is_dir())
     {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "target type changed"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "target type changed",
+        ));
     }
     if metadata.uid() != unsafe { libc::geteuid() } as u32 {
         return Err(io::Error::new(
@@ -214,7 +222,6 @@ fn open_repair_target(_path: &Path, _target: PermissionTarget, _mode: u32) -> io
         "race-resistant permission repair is unavailable on this platform",
     ))
 }
-
 
 pub const PRIVATE_FILE_MODE: u32 = 0o600;
 pub const PRIVATE_DIR_MODE: u32 = 0o700;
@@ -419,8 +426,16 @@ mod tests {
         });
 
         assert_eq!(result.outcome, RepairOutcome::Skipped);
-        assert!(fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
-        assert_eq!(fs::metadata(&outside).unwrap().permissions().mode() & 0o7777, 0o644);
+        assert!(
+            fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::metadata(&outside).unwrap().permissions().mode() & 0o7777,
+            0o644
+        );
         assert_eq!(fs::read_to_string(&outside).unwrap(), "outside secret");
         fs::remove_dir_all(root).unwrap();
     }
@@ -446,17 +461,26 @@ mod tests {
         };
         let result = apply(&candidate);
         assert_eq!(result.outcome, RepairOutcome::Fixed, "{}", result.detail);
-        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o7777, 0o600);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+            0o600
+        );
         fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
         let result = apply(&candidate);
         assert_eq!(result.outcome, RepairOutcome::Fixed, "{}", result.detail);
-        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o7777, 0o600);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+            0o600
+        );
 
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
         fs::hard_link(&path, root.join("shared")).unwrap();
         let result = apply(&candidate);
         assert_eq!(result.outcome, RepairOutcome::Skipped);
-        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o7777, 0o644);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+            0o644
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -483,7 +507,10 @@ mod tests {
         let result = apply(&candidate);
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
         assert_eq!(result.outcome, RepairOutcome::Fixed, "{}", result.detail);
-        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o7777, 0o600);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+            0o600
+        );
         fs::remove_dir_all(root).unwrap();
     }
 }

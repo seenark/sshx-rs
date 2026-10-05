@@ -638,7 +638,12 @@ fn apply_permissions_does_not_follow_replacement_symlink() {
     let result = permissions::apply(&candidate);
 
     assert_eq!(result.outcome, permissions::RepairOutcome::Skipped);
-    assert!(fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
+    assert!(
+        fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
     assert_eq!(mode_of(&outside), 0o644);
     assert_eq!(fs::read_to_string(&outside).unwrap(), "outside secret");
 
@@ -653,7 +658,12 @@ fn apply_permissions_does_not_follow_replacement_symlink() {
     let result = permissions::apply(&candidate);
 
     assert_eq!(result.outcome, permissions::RepairOutcome::Skipped);
-    assert!(fs::symlink_metadata(home.join(".ssh")).unwrap().file_type().is_symlink());
+    assert!(
+        fs::symlink_metadata(home.join(".ssh"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
     assert_eq!(mode_of(&outside_child), 0o644);
     assert_eq!(
         fs::read_to_string(&outside_child).unwrap(),
@@ -820,8 +830,7 @@ fn human_doctor_groups_severity_and_stage_with_actionable_evidence() {
         ],
         repairs: Vec::new(),
     };
-    let rendered =
-        sshx::output::render_doctor(&report, sshx::output::OutputFormat::Human).unwrap();
+    let rendered = sshx::output::render_doctor(&report, sshx::output::OutputFormat::Human).unwrap();
 
     let config = rendered.find("[error] config\n").unwrap();
     let first = rendered.find("include_missing:").unwrap();

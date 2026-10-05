@@ -12,10 +12,8 @@ pub const TUNNEL_USAGE: &str = "Usage: sshx tunnel [HOST] [OPTIONS]\n       sshx
 const TUNNEL_DIRECT_USAGE: &str = "Usage: sshx tunnel direct start [HOST] [OPTIONS] | sshx tunnel direct list [OPTIONS] | sshx tunnel direct status|stop|restart ID [OPTIONS]";
 const TUNNEL_PAIRED_USAGE: &str = "Usage: sshx tunnel paired start [HOST] [OPTIONS] | sshx tunnel paired list [OPTIONS] | sshx tunnel paired status|stop|restart ID [OPTIONS]";
 const TUNNEL_AUTO_START_USAGE: &str = "Usage: sshx tunnel start [HOST] [OPTIONS]";
-const TUNNEL_DIRECT_START_USAGE: &str =
-    "Usage: sshx tunnel direct start [HOST] [OPTIONS]";
-const TUNNEL_PAIRED_START_USAGE: &str =
-    "Usage: sshx tunnel paired start [HOST] [OPTIONS]";
+const TUNNEL_DIRECT_START_USAGE: &str = "Usage: sshx tunnel direct start [HOST] [OPTIONS]";
+const TUNNEL_PAIRED_START_USAGE: &str = "Usage: sshx tunnel paired start [HOST] [OPTIONS]";
 const TUNNEL_OPTIONS: &str = "--forward REMOTE[=LOCAL] (repeatable)    Forward declared service.\n--bind    Select declared services and local ports.\n-L SPEC --local-forward SPEC    Add direct local forwarding; combine with --forward on direct routes.\n--allow-bind    Permit specific non-loopback listeners; forbidden bind addresses remain rejected.\n-R SPEC --remote-forward SPEC    Open server-side listener and forward connections to destination on your side; server bind availability is checked by OpenSSH.\n-D SPEC --dynamic-forward SPEC    Open local SOCKS proxy; configure applications to use its bind address and port.\n--password-fd FD --gateway-password-fd FD --vm-password-fd FD    Supply passwords through inherited descriptors.\n--config PATH    Select SSH config roots for start/restart. List/status/stop use the runtime registry under sshx home.\n--format human|json|yaml    Select output.\n--no-input    Disable interactive prompts.";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -38,8 +36,12 @@ pub(crate) enum HelpPage {
     PairValidate,
     PairRecover,
     Tunnel,
-    TunnelRoute { route: TunnelRoute },
-    TunnelStart { route: Option<TunnelRoute> },
+    TunnelRoute {
+        route: TunnelRoute,
+    },
+    TunnelStart {
+        route: Option<TunnelRoute>,
+    },
     TunnelLifecycle {
         operation: LifecycleOperation,
         route: Option<TunnelRoute>,
@@ -93,7 +95,6 @@ impl HelpPage {
     }
 }
 
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum LifecycleOperation {
     List,
@@ -101,7 +102,6 @@ pub(crate) enum LifecycleOperation {
     Stop,
     Restart,
 }
-
 
 struct LifecycleMetadata {
     arguments: &'static str,
@@ -219,24 +219,24 @@ fn resolve_refs(path: &[&str]) -> Option<HelpPage> {
         ["tunnel", "paired", "start", ..] => Some(HelpPage::TunnelStart {
             route: Some(TunnelRoute::Paired),
         }),
-        ["tunnel", "direct", operation, ..] => LifecycleOperation::parse(operation).map(
-            |operation| HelpPage::TunnelLifecycle {
+        ["tunnel", "direct", operation, ..] => {
+            LifecycleOperation::parse(operation).map(|operation| HelpPage::TunnelLifecycle {
                 operation,
                 route: Some(TunnelRoute::Direct),
-            },
-        ),
-        ["tunnel", "paired", operation, ..] => LifecycleOperation::parse(operation).map(
-            |operation| HelpPage::TunnelLifecycle {
+            })
+        }
+        ["tunnel", "paired", operation, ..] => {
+            LifecycleOperation::parse(operation).map(|operation| HelpPage::TunnelLifecycle {
                 operation,
                 route: Some(TunnelRoute::Paired),
-            },
-        ),
-        ["tunnel", operation, ..] => LifecycleOperation::parse(operation).map(|operation| {
-            HelpPage::TunnelLifecycle {
+            })
+        }
+        ["tunnel", operation, ..] => {
+            LifecycleOperation::parse(operation).map(|operation| HelpPage::TunnelLifecycle {
                 operation,
                 route: None,
-            }
-        }),
+            })
+        }
         _ => None,
     }
 }
@@ -608,8 +608,12 @@ fn tunnel_start(route: Option<TunnelRoute>) -> String {
         None => "sshx tunnel start db-prod --forward 5432=15432 --no-input",
     };
     let purpose = match route {
-        Some(TunnelRoute::Direct) => "Start a standalone direct tunnel and return its persisted ID.",
-        Some(TunnelRoute::Paired) => "Start a standalone paired tunnel and return its persisted ID.",
+        Some(TunnelRoute::Direct) => {
+            "Start a standalone direct tunnel and return its persisted ID."
+        }
+        Some(TunnelRoute::Paired) => {
+            "Start a standalone paired tunnel and return its persisted ID."
+        }
         None => "Start a standalone tunnel with its HostEntry route and return its persisted ID.",
     };
     page(
@@ -625,10 +629,7 @@ fn tunnel_start(route: Option<TunnelRoute>) -> String {
     )
 }
 
-fn tunnel_lifecycle(
-    operation: LifecycleOperation,
-    route: Option<TunnelRoute>,
-) -> String {
+fn tunnel_lifecycle(operation: LifecycleOperation, route: Option<TunnelRoute>) -> String {
     let metadata = operation.metadata();
     let command_group = route.map_or_else(
         || "tunnel".to_string(),
@@ -640,7 +641,10 @@ fn tunnel_lifecycle(
             "sshx {command_path} [OPTIONS]\nsshx {command_path} --help\nsshx help {command_path}"
         )
     } else {
-        let id = if matches!(operation, LifecycleOperation::Status | LifecycleOperation::Stop) {
+        let id = if matches!(
+            operation,
+            LifecycleOperation::Status | LifecycleOperation::Stop
+        ) {
             "[ID]"
         } else {
             "ID"

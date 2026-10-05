@@ -127,7 +127,9 @@ pub fn paired_route(
     if gateway_indexes.is_none_or(|indexes| indexes.len() != 1)
         || vm_indexes.is_none_or(|indexes| indexes.len() != 1)
     {
-        return Err("PAIR_INVALID: duplicate immutable ID prevents exact route resolution".to_string());
+        return Err(
+            "PAIR_INVALID: duplicate immutable ID prevents exact route resolution".to_string(),
+        );
     }
     let gateway_index = gateway_indexes
         .and_then(|indexes| indexes.first())
@@ -162,11 +164,8 @@ pub fn paired_route(
     let matches_route = forward_matcher(gateway_data, vm_data);
     if !gateway_data.forwards.iter().any(|candidate| {
         matches_route(candidate) && candidate.host == transit.0 && candidate.port == transit.1
-    })
-    {
-        return Err(
-            "PAIR_ROUTE_CHANGED: VM route no longer matches approved transit".to_string(),
-        );
+    }) {
+        return Err("PAIR_ROUTE_CHANGED: VM route no longer matches approved transit".to_string());
     }
     let candidates = gateway_data
         .forwards
@@ -587,11 +586,14 @@ pub fn plan_setup(
             validate_transit_port(port)?;
             if !gateway_data.forwards.iter().any(|candidate| {
                 matches_route(candidate) && candidate.host == host && candidate.port == port
-            })
-            {
+            }) {
                 return Err(format!(
                     "TRANSIT_MISMATCH: explicit transit {host}:{port} must match VM route at Port {}",
-                    if vm_data.invalid_port { "invalid".to_string() } else { vm_data.port.to_string() }
+                    if vm_data.invalid_port {
+                        "invalid".to_string()
+                    } else {
+                        vm_data.port.to_string()
+                    }
                 ));
             }
             (host.to_string(), port)
@@ -607,7 +609,10 @@ pub fn plan_setup(
             } else {
                 vm_data.port
             };
-            let mut candidates = gateway_data.forwards.iter().filter(|candidate| matches_route(candidate));
+            let mut candidates = gateway_data
+                .forwards
+                .iter()
+                .filter(|candidate| matches_route(candidate));
             let candidate = candidates.next();
             let remaining = candidates.count();
             let Some(candidate) = candidate.filter(|_| remaining == 0) else {
@@ -629,7 +634,6 @@ pub fn plan_setup(
             "TRANSIT_MISMATCH: approved transit {transit_host}:{transit_port} matches {destination_matches} gateway LocalForward directives"
         ));
     }
-
 
     mutation::plan_pair(
         &PairMutationRequest {
@@ -707,9 +711,7 @@ pub fn plan_delete(entries: &[HostEntry], selected: &PairRecord) -> Result<PairP
             return Err(conflict());
         }
     }
-    if gateway_data.pair_marker_counts == [0, 0, 0]
-        && vm_data.pair_marker_counts == [0, 0, 0]
-    {
+    if gateway_data.pair_marker_counts == [0, 0, 0] && vm_data.pair_marker_counts == [0, 0, 0] {
         return Err(stale());
     }
     if gateway_data.pair_marker_counts != [0, 1, 0]
@@ -783,8 +785,7 @@ fn forward_matcher(
             return false;
         };
         let is_localhost = |address: IpAddr| {
-            address == IpAddr::V4(Ipv4Addr::LOCALHOST)
-                || address == IpAddr::V6(Ipv6Addr::LOCALHOST)
+            address == IpAddr::V4(Ipv4Addr::LOCALHOST) || address == IpAddr::V6(Ipv6Addr::LOCALHOST)
         };
         port == vm_port
             && match (address, vm_address) {
@@ -812,7 +813,10 @@ fn forward_matcher(
 
 pub fn setup_eligible(entry: &HostEntry) -> bool {
     parse_entry(entry).is_ok_and(|entry| {
-        !entry.gateway_marker && !entry.paired_vm_marker && !entry.proxy_command && !entry.proxy_jump
+        !entry.gateway_marker
+            && !entry.paired_vm_marker
+            && !entry.proxy_command
+            && !entry.proxy_jump
     })
 }
 
@@ -964,13 +968,17 @@ fn parse_entry(entry: &HostEntry) -> Result<ParsedEntry, String> {
                 }
                 Some("GATEWAY") => {
                     result.pair_marker_counts[0] += 1;
-                    result.additional_references.extend(result.gateway_id.take());
+                    result
+                        .additional_references
+                        .extend(result.gateway_id.take());
                     result.gateway_marker = true;
                     result.gateway_id = value.filter(|value| !value.is_empty());
                 }
                 Some("VM") => {
                     result.pair_marker_counts[1] += 1;
-                    result.additional_references.extend(result.paired_vm_id.take());
+                    result
+                        .additional_references
+                        .extend(result.paired_vm_id.take());
                     result.paired_vm_marker = true;
                     result.paired_vm_id = value.filter(|value| !value.is_empty());
                 }
@@ -1343,9 +1351,9 @@ mod tests {
         fs::remove_file(path).unwrap();
 
         assert!(
-            findings
-                .iter()
-                .any(|finding| finding.message.contains("contains multiple ##SSHX ID markers")),
+            findings.iter().any(|finding| finding
+                .message
+                .contains("contains multiple ##SSHX ID markers")),
             "{findings:?}"
         );
         assert!(

@@ -165,7 +165,12 @@ fn standalone_direct_tunnel_survives_launcher_and_stops_by_id() {
         id
     );
     fs::remove_file(&marker).unwrap();
-    let down = run(&home, &bin, &marker, &["tunnel", "status", &id, "--format", "json"]);
+    let down = run(
+        &home,
+        &bin,
+        &marker,
+        &["tunnel", "status", id, "--format", "json"],
+    );
     assert!(down.status.success(), "{down:?}");
     let down_tunnel = &serde_json::from_slice::<Value>(&down.stdout).unwrap()["tunnels"][0];
     assert_eq!(down_tunnel["state"], "down");
@@ -175,11 +180,18 @@ fn standalone_direct_tunnel_survives_launcher_and_stops_by_id() {
     let original_registry = fs::read(&registry_path).unwrap();
     let mut unsafe_registry: Value = serde_json::from_slice(&original_registry).unwrap();
     unsafe_registry["tunnels"][0]["control_socket"] = "/tmp/unproved-sshx-control".into();
-    fs::write(&registry_path, serde_json::to_vec_pretty(&unsafe_registry).unwrap()).unwrap();
+    fs::write(
+        &registry_path,
+        serde_json::to_vec_pretty(&unsafe_registry).unwrap(),
+    )
+    .unwrap();
     let unsafe_stop = run(&home, &bin, &marker, &["tunnel", "stop", id]);
     assert_eq!(unsafe_stop.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&unsafe_stop.stderr).contains("REGISTRY_UNSAFE"));
-    assert!(marker.exists(), "unproved control reference must not stop master");
+    assert!(
+        marker.exists(),
+        "unproved control reference must not stop master"
+    );
     fs::write(&registry_path, &original_registry).unwrap();
 
     let wrong_route = run(
@@ -201,7 +213,10 @@ fn standalone_direct_tunnel_survives_launcher_and_stops_by_id() {
         String::from_utf8_lossy(&wrong_route.stderr).contains("TUNNEL_ROUTE_MISMATCH"),
         "{wrong_route:?}"
     );
-    assert!(marker.exists(), "wrong-route start must not stop the master");
+    assert!(
+        marker.exists(),
+        "wrong-route start must not stop the master"
+    );
     assert_eq!(fs::read(&registry_path).unwrap(), original_registry);
 
     for operation in ["status", "stop", "restart"] {
@@ -210,16 +225,26 @@ fn standalone_direct_tunnel_survives_launcher_and_stops_by_id() {
             &bin,
             &marker,
             &[
-                "--config", config.to_str().unwrap(),
-                "tunnel", "paired", operation, id, "--format", "json",
+                "--config",
+                config.to_str().unwrap(),
+                "tunnel",
+                "paired",
+                operation,
+                id,
+                "--format",
+                "json",
             ],
         );
         assert_eq!(wrong_lifecycle_route.status.code(), Some(2));
         assert!(
-            String::from_utf8_lossy(&wrong_lifecycle_route.stderr).contains("TUNNEL_ROUTE_MISMATCH"),
+            String::from_utf8_lossy(&wrong_lifecycle_route.stderr)
+                .contains("TUNNEL_ROUTE_MISMATCH"),
             "{operation}: {wrong_lifecycle_route:?}"
         );
-        assert!(marker.exists(), "wrong-route {operation} must not stop the master");
+        assert!(
+            marker.exists(),
+            "wrong-route {operation} must not stop the master"
+        );
         assert_eq!(
             fs::read(&registry_path).unwrap(),
             original_registry,
@@ -227,7 +252,10 @@ fn standalone_direct_tunnel_survives_launcher_and_stops_by_id() {
         );
     }
     let paired_list = run(
-        &home, &bin, &marker, &["tunnel", "paired", "list", "--format", "json"],
+        &home,
+        &bin,
+        &marker,
+        &["tunnel", "paired", "list", "--format", "json"],
     );
     assert!(paired_list.status.success(), "{paired_list:?}");
     assert_eq!(
@@ -272,14 +300,7 @@ fn standalone_direct_tunnel_survives_launcher_and_stops_by_id() {
         &home,
         &bin,
         &marker,
-        &[
-            "tunnel",
-            "direct",
-            "stop",
-            restarted_id,
-            "--format",
-            "json",
-        ],
+        &["tunnel", "direct", "stop", restarted_id, "--format", "json"],
     );
     assert!(stopped.status.success(), "{stopped:?}");
     assert!(!marker.exists());
@@ -309,7 +330,11 @@ fn standalone_direct_tunnel_survives_launcher_and_stops_by_id() {
 fn tunnel_bind_machine_output_rejects_terminal_input_without_prompting() {
     let (root, home, bin) = fixture();
     let config = home.join(".ssh/config");
-    fs::write(&config, "Host direct\n  HostName direct.example\n  ##PORT 5432\n").unwrap();
+    fs::write(
+        &config,
+        "Host direct\n  HostName direct.example\n  ##PORT 5432\n",
+    )
+    .unwrap();
     let mut master = -1;
     let mut slave = -1;
     assert_eq!(
@@ -329,11 +354,21 @@ fn tunnel_bind_machine_output_rejects_terminal_input_without_prompting() {
     let marker = root.join("master.started");
     let mut child = Command::new(env!("CARGO_BIN_EXE_sshx"))
         .env("HOME", &home)
-        .env("PATH", format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()))
+        .env(
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        )
         .env("SSHX_TUNNEL_MARKER", &marker)
         .args([
-            "--config", config.to_str().unwrap(), "tunnel", "direct", "start",
-            "direct", "--bind", "--format", "json",
+            "--config",
+            config.to_str().unwrap(),
+            "tunnel",
+            "direct",
+            "start",
+            "direct",
+            "--bind",
+            "--format",
+            "json",
         ])
         .stdin(slave)
         .stdout(Stdio::piped())
@@ -358,7 +393,6 @@ fn tunnel_bind_machine_output_rejects_terminal_input_without_prompting() {
         "{output:?}"
     );
 }
-
 
 #[test]
 fn standalone_tunnel_rejects_non_loopback_bind_without_opt_in() {
@@ -564,15 +598,25 @@ exit 0
     let id = tunnel["id"].as_str().unwrap();
     for operation in ["status", "stop", "restart"] {
         let wrong_lifecycle_route = run(&[
-            "--config", config.to_str().unwrap(),
-            "tunnel", "direct", operation, id, "--format", "json",
+            "--config",
+            config.to_str().unwrap(),
+            "tunnel",
+            "direct",
+            operation,
+            id,
+            "--format",
+            "json",
         ]);
         assert_eq!(wrong_lifecycle_route.status.code(), Some(2));
         assert!(
-            String::from_utf8_lossy(&wrong_lifecycle_route.stderr).contains("TUNNEL_ROUTE_MISMATCH"),
+            String::from_utf8_lossy(&wrong_lifecycle_route.stderr)
+                .contains("TUNNEL_ROUTE_MISMATCH"),
             "{operation}: {wrong_lifecycle_route:?}"
         );
-        assert!(!root.join("close.log").exists(), "wrong-route {operation} must not close either master");
+        assert!(
+            !root.join("close.log").exists(),
+            "wrong-route {operation} must not close either master"
+        );
     }
     let direct_list = run(&["tunnel", "direct", "list", "--format", "json"]);
     assert!(direct_list.status.success(), "{direct_list:?}");
@@ -587,10 +631,7 @@ exit 0
         .zip([5432, 6379, 3001].into_iter().zip(&service_ports))
     {
         assert_eq!(forward["remote_port"].as_u64(), Some(remote_port));
-        assert_eq!(
-            forward["local_port"].as_u64(),
-            Some(u64::from(*local_port))
-        );
+        assert_eq!(forward["local_port"].as_u64(), Some(u64::from(*local_port)));
     }
     let automatic_duplicate = run(&[
         "--config",
@@ -607,7 +648,10 @@ exit 0
         "--format",
         "json",
     ]);
-    assert!(automatic_duplicate.status.success(), "{automatic_duplicate:?}");
+    assert!(
+        automatic_duplicate.status.success(),
+        "{automatic_duplicate:?}"
+    );
     assert_eq!(
         serde_json::from_slice::<Value>(&automatic_duplicate.stdout).unwrap()["tunnels"][0]["id"],
         id
@@ -652,10 +696,12 @@ exit 0
     assert_eq!(stale_tunnel["gateway_master_status"], "responsive");
     assert_eq!(stale_tunnel["vm_master_status"], "responsive");
     assert_eq!(stale_tunnel["listener_status"], "bound");
-    assert!(stale_tunnel["error"]
-        .as_str()
-        .unwrap()
-        .contains("CONFIG_CHANGED"));
+    assert!(
+        stale_tunnel["error"]
+            .as_str()
+            .unwrap()
+            .contains("CONFIG_CHANGED")
+    );
 
     let restarted = run(&[
         "--config",
@@ -695,19 +741,11 @@ exit 0
         "{duplicate_after_restart:?}"
     );
     assert_eq!(
-        serde_json::from_slice::<Value>(&duplicate_after_restart.stdout).unwrap()["tunnels"][0]
-            ["id"],
+        serde_json::from_slice::<Value>(&duplicate_after_restart.stdout).unwrap()["tunnels"][0]["id"],
         restarted_id
     );
 
-    let stopped = run(&[
-        "tunnel",
-        "paired",
-        "stop",
-        restarted_id,
-        "--format",
-        "json",
-    ]);
+    let stopped = run(&["tunnel", "paired", "stop", restarted_id, "--format", "json"]);
     assert!(stopped.status.success(), "{stopped:?}");
     assert_eq!(
         serde_json::from_slice::<Value>(&stopped.stdout).unwrap()["tunnels"][0]["state"],

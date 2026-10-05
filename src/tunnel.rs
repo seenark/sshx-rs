@@ -498,7 +498,8 @@ fn existing_registry(home: &Path) -> Option<(PathBuf, RegistryFile)> {
 
 pub fn list(home: &Path, route: Option<TunnelRoute>) -> Result<TunnelResponse, String> {
     let root = registry_root(home);
-    if matches!(fs::symlink_metadata(&root), Err(error) if error.kind() == std::io::ErrorKind::NotFound) {
+    if matches!(fs::symlink_metadata(&root), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+    {
         return Ok(TunnelResponse {
             operation: "list".to_string(),
             tunnels: Vec::new(),
@@ -508,9 +509,12 @@ pub fn list(home: &Path, route: Option<TunnelRoute>) -> Result<TunnelResponse, S
     let registry = read_registry(&root)?;
     Ok(TunnelResponse {
         operation: "list".to_string(),
-        tunnels: registry.tunnels.iter()
+        tunnels: registry
+            .tunnels
+            .iter()
             .filter(|record| route.is_none_or(|route| record.kind == route.as_str()))
-            .map(view).collect(),
+            .map(view)
+            .collect(),
     })
 }
 
@@ -577,8 +581,7 @@ pub fn restart(
     expected_route: Option<TunnelRoute>,
     no_input: bool,
     password_fd: Option<i32>,
-    gateway_password_fd: Option<i32>,
-    vm_password_fd: Option<i32>,
+    paired_credentials: connect::PairedCredentials,
 ) -> Result<TunnelResponse, String> {
     let root = registry_root(home);
     ensure_private_tree(&root)?;
@@ -628,8 +631,8 @@ pub fn restart(
             &pair.vm_alias,
             no_input,
             connect::PairedCredentials {
-                gateway_password_fd: gateway_password_fd.or(password_fd),
-                vm_password_fd: vm_password_fd.or(password_fd),
+                gateway_password_fd: paired_credentials.gateway_password_fd.or(password_fd),
+                vm_password_fd: paired_credentials.vm_password_fd.or(password_fd),
             },
             &forwards,
         )
@@ -661,7 +664,8 @@ pub fn restart(
             _ => return Err("TUNNEL_INVALID: registry has unknown forward kind".to_string()),
         }
     }
-    let mut credentials = connect::StandaloneCredentials::new(password_fd.or(vm_password_fd));
+    let mut credentials =
+        connect::StandaloneCredentials::new(password_fd.or(paired_credentials.vm_password_fd));
     start(
         entry,
         home,
@@ -1078,9 +1082,7 @@ fn normalize_bind(value: &str, allow_bind: bool) -> Result<String, String> {
                 "FORWARD_BIND_INVALID: bind address brackets must be balanced".to_string()
             })?,
         None if value.contains(['[', ']']) => {
-            return Err(
-                "FORWARD_BIND_INVALID: bind address brackets must be balanced".to_string(),
-            );
+            return Err("FORWARD_BIND_INVALID: bind address brackets must be balanced".to_string());
         }
         None => value,
     };
@@ -1587,7 +1589,6 @@ fn request_signature(
     })
 }
 
-
 fn request_signature_with(
     entry: &HostEntry,
     fingerprint: &str,
@@ -1758,8 +1759,8 @@ mod tests {
 
     #[test]
     fn localhost_and_ipv4_loopback_are_duplicate_listeners() {
-        let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
-            .expect("temporary port should bind");
+        let listener =
+            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("temporary port should bind");
         let port = listener.local_addr().expect("address should exist").port();
         drop(listener);
         let forwards = parse_forwards(

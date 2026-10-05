@@ -501,7 +501,14 @@ pub fn open_with_password_fd_and_forwards(
     forwards: &[ServiceForward],
 ) -> Result<(), String> {
     open_with_password_fd_and_all_forwards(
-        entry, home, no_input, selected_alias, password_fd, forwards, &[], false,
+        entry,
+        home,
+        no_input,
+        selected_alias,
+        password_fd,
+        forwards,
+        &[],
+        false,
     )
 }
 
@@ -605,7 +612,12 @@ fn open_session(
     };
     let mut enrolled = false;
     let master = loop {
-        let mut master = spawn_master(&runtime, no_input, attempt.as_ref(), !forwards.is_empty() || !direct_forwards.is_empty())?;
+        let mut master = spawn_master(
+            &runtime,
+            no_input,
+            attempt.as_ref(),
+            !forwards.is_empty() || !direct_forwards.is_empty(),
+        )?;
         match wait_for_master(
             &runtime,
             &mut master,
@@ -963,7 +975,8 @@ fn launch_standalone_session(
                     && error.starts_with("SSH_AUTH_FAILED")
                     && !prompted;
                 if can_prompt
-                    && let Some(next) = prompt_password(&runtime.runtime.alias, credentials.attempt.is_some())?
+                    && let Some(next) =
+                        prompt_password(&runtime.runtime.alias, credentials.attempt.is_some())?
                 {
                     credentials.attempt = Some(next);
                     prompted = true;
@@ -1256,32 +1269,35 @@ fn remote_forward_argument(forward: &session::ForwardSpec) -> Result<String, Str
     let [bind, port, _, _] = fields.as_slice() else {
         return Err("FORWARD_INVALID: remote forward has invalid effective value".to_string());
     };
-    let host = forward.remote_host.as_deref().ok_or_else(|| {
-        "FORWARD_INVALID: remote forward has no destination host".to_string()
-    })?;
-    let remote_port = forward.remote_port.ok_or_else(|| {
-        "FORWARD_INVALID: remote forward has no destination port".to_string()
-    })?;
-    Ok(format!("{bind}:{port} {}:{remote_port}", forward_host(host)))
+    let host = forward
+        .remote_host
+        .as_deref()
+        .ok_or_else(|| "FORWARD_INVALID: remote forward has no destination host".to_string())?;
+    let remote_port = forward
+        .remote_port
+        .ok_or_else(|| "FORWARD_INVALID: remote forward has no destination port".to_string())?;
+    Ok(format!(
+        "{bind}:{port} {}:{remote_port}",
+        forward_host(host)
+    ))
 }
 fn local_forward_argument(forward: &session::ForwardSpec) -> Result<String, String> {
-    let (bind, port) = forward.listener().ok_or_else(|| {
-        "FORWARD_INVALID: local forward requires a local listener".to_string()
-    })?;
+    let (bind, port) = forward
+        .listener()
+        .ok_or_else(|| "FORWARD_INVALID: local forward requires a local listener".to_string())?;
     let host = forward
         .remote_host
         .as_deref()
         .ok_or_else(|| "FORWARD_INVALID: local forward has no destination host".to_string())?;
-    let remote_port = forward.remote_port.ok_or_else(|| {
-        "FORWARD_INVALID: local forward has no destination port".to_string()
-    })?;
+    let remote_port = forward
+        .remote_port
+        .ok_or_else(|| "FORWARD_INVALID: local forward has no destination port".to_string())?;
     Ok(format!(
         "{}:{port} {}:{remote_port}",
         forward_host(&bind),
         forward_host(host)
     ))
 }
-
 
 fn split_forward_fields(value: &str) -> Vec<&str> {
     let mut fields = Vec::new();
@@ -3036,11 +3052,10 @@ mod tests {
             .unwrap_err()
             .starts_with("FORWARD_DUPLICATE:")
         );
-        assert!(super::preflight_direct_listeners(
-            std::slice::from_ref(&service),
-            &[dynamic("::1")]
-        )
-        .is_ok());
+        assert!(
+            super::preflight_direct_listeners(std::slice::from_ref(&service), &[dynamic("::1")])
+                .is_ok()
+        );
         assert!(
             super::preflight_direct_listeners(&[service], &[dynamic("127.0.0.1")])
                 .unwrap_err()

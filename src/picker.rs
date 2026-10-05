@@ -12,8 +12,8 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
 use sshx::discovery::HostEntry;
-use sshx::settings::RegisteredRoot;
 use sshx::session::{DeclaredService, ServiceForward};
+use sshx::settings::RegisteredRoot;
 use std::cmp::Ordering;
 use std::fs::File;
 use std::io::{self, IsTerminal, Read};
@@ -114,7 +114,6 @@ pub fn select<'a>(
     state: &mut HostsState,
     status: Option<&str>,
 ) -> Result<Selection<'a>, String> {
-
     with_terminal(
         label,
         format!(
@@ -122,12 +121,18 @@ pub fn select<'a>(
         ),
         |terminal, input| {
             let mut query = String::new();
-            let mut selected = state.selected.as_ref().and_then(|(path, start, end, alias)| {
-                matching_rows(entries, "").iter().position(|row| {
-                    row.entry.source.path == *path && row.entry.source.byte_start == *start
-                        && row.entry.source.byte_end == *end && row.alias == alias
+            let mut selected = state
+                .selected
+                .as_ref()
+                .and_then(|(path, start, end, alias)| {
+                    matching_rows(entries, "").iter().position(|row| {
+                        row.entry.source.path == *path
+                            && row.entry.source.byte_start == *start
+                            && row.entry.source.byte_end == *end
+                            && row.alias == alias
+                    })
                 })
-            }).unwrap_or(0);
+                .unwrap_or(0);
             let mut detail_page = HostDetailPage::Summary;
             let mut detail_scroll = 0u16;
 
@@ -283,16 +288,18 @@ pub fn browse_hosts<'a>(
                 )
             });
             if current_route != route_selection {
-                route_display = rows.get(selected).map_or_else(String::new, |row| {
-                    match sshx::pair::paired_route(source_entries, row.entry) {
-                        Ok(Some(route)) => format!(
-                            "Pair via {}",
-                            route.gateway.aliases.first().map_or("-", String::as_str)
-                        ),
-                        Ok(None) => "Direct".to_string(),
-                        Err(error) => format!("Unavailable: {error}"),
-                    }
-                });
+                route_display =
+                    rows.get(selected).map_or_else(
+                        String::new,
+                        |row| match sshx::pair::paired_route(source_entries, row.entry) {
+                            Ok(Some(route)) => format!(
+                                "Pair via {}",
+                                route.gateway.aliases.first().map_or("-", String::as_str)
+                            ),
+                            Ok(None) => "Direct".to_string(),
+                            Err(error) => format!("Unavailable: {error}"),
+                        },
+                    );
                 route_selection = current_route;
             }
             let empty_message = if entries.is_empty() && state.query.is_empty() {
@@ -353,7 +360,10 @@ pub fn browse_hosts<'a>(
                         state.detail_scroll = 0;
                         state.detail_page = HostDetailPage::Summary;
                         state.copy_password = true;
-                        return Ok(Some(Selection { entry: row.entry, alias: row.alias }));
+                        return Ok(Some(Selection {
+                            entry: row.entry,
+                            alias: row.alias,
+                        }));
                     }
                 }
                 KeyEvent {
@@ -367,7 +377,10 @@ pub fn browse_hosts<'a>(
                             'r' => sshx::mutation::MutationKind::Rename,
                             _ => sshx::mutation::MutationKind::Delete,
                         });
-                        return Ok(Some(Selection { entry: row.entry, alias: row.alias }));
+                        return Ok(Some(Selection {
+                            entry: row.entry,
+                            alias: row.alias,
+                        }));
                     }
                 }
                 KeyEvent {
@@ -610,34 +623,58 @@ pub fn tunnels_workspace(
                     })
                     .map_err(|error| format!("TUNNEL_REQUIRED: cannot render tunnel list: {error}"))?;
                 match read_key(input, "TUNNEL_REQUIRED")? {
-                    KeyEvent { code: KeyCode::Esc, .. } => return Err(CANCELLED.to_string()),
-                    KeyEvent { code: KeyCode::Char('c'), modifiers, .. }
-                        if modifiers.contains(KeyModifiers::CONTROL) =>
-                    {
+                    KeyEvent {
+                        code: KeyCode::Esc, ..
+                    } => return Err(CANCELLED.to_string()),
+                    KeyEvent {
+                        code: KeyCode::Char('c'),
+                        modifiers,
+                        ..
+                    } if modifiers.contains(KeyModifiers::CONTROL) => {
                         return Err(CANCELLED.to_string());
                     }
-                    KeyEvent { code: KeyCode::PageUp, .. } => {
+                    KeyEvent {
+                        code: KeyCode::PageUp,
+                        ..
+                    } => {
                         detail_scroll = detail_scroll.saturating_sub(detail_step);
                     }
-                    KeyEvent { code: KeyCode::PageDown, .. } => {
+                    KeyEvent {
+                        code: KeyCode::PageDown,
+                        ..
+                    } => {
                         detail_scroll = detail_scroll.saturating_add(detail_step);
                     }
-                    KeyEvent { code: KeyCode::Up, .. } => {
+                    KeyEvent {
+                        code: KeyCode::Up, ..
+                    } => {
                         selected = selected.saturating_sub(1);
                         detail_scroll = 0;
                     }
-                    KeyEvent { code: KeyCode::Down, .. } if selected + 1 < tunnels.len() => {
+                    KeyEvent {
+                        code: KeyCode::Down,
+                        ..
+                    } if selected + 1 < tunnels.len() => {
                         selected += 1;
                         detail_scroll = 0;
                     }
-                    KeyEvent { code: KeyCode::Char('s'), .. } if !tunnels.is_empty() && allowed.is_none_or(|action| action == 's') => {
-                        return Ok((selected, 's'))
+                    KeyEvent {
+                        code: KeyCode::Char('s'),
+                        ..
+                    } if !tunnels.is_empty() && allowed.is_none_or(|action| action == 's') => {
+                        return Ok((selected, 's'));
                     }
-                    KeyEvent { code: KeyCode::Char('r'), .. } if !tunnels.is_empty() && allowed.is_none_or(|action| action == 'r') => {
-                        return Ok((selected, 'r'))
+                    KeyEvent {
+                        code: KeyCode::Char('r'),
+                        ..
+                    } if !tunnels.is_empty() && allowed.is_none_or(|action| action == 'r') => {
+                        return Ok((selected, 'r'));
                     }
-                    KeyEvent { code: KeyCode::Enter, .. } if !tunnels.is_empty() && allowed.is_none_or(|action| action == 'v') => {
-                        return Ok((selected, 'v'))
+                    KeyEvent {
+                        code: KeyCode::Enter,
+                        ..
+                    } if !tunnels.is_empty() && allowed.is_none_or(|action| action == 'v') => {
+                        return Ok((selected, 'v'));
                     }
                     _ => {}
                 }
@@ -680,7 +717,9 @@ pub fn pairs_workspace(
         "PAIR_RECOVERY_PENDING" => {
             "Press R to recover the pending Pair transaction before setup or deletion."
         }
-        _ => "Inspect the reported source and metadata, correct the finding, then press V to validate.",
+        _ => {
+            "Inspect the reported source and metadata, correct the finding, then press V to validate."
+        }
     };
     let recovery_available = findings
         .iter()
@@ -706,15 +745,25 @@ pub fn pairs_workspace(
                 {
                     Ok(())
                 }
-                Ok(_) => Err("PAIR_BROKEN: reciprocal Pair record no longer matches the current route".to_string()),
+                Ok(_) => Err(
+                    "PAIR_BROKEN: reciprocal Pair record no longer matches the current route"
+                        .to_string(),
+                ),
                 Err(error) => Err(error),
             }
         } else {
-            Err("PAIR_INVALID: immutable IDs do not resolve to exactly one gateway and one VM".to_string())
+            Err(
+                "PAIR_INVALID: immutable IDs do not resolve to exactly one gateway and one VM"
+                    .to_string(),
+            )
         };
         let mut body = format!(
             "Status: {}\nApproved transit: {}:{}\n\nGateway\nID: {}\nRecorded alias: {}\n",
-            if route_status.is_ok() { "valid" } else { "invalid" },
+            if route_status.is_ok() {
+                "valid"
+            } else {
+                "invalid"
+            },
             pair.transit_host,
             pair.transit_port,
             pair.gateway_id,
@@ -755,7 +804,11 @@ pub fn pairs_workspace(
         }
         labels.push(format!(
             "{}: {} [{}] / {} [{}]",
-            if route_status.is_ok() { "valid" } else { "invalid" },
+            if route_status.is_ok() {
+                "valid"
+            } else {
+                "invalid"
+            },
             pair.gateway_alias,
             pair.gateway_id,
             pair.vm_alias,
@@ -877,39 +930,67 @@ pub fn pairs_workspace(
                     })
                     .map_err(|error| format!("PAIR_REQUIRED: cannot render Pairs: {error}"))?;
                 match read_key(input, "PAIR_REQUIRED")? {
-                    KeyEvent { code: KeyCode::Esc, .. } => return Ok(PairWorkspaceAction::Exit),
-                    KeyEvent { code: KeyCode::Char('c'), modifiers, .. }
-                        if modifiers.contains(KeyModifiers::CONTROL) =>
-                    {
+                    KeyEvent {
+                        code: KeyCode::Esc, ..
+                    } => return Ok(PairWorkspaceAction::Exit),
+                    KeyEvent {
+                        code: KeyCode::Char('c'),
+                        modifiers,
+                        ..
+                    } if modifiers.contains(KeyModifiers::CONTROL) => {
                         return Ok(PairWorkspaceAction::Exit);
                     }
-                    KeyEvent { code: KeyCode::Char('v' | 'V'), .. } => {
+                    KeyEvent {
+                        code: KeyCode::Char('v' | 'V'),
+                        ..
+                    } => {
                         return Ok(PairWorkspaceAction::Validate);
                     }
-                    KeyEvent { code: KeyCode::Char('s' | 'S'), .. } if recovery_available => {}
-                    KeyEvent { code: KeyCode::Char('s' | 'S'), .. } => {
+                    KeyEvent {
+                        code: KeyCode::Char('s' | 'S'),
+                        ..
+                    } if recovery_available => {}
+                    KeyEvent {
+                        code: KeyCode::Char('s' | 'S'),
+                        ..
+                    } => {
                         return Ok(PairWorkspaceAction::Setup);
                     }
-                    KeyEvent { code: KeyCode::Char('d' | 'D'), .. }
-                        if !recovery_available && selected < pairs.len() =>
-                    {
+                    KeyEvent {
+                        code: KeyCode::Char('d' | 'D'),
+                        ..
+                    } if !recovery_available && selected < pairs.len() => {
                         return Ok(PairWorkspaceAction::Delete(selected));
                     }
-                    KeyEvent { code: KeyCode::Char('r' | 'R'), .. } if recovery_available => {
+                    KeyEvent {
+                        code: KeyCode::Char('r' | 'R'),
+                        ..
+                    } if recovery_available => {
                         return Ok(PairWorkspaceAction::Recover);
                     }
-                    KeyEvent { code: KeyCode::Up, .. } => {
+                    KeyEvent {
+                        code: KeyCode::Up, ..
+                    } => {
                         selected = selected.saturating_sub(1);
                         scroll = 0;
                     }
-                    KeyEvent { code: KeyCode::Down, .. } if selected + 1 < bodies.len() => {
+                    KeyEvent {
+                        code: KeyCode::Down,
+                        ..
+                    } if selected + 1 < bodies.len() => {
                         selected += 1;
                         scroll = 0;
                     }
-                    KeyEvent { code: KeyCode::PageUp, .. } => {
+                    KeyEvent {
+                        code: KeyCode::PageUp,
+                        ..
+                    } => {
                         scroll = scroll.saturating_sub(detail_step);
                     }
-                    KeyEvent { code: KeyCode::PageDown, .. } => {
+                    KeyEvent {
+                        code: KeyCode::PageDown,
+                        ..
+                    } => {
                         scroll = scroll.saturating_add(detail_step);
                     }
                     _ => {}
@@ -933,10 +1014,16 @@ pub enum PairSetupAction {
     Apply,
 }
 
-fn pair_setup_entry<'a>(entries: &[&'a HostEntry], pick: Option<(usize, usize)>) -> Option<Row<'a>> {
+fn pair_setup_entry<'a>(
+    entries: &[&'a HostEntry],
+    pick: Option<(usize, usize)>,
+) -> Option<Row<'a>> {
     let (entry, alias) = pick?;
     let entry = *entries.get(entry)?;
-    Some(Row { entry, alias: entry.aliases.get(alias)?.as_str() })
+    Some(Row {
+        entry,
+        alias: entry.aliases.get(alias)?.as_str(),
+    })
 }
 
 fn pair_setup_options(
@@ -944,38 +1031,58 @@ fn pair_setup_options(
     eligible: &[usize],
     query: &str,
 ) -> Vec<(usize, usize)> {
-    let mut options = eligible.iter().copied()
+    let mut options = eligible
+        .iter()
+        .copied()
         .flat_map(|index| (0..entries[index].aliases.len()).map(move |alias| (index, alias)))
         .filter(|pick| row_rank(&pair_setup_entry(entries, Some(*pick)).unwrap(), query).is_some())
         .collect::<Vec<_>>();
-    options.sort_by(|left, right| compare_rows(
-        &pair_setup_entry(entries, Some(*left)).unwrap(),
-        &pair_setup_entry(entries, Some(*right)).unwrap(),
-        query,
-    ));
+    options.sort_by(|left, right| {
+        compare_rows(
+            &pair_setup_entry(entries, Some(*left)).unwrap(),
+            &pair_setup_entry(entries, Some(*right)).unwrap(),
+            query,
+        )
+    });
     options
 }
+
+type PairSetupRoute = (usize, Result<Vec<(String, u16)>, String>);
 
 fn pair_setup_routes(
     entries: &[&HostEntry],
     eligible: &[usize],
     gateway: Option<(usize, usize)>,
-) -> Vec<(usize, Result<Vec<(String, u16)>, String>)> {
-    let Some(gateway) = pair_setup_entry(entries, gateway) else { return Vec::new(); };
-    eligible.iter().copied().filter(|index| {
-        let source = &entries[*index].source;
-        source.path != gateway.entry.source.path
-            || source.byte_start != gateway.entry.source.byte_start
-            || source.byte_end != gateway.entry.source.byte_end
-    }).map(|index| (index, sshx::pair::transit_candidates(gateway.entry, entries[index]))).collect()
+) -> Vec<PairSetupRoute> {
+    let Some(gateway) = pair_setup_entry(entries, gateway) else {
+        return Vec::new();
+    };
+    eligible
+        .iter()
+        .copied()
+        .filter(|index| {
+            let source = &entries[*index].source;
+            source.path != gateway.entry.source.path
+                || source.byte_start != gateway.entry.source.byte_start
+                || source.byte_end != gateway.entry.source.byte_end
+        })
+        .map(|index| {
+            (
+                index,
+                sshx::pair::transit_candidates(gateway.entry, entries[index]),
+            )
+        })
+        .collect()
 }
 
 fn pair_setup_vm_eligible(
     eligible: &[usize],
     gateway: Option<(usize, usize)>,
-    routes: &[(usize, Result<Vec<(String, u16)>, String>)],
+    routes: &[PairSetupRoute],
 ) -> Vec<usize> {
-    if gateway.is_none() { return eligible.to_vec(); }
+    if gateway.is_none() {
+        return eligible.to_vec();
+    }
     routes.iter().map(|(index, _)| *index).collect()
 }
 
@@ -989,22 +1096,32 @@ pub fn pair_setup_workspace(
         "Pair setup",
         "PAIR_REQUIRED: Pair setup requires usable stdin and stderr terminals".to_string(),
         |terminal, input| {
-            let eligible = entries.iter().enumerate()
+            let eligible = entries
+                .iter()
+                .enumerate()
                 .filter_map(|(index, entry)| sshx::pair::setup_eligible(entry).then_some(index))
                 .collect::<Vec<_>>();
             let mut routes = pair_setup_routes(entries, &eligible, draft.gateway);
             let mut vm_eligible = pair_setup_vm_eligible(&eligible, draft.gateway, &routes);
             let empty_candidates = Ok(Vec::<(String, u16)>::new());
-            let initial_candidates = draft.vm.and_then(|(index, _)| {
-                routes.iter().find(|(entry, _)| *entry == index).map(|(_, result)| result)
-            }).unwrap_or(&empty_candidates);
+            let initial_candidates = draft
+                .vm
+                .and_then(|(index, _)| {
+                    routes
+                        .iter()
+                        .find(|(entry, _)| *entry == index)
+                        .map(|(_, result)| result)
+                })
+                .unwrap_or(&empty_candidates);
             let mut focus = if draft.gateway.is_none() {
                 0
             } else if draft.vm.is_none() {
                 1
             } else if draft.transit_host.is_empty() != draft.transit_port.is_empty()
                 || (draft.transit_host.is_empty()
-                    && !initial_candidates.as_ref().is_ok_and(|values| values.len() == 1))
+                    && !initial_candidates
+                        .as_ref()
+                        .is_ok_and(|values| values.len() == 1))
             {
                 2
             } else {
@@ -1012,10 +1129,17 @@ pub fn pair_setup_workspace(
             };
             let mut queries = [String::new(), String::new()];
             let mut selected = [0usize; 2];
-            for index in 0..2 {
-                let options = pair_setup_options(entries, if index == 0 { &eligible } else { &vm_eligible }, "");
+            for (index, selected) in selected.iter_mut().enumerate() {
+                let options = pair_setup_options(
+                    entries,
+                    if index == 0 { &eligible } else { &vm_eligible },
+                    "",
+                );
                 let pick = if index == 0 { draft.gateway } else { draft.vm };
-                selected[index] = options.iter().position(|option| Some(*option) == pick).unwrap_or(0);
+                *selected = options
+                    .iter()
+                    .position(|option| Some(*option) == pick)
+                    .unwrap_or(0);
             }
             let mut list_state = ListState::default();
             let mut candidate_index = None::<usize>;
@@ -1025,11 +1149,21 @@ pub fn pair_setup_workspace(
             let mut scroll = 0u16;
             let mut scroll_step = 1u16;
             loop {
-                let candidates = draft.vm.and_then(|(index, _)| {
-                    routes.iter().find(|(entry, _)| *entry == index).map(|(_, result)| result)
-                }).unwrap_or(&empty_candidates);
+                let candidates = draft
+                    .vm
+                    .and_then(|(index, _)| {
+                        routes
+                            .iter()
+                            .find(|(entry, _)| *entry == index)
+                            .map(|(_, result)| result)
+                    })
+                    .unwrap_or(&empty_candidates);
                 let options = if focus < 2 && review.is_none() {
-                    pair_setup_options(entries, if focus == 0 { &eligible } else { &vm_eligible }, &queries[focus])
+                    pair_setup_options(
+                        entries,
+                        if focus == 0 { &eligible } else { &vm_eligible },
+                        &queries[focus],
+                    )
                 } else {
                     Vec::new()
                 };
@@ -1039,7 +1173,9 @@ pub fn pair_setup_workspace(
                 let gateway = pair_setup_entry(entries, draft.gateway);
                 let vm = pair_setup_entry(entries, draft.vm);
                 let vm_ineligible = draft.gateway.is_some()
-                    && draft.vm.is_some_and(|(index, _)| !vm_eligible.contains(&index));
+                    && draft
+                        .vm
+                        .is_some_and(|(index, _)| !vm_eligible.contains(&index));
                 let vm_warning = "Selected VM is not a distinct eligible HostEntry; value kept. Select another HostEntry.";
                 let transit_status = match candidates {
                     Ok(values) if values.len() == 1 => {
@@ -1057,7 +1193,10 @@ pub fn pair_setup_workspace(
                         let row = pair_setup_entry(entries, Some(*pick)).unwrap();
                         details.push_str(&format!(
                             "Source: {}:{}\nID: {}\nChoose: {}\n",
-                            row.entry.source.path, row.entry.source.line_start, row.entry.id, row.alias,
+                            row.entry.source.path,
+                            row.entry.source.line_start,
+                            row.entry.id,
+                            row.alias,
                         ));
                     } else {
                         details.push_str("No eligible matching HostEntry aliases.\n");
@@ -1067,7 +1206,10 @@ pub fn pair_setup_workspace(
                         if let Some(row) = row {
                             details.push_str(&format!(
                                 "{label}: {}\nSource: {}:{}\nID: {}\n",
-                                row.alias, row.entry.source.path, row.entry.source.line_start, row.entry.id,
+                                row.alias,
+                                row.entry.source.path,
+                                row.entry.source.line_start,
+                                row.entry.id,
                             ));
                         }
                     }
@@ -1279,30 +1421,50 @@ pub fn pair_setup_workspace(
                 }).map_err(|error| format!("PAIR_REQUIRED: cannot render Pair setup: {error}"))?;
                 let mut edited = false;
                 match read_key(input, "PAIR_REQUIRED")? {
-                    KeyEvent { code: KeyCode::Esc, .. } if review.is_some() => {
+                    KeyEvent {
+                        code: KeyCode::Esc, ..
+                    } if review.is_some() => {
                         review = None;
                         scroll = 0;
                     }
-                    KeyEvent { code: KeyCode::Esc, .. } => return Ok(completed),
-                    KeyEvent { code: KeyCode::Char('c'), modifiers, .. }
-                        if modifiers.contains(KeyModifiers::CONTROL) => return Ok(completed),
-                    KeyEvent { code: KeyCode::Char('s'), modifiers, .. }
-                        if modifiers.contains(KeyModifiers::CONTROL) && !applied =>
-                    {
+                    KeyEvent {
+                        code: KeyCode::Esc, ..
+                    } => return Ok(completed),
+                    KeyEvent {
+                        code: KeyCode::Char('c'),
+                        modifiers,
+                        ..
+                    } if modifiers.contains(KeyModifiers::CONTROL) => return Ok(completed),
+                    KeyEvent {
+                        code: KeyCode::Char('s'),
+                        modifiers,
+                        ..
+                    } if modifiers.contains(KeyModifiers::CONTROL) && !applied => {
                         review = None;
                         status = None;
                         scroll = 0;
                         if pair_setup_entry(entries, draft.gateway).is_none()
-                            || !draft.gateway.is_some_and(|(index, _)| eligible.contains(&index))
+                            || !draft
+                                .gateway
+                                .is_some_and(|(index, _)| eligible.contains(&index))
                         {
-                            status = Some(("PAIR_SELECTION: select an eligible gateway HostEntry".to_string(), false));
+                            status = Some((
+                                "PAIR_SELECTION: select an eligible gateway HostEntry".to_string(),
+                                false,
+                            ));
                             focus = 0;
                             continue;
                         }
                         if pair_setup_entry(entries, draft.vm).is_none()
-                            || !draft.vm.is_some_and(|(index, _)| vm_eligible.contains(&index))
+                            || !draft
+                                .vm
+                                .is_some_and(|(index, _)| vm_eligible.contains(&index))
                         {
-                            status = Some(("PAIR_SELECTION: select a different eligible VM HostEntry".to_string(), false));
+                            status = Some((
+                                "PAIR_SELECTION: select a different eligible VM HostEntry"
+                                    .to_string(),
+                                false,
+                            ));
                             focus = 1;
                             continue;
                         }
@@ -1311,51 +1473,88 @@ pub fn pair_setup_workspace(
                                 review = Some(text);
                                 if preview {
                                     completed = true;
-                                    status = Some(("Preview complete — no files changed".to_string(), true));
+                                    status = Some((
+                                        "Preview complete — no files changed".to_string(),
+                                        true,
+                                    ));
                                 }
                             }
                             Err(error) => status = Some((error, false)),
                         }
                     }
-                    KeyEvent { code: KeyCode::Enter, .. } if review.is_some() => {
-                        if !preview {
-                            review = None;
-                            scroll = 0;
-                            match execute(&draft, PairSetupAction::Apply) {
-                                Ok(text) => {
-                                    completed = true;
-                                    status = Some((text, true));
-                                }
-                                Err(error) => status = Some((error, false)),
+                    KeyEvent {
+                        code: KeyCode::Enter,
+                        ..
+                    } if review.is_some() && !preview => {
+                        review = None;
+                        scroll = 0;
+                        match execute(&draft, PairSetupAction::Apply) {
+                            Ok(text) => {
+                                completed = true;
+                                status = Some((text, true));
                             }
+                            Err(error) => status = Some((error, false)),
                         }
                     }
-                    KeyEvent { code: KeyCode::Tab, .. } => {
+                    KeyEvent {
+                        code: KeyCode::Enter,
+                        ..
+                    } if review.is_some() => {}
+                    KeyEvent {
+                        code: KeyCode::Tab, ..
+                    } => {
                         focus = (focus + 1) % 4;
-                        if review.is_none() { scroll = 0; }
+                        if review.is_none() {
+                            scroll = 0;
+                        }
                     }
-                    KeyEvent { code: KeyCode::BackTab, .. } => {
+                    KeyEvent {
+                        code: KeyCode::BackTab,
+                        ..
+                    } => {
                         focus = (focus + 3) % 4;
-                        if review.is_none() { scroll = 0; }
+                        if review.is_none() {
+                            scroll = 0;
+                        }
                     }
-                    KeyEvent { code: KeyCode::Up, .. } if focus < 2 && review.is_none() => {
+                    KeyEvent {
+                        code: KeyCode::Up, ..
+                    } if focus < 2 && review.is_none() => {
                         selected[focus] = selected[focus].saturating_sub(1);
                         scroll = 0;
                     }
-                    KeyEvent { code: KeyCode::Down, .. } if focus < 2 && review.is_none() => {
-                        selected[focus] = (selected[focus] + 1).min(options.len().saturating_sub(1));
+                    KeyEvent {
+                        code: KeyCode::Down,
+                        ..
+                    } if focus < 2 && review.is_none() => {
+                        selected[focus] =
+                            (selected[focus] + 1).min(options.len().saturating_sub(1));
                         scroll = 0;
                     }
-                    KeyEvent { code: KeyCode::PageUp | KeyCode::Up, .. } => scroll = scroll.saturating_sub(scroll_step),
-                    KeyEvent { code: KeyCode::PageDown | KeyCode::Down, .. } => scroll = scroll.saturating_add(scroll_step),
-                    KeyEvent { code: KeyCode::Enter, .. } if focus < 2 => {
+                    KeyEvent {
+                        code: KeyCode::PageUp | KeyCode::Up,
+                        ..
+                    } => scroll = scroll.saturating_sub(scroll_step),
+                    KeyEvent {
+                        code: KeyCode::PageDown | KeyCode::Down,
+                        ..
+                    } => scroll = scroll.saturating_add(scroll_step),
+                    KeyEvent {
+                        code: KeyCode::Enter,
+                        ..
+                    } if focus < 2 => {
                         if let Some(pick) = options.get(selected[focus]) {
                             if focus == 0 {
                                 draft.gateway = Some(*pick);
                                 routes = pair_setup_routes(entries, &eligible, draft.gateway);
-                                vm_eligible = pair_setup_vm_eligible(&eligible, draft.gateway, &routes);
-                                let vm_options = pair_setup_options(entries, &vm_eligible, &queries[1]);
-                                selected[1] = vm_options.iter().position(|pick| Some(*pick) == draft.vm).unwrap_or(0);
+                                vm_eligible =
+                                    pair_setup_vm_eligible(&eligible, draft.gateway, &routes);
+                                let vm_options =
+                                    pair_setup_options(entries, &vm_eligible, &queries[1]);
+                                selected[1] = vm_options
+                                    .iter()
+                                    .position(|pick| Some(*pick) == draft.vm)
+                                    .unwrap_or(0);
                             } else {
                                 draft.vm = Some(*pick);
                             }
@@ -1364,34 +1563,62 @@ pub fn pair_setup_workspace(
                             candidate_index = None;
                         }
                     }
-                    KeyEvent { code: KeyCode::Char('n'), modifiers, .. }
-                        if modifiers.contains(KeyModifiers::CONTROL) =>
-                    {
-                        if let Ok(values) = &candidates {
-                            if !values.is_empty() {
-                                let index = candidate_index.map_or(0, |index| (index + 1) % values.len());
-                                draft.transit_host.clone_from(&values[index].0);
-                                draft.transit_port = values[index].1.to_string();
-                                candidate_index = Some(index);
-                                edited = true;
-                            }
+                    KeyEvent {
+                        code: KeyCode::Char('n'),
+                        modifiers,
+                        ..
+                    } if modifiers.contains(KeyModifiers::CONTROL) => {
+                        if let Ok(values) = &candidates
+                            && !values.is_empty()
+                        {
+                            let index =
+                                candidate_index.map_or(0, |index| (index + 1) % values.len());
+                            draft.transit_host.clone_from(&values[index].0);
+                            draft.transit_port = values[index].1.to_string();
+                            candidate_index = Some(index);
+                            edited = true;
                         }
                     }
-                    KeyEvent { code: KeyCode::Backspace, .. } => {
+                    KeyEvent {
+                        code: KeyCode::Backspace,
+                        ..
+                    } => {
                         match focus {
-                            0 | 1 => { queries[focus].pop(); selected[focus] = 0; }
-                            2 => { draft.transit_host.pop(); candidate_index = None; }
-                            _ => { draft.transit_port.pop(); candidate_index = None; }
+                            0 | 1 => {
+                                queries[focus].pop();
+                                selected[focus] = 0;
+                            }
+                            2 => {
+                                draft.transit_host.pop();
+                                candidate_index = None;
+                            }
+                            _ => {
+                                draft.transit_port.pop();
+                                candidate_index = None;
+                            }
                         }
                         edited = true;
                     }
-                    KeyEvent { code: KeyCode::Char(character), modifiers, .. }
-                        if !modifiers.contains(KeyModifiers::CONTROL) && !modifiers.contains(KeyModifiers::ALT) =>
+                    KeyEvent {
+                        code: KeyCode::Char(character),
+                        modifiers,
+                        ..
+                    } if !modifiers.contains(KeyModifiers::CONTROL)
+                        && !modifiers.contains(KeyModifiers::ALT) =>
                     {
                         match focus {
-                            0 | 1 => { queries[focus].push(character); selected[focus] = 0; }
-                            2 => { draft.transit_host.push(character); candidate_index = None; }
-                            _ => { draft.transit_port.push(character); candidate_index = None; }
+                            0 | 1 => {
+                                queries[focus].push(character);
+                                selected[focus] = 0;
+                            }
+                            2 => {
+                                draft.transit_host.push(character);
+                                candidate_index = None;
+                            }
+                            _ => {
+                                draft.transit_port.push(character);
+                                candidate_index = None;
+                            }
                         }
                         edited = true;
                     }
@@ -1407,20 +1634,15 @@ pub fn pair_setup_workspace(
     )
 }
 
-
-
-
 fn remember_selection(state: &mut HostsState, rows: &[Row<'_>], selected: usize) {
-    state.selected = rows
-        .get(selected)
-        .map(|row| {
-            (
-                row.entry.source.path.clone(),
-                row.entry.source.byte_start,
-                row.entry.source.byte_end,
-                row.alias.to_string(),
-            )
-        });
+    state.selected = rows.get(selected).map(|row| {
+        (
+            row.entry.source.path.clone(),
+            row.entry.source.byte_start,
+            row.entry.source.byte_end,
+            row.alias.to_string(),
+        )
+    });
 }
 
 fn hosts_footer(width: u16, has_rows: bool, active_tunnels: usize) -> String {
@@ -1440,8 +1662,16 @@ fn hosts_footer(width: u16, has_rows: bool, active_tunnels: usize) -> String {
     }
     format!(
         "{}\nPgUp/Dn scroll{}\nCtrl+T Tunnels ({active_tunnels} active) · Ctrl+P Pairs\nCtrl+S Setup · Ctrl+D Doctor · Esc exit",
-        if has_rows { "↑↓ move · Enter connect · Tab details" } else { "Tab details" },
-        if has_rows { " · Ctrl+Y Copy password" } else { "" }
+        if has_rows {
+            "↑↓ move · Enter connect · Tab details"
+        } else {
+            "Tab details"
+        },
+        if has_rows {
+            " · Ctrl+Y Copy password"
+        } else {
+            ""
+        }
     )
 }
 
@@ -1450,12 +1680,22 @@ pub fn setup_workspace(
     mut fields: [String; 3],
     status: Option<&str>,
 ) -> Result<([String; 3], bool), String> {
-    const LABELS: [&str; 3] = ["Scope (personal/work)", "Project (optional)", "SSH config file path"];
+    const LABELS: [&str; 3] = [
+        "Scope (personal/work)",
+        "Project (optional)",
+        "SSH config file path",
+    ];
     with_terminal(
         "Setup",
         "SETUP_REQUIRED: Setup requires usable stdin and stderr terminals".to_string(),
         |terminal, input| {
-            let mut selected = if fields[0].is_empty() { 0 } else if fields[2].is_empty() { 2 } else { 0 };
+            let mut selected = if fields[0].is_empty() {
+                0
+            } else if fields[2].is_empty() {
+                2
+            } else {
+                0
+            };
             let mut root_scroll = 0u16;
             loop {
                 terminal
@@ -1549,34 +1789,59 @@ pub fn setup_workspace(
                     })
                     .map_err(|error| format!("SETUP_REQUIRED: cannot render Setup workspace: {error}"))?;
                 match read_key(input, "SETUP_REQUIRED")? {
-                    KeyEvent { code: KeyCode::Esc, .. } => return Err(CANCELLED.to_string()),
-                    KeyEvent { code: KeyCode::Char('c'), modifiers, .. }
-                        if modifiers.contains(KeyModifiers::CONTROL) =>
-                    {
+                    KeyEvent {
+                        code: KeyCode::Esc, ..
+                    } => return Err(CANCELLED.to_string()),
+                    KeyEvent {
+                        code: KeyCode::Char('c'),
+                        modifiers,
+                        ..
+                    } if modifiers.contains(KeyModifiers::CONTROL) => {
                         return Err(CANCELLED.to_string());
                     }
-                    KeyEvent { code: KeyCode::Char('s'), modifiers, .. }
-                        if modifiers.contains(KeyModifiers::CONTROL) =>
-                    {
+                    KeyEvent {
+                        code: KeyCode::Char('s'),
+                        modifiers,
+                        ..
+                    } if modifiers.contains(KeyModifiers::CONTROL) => {
                         return Ok((fields, true));
                     }
-                    KeyEvent { code: KeyCode::Tab | KeyCode::Down, .. } => {
+                    KeyEvent {
+                        code: KeyCode::Tab | KeyCode::Down,
+                        ..
+                    } => {
                         selected = (selected + 1) % fields.len();
                     }
-                    KeyEvent { code: KeyCode::Up, .. } => selected = selected.saturating_sub(1),
-                    KeyEvent { code: KeyCode::PageUp, .. } => root_scroll = root_scroll.saturating_sub(8),
-                    KeyEvent { code: KeyCode::PageDown, .. } => root_scroll = root_scroll.saturating_add(8),
-                    KeyEvent { code: KeyCode::Char('u'), modifiers, .. }
-                        if modifiers.contains(KeyModifiers::CONTROL) =>
-                    {
+                    KeyEvent {
+                        code: KeyCode::Up, ..
+                    } => selected = selected.saturating_sub(1),
+                    KeyEvent {
+                        code: KeyCode::PageUp,
+                        ..
+                    } => root_scroll = root_scroll.saturating_sub(8),
+                    KeyEvent {
+                        code: KeyCode::PageDown,
+                        ..
+                    } => root_scroll = root_scroll.saturating_add(8),
+                    KeyEvent {
+                        code: KeyCode::Char('u'),
+                        modifiers,
+                        ..
+                    } if modifiers.contains(KeyModifiers::CONTROL) => {
                         fields[selected].clear();
                     }
-                    KeyEvent { code: KeyCode::Backspace, .. } => {
+                    KeyEvent {
+                        code: KeyCode::Backspace,
+                        ..
+                    } => {
                         fields[selected].pop();
                     }
-                    KeyEvent { code: KeyCode::Char(character), modifiers, .. }
-                        if !modifiers.contains(KeyModifiers::CONTROL)
-                            && !modifiers.contains(KeyModifiers::ALT) =>
+                    KeyEvent {
+                        code: KeyCode::Char(character),
+                        modifiers,
+                        ..
+                    } if !modifiers.contains(KeyModifiers::CONTROL)
+                        && !modifiers.contains(KeyModifiers::ALT) =>
                     {
                         fields[selected].push(character);
                     }
@@ -1795,49 +2060,82 @@ pub fn doctor_workspace(
                     })
                     .map_err(|error| format!("DOCTOR_REQUIRED: cannot render Doctor: {error}"))?;
                 match read_key(input, "DOCTOR_REQUIRED")? {
-                    KeyEvent { code: KeyCode::Esc | KeyCode::Char('n' | 'N'), .. }
-                        if reviewing =>
-                    {
+                    KeyEvent {
+                        code: KeyCode::Esc | KeyCode::Char('n' | 'N'),
+                        ..
+                    } if reviewing => {
                         reviewing = false;
                         detail_scroll = 0;
                     }
-                    KeyEvent { code: KeyCode::Char('y' | 'Y'), .. } if reviewing && plan_visible => {
+                    KeyEvent {
+                        code: KeyCode::Char('y' | 'Y'),
+                        ..
+                    } if reviewing && plan_visible => {
                         return Ok(DoctorAction::Repair);
                     }
-                    KeyEvent { code: KeyCode::Esc, .. } => return Ok(DoctorAction::Exit),
-                    KeyEvent { code: KeyCode::Char('c'), modifiers, .. }
-                        if modifiers.contains(KeyModifiers::CONTROL) =>
-                    {
+                    KeyEvent {
+                        code: KeyCode::Esc, ..
+                    } => return Ok(DoctorAction::Exit),
+                    KeyEvent {
+                        code: KeyCode::Char('c'),
+                        modifiers,
+                        ..
+                    } if modifiers.contains(KeyModifiers::CONTROL) => {
                         return Ok(DoctorAction::Exit);
                     }
-                    KeyEvent { code: KeyCode::Up, .. } if !reviewing => {
+                    KeyEvent {
+                        code: KeyCode::Up, ..
+                    } if !reviewing => {
                         selected = selected.saturating_sub(1);
                         expanded = true;
                         detail_scroll = 0;
                     }
-                    KeyEvent { code: KeyCode::Down, .. } if !reviewing && selected + 1 < order.len() => {
+                    KeyEvent {
+                        code: KeyCode::Down,
+                        ..
+                    } if !reviewing && selected + 1 < order.len() => {
                         selected += 1;
                         expanded = true;
                         detail_scroll = 0;
                     }
-                    KeyEvent { code: KeyCode::Enter, .. } if !reviewing && finding.is_some() => {
+                    KeyEvent {
+                        code: KeyCode::Enter,
+                        ..
+                    } if !reviewing && finding.is_some() => {
                         expanded = !expanded;
                         detail_scroll = 0;
                     }
-                    KeyEvent { code: KeyCode::Tab, .. } if !reviewing => scroll_status = !scroll_status,
-                    KeyEvent { code: KeyCode::PageUp, .. } if !reviewing && scroll_status => {
+                    KeyEvent {
+                        code: KeyCode::Tab, ..
+                    } if !reviewing => scroll_status = !scroll_status,
+                    KeyEvent {
+                        code: KeyCode::PageUp,
+                        ..
+                    } if !reviewing && scroll_status => {
                         status_scroll = status_scroll.saturating_sub(status_page_rows);
                     }
-                    KeyEvent { code: KeyCode::PageDown, .. } if !reviewing && scroll_status => {
+                    KeyEvent {
+                        code: KeyCode::PageDown,
+                        ..
+                    } if !reviewing && scroll_status => {
                         status_scroll = status_scroll.saturating_add(status_page_rows);
                     }
-                    KeyEvent { code: KeyCode::PageUp, .. } => {
+                    KeyEvent {
+                        code: KeyCode::PageUp,
+                        ..
+                    } => {
                         detail_scroll = detail_scroll.saturating_sub(detail_page_rows);
                     }
-                    KeyEvent { code: KeyCode::PageDown, .. } => {
+                    KeyEvent {
+                        code: KeyCode::PageDown,
+                        ..
+                    } => {
                         detail_scroll = detail_scroll.saturating_add(detail_page_rows);
                     }
-                    KeyEvent { code: KeyCode::Char('r' | 'R'), .. } if !reviewing && !repairs.is_empty() => {
+                    KeyEvent {
+                        code: KeyCode::Char('r' | 'R'),
+                        ..
+                    } if !reviewing && !repairs.is_empty() => {
                         reviewing = true;
                         detail_scroll = 0;
                     }
@@ -1881,27 +2179,38 @@ pub fn connection_workspace(
     );
     let mut checked = vec![false; services.len()];
     if let Some(restored) = restored {
-        let declared_count = services.iter().take_while(|service| {
-            !service.id.starts_with("custom ")
-                && !service.id.starts_with("local:")
-                && !service.id.starts_with("remote:")
-                && !service.id.starts_with("socks:")
-        }).count();
+        let declared_count = services
+            .iter()
+            .take_while(|service| {
+                !service.id.starts_with("custom ")
+                    && !service.id.starts_with("local:")
+                    && !service.id.starts_with("remote:")
+                    && !service.id.starts_with("socks:")
+            })
+            .count();
         if restored.rows.len() < declared_count
             || restored.checked.len() != restored.rows.len()
-            || services[..declared_count].iter().zip(&restored.rows).any(|(service, row)| {
-                service.id != row.id || service.remote_port != row.remote_port
-                    || service.destination_host != row.destination_host
-            })
+            || services[..declared_count]
+                .iter()
+                .zip(&restored.rows)
+                .any(|(service, row)| {
+                    service.id != row.id
+                        || service.remote_port != row.remote_port
+                        || service.destination_host != row.destination_host
+                })
         {
             return Err("FORWARD_SELECTION_INVALID: declared services changed".to_string());
         }
-        services = restored.rows.iter().map(|row| DeclaredService {
-            id: row.id.clone(),
-            remote_port: row.remote_port,
-            destination_host: row.destination_host.clone(),
-            default_local_port: row.local_port,
-        }).collect();
+        services = restored
+            .rows
+            .iter()
+            .map(|row| DeclaredService {
+                id: row.id.clone(),
+                remote_port: row.remote_port,
+                destination_host: row.destination_host.clone(),
+                default_local_port: row.local_port,
+            })
+            .collect();
         forwards = restored.rows.clone();
         checked = restored.checked.clone();
     } else {
@@ -1910,8 +2219,7 @@ pub fn connection_workspace(
                 .iter()
                 .position(|service| service.id == requested.id)
                 .ok_or_else(|| {
-                    "FORWARD_SELECTION_INVALID: requested service is no longer declared"
-                        .to_string()
+                    "FORWARD_SELECTION_INVALID: requested service is no longer declared".to_string()
                 })?;
             if checked[index] {
                 return Err(format!(
@@ -1967,10 +2275,7 @@ pub fn connection_workspace(
             )?;
             let key = read_key(input, "CONNECTION_REQUIRED")?;
             if editing.is_none()
-                && !matches!(
-                    key.code,
-                    KeyCode::PageUp | KeyCode::PageDown | KeyCode::Tab
-                )
+                && !matches!(key.code, KeyCode::PageUp | KeyCode::PageDown | KeyCode::Tab)
             {
                 status_scroll = 0;
                 route_scroll = 0;
@@ -2012,7 +2317,9 @@ pub fn connection_workspace(
                             }
                             Err(error) => {
                                 row_errors[index] = vec![error];
-                                status = Some("Fix custom forward as [bind:]local:host:remote.".to_string());
+                                status = Some(
+                                    "Fix custom forward as [bind:]local:host:remote.".to_string(),
+                                );
                                 focus = WorkspaceFocus::Row;
                             }
                         }
@@ -2021,9 +2328,19 @@ pub fn connection_workspace(
                     {
                         let is_remote = services[index].id.starts_with("remote:");
                         let parsed = if is_remote {
-                            sshx::tunnel::parse_forwards(&[], std::slice::from_ref(value), &[], allow_bind)
+                            sshx::tunnel::parse_forwards(
+                                &[],
+                                std::slice::from_ref(value),
+                                &[],
+                                allow_bind,
+                            )
                         } else {
-                            sshx::tunnel::parse_forwards(&[], &[], std::slice::from_ref(value), allow_bind)
+                            sshx::tunnel::parse_forwards(
+                                &[],
+                                &[],
+                                std::slice::from_ref(value),
+                                allow_bind,
+                            )
                         };
                         match parsed {
                             Ok(mut parsed) => {
@@ -2038,8 +2355,10 @@ pub fn connection_workspace(
                                     }
                                 );
                                 services[index].id = id.clone();
-                                services[index].destination_host = parsed.remote_host.unwrap_or_default();
-                                services[index].remote_port = parsed.remote_port.unwrap_or_default();
+                                services[index].destination_host =
+                                    parsed.remote_host.unwrap_or_default();
+                                services[index].remote_port =
+                                    parsed.remote_port.unwrap_or_default();
                                 services[index].default_local_port = if is_remote {
                                     forward_listener_port(&parsed.effective).unwrap_or(1)
                                 } else {
@@ -2116,9 +2435,8 @@ pub fn connection_workspace(
                         .map(|(index, _)| forwards[index].clone())
                         .collect::<Vec<_>>();
                     if mode == ConnectionMode::Tunnel && selected_forwards.is_empty() {
-                        status = Some(
-                            "Tunnel mode requires at least one local forward.".to_string(),
-                        );
+                        status =
+                            Some("Tunnel mode requires at least one local forward.".to_string());
                         focus = WorkspaceFocus::Status;
                         continue;
                     }
@@ -2164,19 +2482,21 @@ pub fn connection_workspace(
                         focus = WorkspaceFocus::Status;
                     } else {
                         for issue in issues {
-                            if let Some(index) =
-                                forwards.iter().position(|forward| forward.id == issue.service_id)
+                            if let Some(index) = forwards
+                                .iter()
+                                .position(|forward| forward.id == issue.service_id)
                             {
                                 row_errors[index].push(issue.message);
                             }
                         }
-                        status = Some("Fix marked rows before starting; no master was started.".to_string());
+                        status = Some(
+                            "Fix marked rows before starting; no master was started.".to_string(),
+                        );
                         focus = WorkspaceFocus::Status;
                     }
                 }
                 KeyEvent {
-                    code: KeyCode::Esc,
-                    ..
+                    code: KeyCode::Esc, ..
                 } if let Some((index, _)) = editing.take() => {
                     if new_custom_row.take() == Some(index) {
                         services.remove(index);
@@ -2234,7 +2554,8 @@ pub fn connection_workspace(
                     value.push(character);
                 }
                 KeyEvent {
-                    code: KeyCode::PageUp, ..
+                    code: KeyCode::PageUp,
+                    ..
                 } => match focus {
                     WorkspaceFocus::Route => {
                         route_scroll = route_scroll.saturating_sub(1);
@@ -2247,7 +2568,8 @@ pub fn connection_workspace(
                     }
                 },
                 KeyEvent {
-                    code: KeyCode::PageDown, ..
+                    code: KeyCode::PageDown,
+                    ..
                 } => match focus {
                     WorkspaceFocus::Route => {
                         route_scroll = route_scroll.saturating_add(1);
@@ -2275,7 +2597,8 @@ pub fn connection_workspace(
                     focus = WorkspaceFocus::Row;
                 }
                 KeyEvent {
-                    code: KeyCode::Down, ..
+                    code: KeyCode::Down,
+                    ..
                 } if editing.is_none() && review && selected + 1 < services.len() => {
                     selected += 1;
                     focus = WorkspaceFocus::Row;
@@ -2288,7 +2611,8 @@ pub fn connection_workspace(
                     focus = WorkspaceFocus::Row;
                 }
                 KeyEvent {
-                    code: KeyCode::Down, ..
+                    code: KeyCode::Down,
+                    ..
                 } if editing.is_none() && selected + 1 < services.len() => {
                     selected += 1;
                     status = None;
@@ -2410,7 +2734,8 @@ pub fn connection_workspace(
                     } else if let Some(specification) = id.strip_prefix("local:") {
                         specification.to_string()
                     } else if id.starts_with("remote:") || id.starts_with("socks:") {
-                        id.split_once(':').map_or_else(String::new, |(_, value)| value.to_string())
+                        id.split_once(':')
+                            .map_or_else(String::new, |(_, value)| value.to_string())
                     } else {
                         forwards[selected].local_port.to_string()
                     };
@@ -2419,11 +2744,14 @@ pub fn connection_workspace(
                     status = Some(if id.starts_with("remote:") {
                         "Edit -R [bind:]listen:your-side-host:your-side-port; server bind may expose service. OpenSSH reports startup failure.".to_string()
                     } else if id.starts_with("socks:") {
-                        "Edit -D [bind:]port; applications must configure this SOCKS proxy.".to_string()
+                        "Edit -D [bind:]port; applications must configure this SOCKS proxy."
+                            .to_string()
                     } else if id.starts_with("local:") {
-                        "Edit local row [bind:]local:host:remote; Enter saves, Esc cancels.".to_string()
+                        "Edit local row [bind:]local:host:remote; Enter saves, Esc cancels."
+                            .to_string()
                     } else if id.starts_with("custom ") {
-                        "Edit custom row [bind:]local:host:remote; Enter saves, Esc cancels.".to_string()
+                        "Edit custom row [bind:]local:host:remote; Enter saves, Esc cancels."
+                            .to_string()
                     } else {
                         "Edit local listener port; Enter saves, Esc cancels.".to_string()
                     });
@@ -2457,9 +2785,7 @@ fn workspace_preflight_issues(
 ) -> Vec<sshx::session::ForwardIssue> {
     let local = forwards
         .iter()
-        .filter(|forward| {
-            !forward.id.starts_with("remote:") && !forward.id.starts_with("socks:")
-        })
+        .filter(|forward| !forward.id.starts_with("remote:") && !forward.id.starts_with("socks:"))
         .cloned()
         .collect::<Vec<_>>();
     let mut issues = sshx::session::preflight_issues(&local);
@@ -2687,7 +3013,9 @@ fn draw_connection_workspace(
                 eprintln!("  ! {error}");
             }
         }
-        eprintln!("↑↓ row  Space select  a -L  r -R  d -D  e edit  x remove custom/R/D  m mode  Enter review  Esc back  Ctrl-C cancel");
+        eprintln!(
+            "↑↓ row  Space select  a -L  r -R  d -D  e edit  x remove custom/R/D  m mode  Enter review  Esc back  Ctrl-C cancel"
+        );
         return Ok(());
     }
     terminal
@@ -3053,7 +3381,8 @@ pub fn host_create_workspace(
                         })?;
                     match read_key(input, "HOST_CREATE_REQUIRED")? {
                         KeyEvent {
-                            code: KeyCode::Enter, ..
+                            code: KeyCode::Enter,
+                            ..
                         } => {
                             return Ok((
                                 fields,
@@ -3069,7 +3398,8 @@ pub fn host_create_workspace(
                             code: KeyCode::Esc, ..
                         }
                         | KeyEvent {
-                            code: KeyCode::Char('e' | 'E'), ..
+                            code: KeyCode::Char('e' | 'E'),
+                            ..
                         } => return Ok((fields, selected, HostCreateAction::Edit)),
                         KeyEvent {
                             code: KeyCode::Char('c'),
@@ -3079,19 +3409,23 @@ pub fn host_create_workspace(
                             return Err(CANCELLED.to_string());
                         }
                         KeyEvent {
-                            code: KeyCode::Down, ..
+                            code: KeyCode::Down,
+                            ..
                         } => scroll = scroll.saturating_add(1),
                         KeyEvent {
                             code: KeyCode::Up, ..
                         } => scroll = scroll.saturating_sub(1),
                         KeyEvent {
-                            code: KeyCode::PageDown, ..
+                            code: KeyCode::PageDown,
+                            ..
                         } => scroll = scroll.saturating_add(10),
                         KeyEvent {
-                            code: KeyCode::PageUp, ..
+                            code: KeyCode::PageUp,
+                            ..
                         } => scroll = scroll.saturating_sub(10),
                         KeyEvent {
-                            code: KeyCode::Home, ..
+                            code: KeyCode::Home,
+                            ..
                         } => scroll = 0,
                         _ => {}
                     }
@@ -3103,10 +3437,10 @@ pub fn host_create_workspace(
                         let area = frame.area();
                         let has_status = status.is_some() && area.height >= 3;
                         let fixed_rows = if has_status { 3 } else { 2 };
-                        let visible = area
-                            .height
-                            .saturating_sub(fixed_rows)
-                            .min(fields.len() as u16) as usize;
+                        let visible =
+                            area.height
+                                .saturating_sub(fixed_rows)
+                                .min(fields.len() as u16) as usize;
                         let mut constraints = vec![Constraint::Length(1)];
                         if has_status {
                             constraints.push(Constraint::Length(1));
@@ -3118,8 +3452,11 @@ pub fn host_create_workspace(
                             .constraints(constraints)
                             .split(area);
                         frame.render_widget(
-                            Paragraph::new("Create HostEntry")
-                                .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                            Paragraph::new("Create HostEntry").style(
+                                Style::default()
+                                    .fg(Color::Cyan)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
                             rows[0],
                         );
                         if has_status {
@@ -3139,12 +3476,15 @@ pub fn host_create_workspace(
                                 fields[index].clone()
                             };
                             let style = if index == selected {
-                                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                                Style::default()
+                                    .fg(Color::Yellow)
+                                    .add_modifier(Modifier::BOLD)
                             } else {
                                 Style::default().fg(Color::White)
                             };
                             let text = format!("{}: {value}", LABELS[index]);
-                            let scroll = text.chars().count().saturating_sub(area.width as usize) as u16;
+                            let scroll =
+                                text.chars().count().saturating_sub(area.width as usize) as u16;
                             frame.render_widget(
                                 Paragraph::new(text)
                                     .style(style)
@@ -3164,7 +3504,9 @@ pub fn host_create_workspace(
                             rows[rows.len() - 1],
                         );
                     })
-                    .map_err(|error| format!("HOST_CREATE_REQUIRED: cannot render form: {error}"))?;
+                    .map_err(|error| {
+                        format!("HOST_CREATE_REQUIRED: cannot render form: {error}")
+                    })?;
                 match read_key(input, "HOST_CREATE_REQUIRED")? {
                     KeyEvent {
                         code: KeyCode::Esc, ..
@@ -3187,7 +3529,9 @@ pub fn host_create_workspace(
                         code: direction @ (KeyCode::Left | KeyCode::Right),
                         ..
                     } if selected == 0 && !roots.is_empty() => {
-                        let current = roots.iter().position(|root| root.path.to_string_lossy() == fields[0]);
+                        let current = roots
+                            .iter()
+                            .position(|root| root.path.to_string_lossy() == fields[0]);
                         let index = match (direction, current) {
                             (KeyCode::Right, Some(index)) => (index + 1) % roots.len(),
                             (KeyCode::Left, Some(0)) => roots.len() - 1,
@@ -3198,22 +3542,28 @@ pub fn host_create_workspace(
                         fields[0] = root.path.to_string_lossy().into_owned();
                         fields[1] = root.scope.clone();
                         fields[2] = root.project.clone().unwrap_or_default();
-                        fields[3] = root.path.parent().map_or_else(String::new, |path| path.to_string_lossy().into_owned());
+                        fields[3] = root
+                            .path
+                            .parent()
+                            .map_or_else(String::new, |path| path.to_string_lossy().into_owned());
                     }
                     KeyEvent {
                         code: KeyCode::Tab, ..
                     }
                     | KeyEvent {
-                        code: KeyCode::Down, ..
+                        code: KeyCode::Down,
+                        ..
                     }
                     | KeyEvent {
-                        code: KeyCode::Enter, ..
+                        code: KeyCode::Enter,
+                        ..
                     } => selected = (selected + 1) % fields.len(),
                     KeyEvent {
                         code: KeyCode::Up, ..
                     } => selected = selected.saturating_sub(1),
                     KeyEvent {
-                        code: KeyCode::Backspace, ..
+                        code: KeyCode::Backspace,
+                        ..
                     } => {
                         fields[selected].pop();
                     }
@@ -3274,17 +3624,26 @@ pub enum HostEditAction {
     PreviewComplete,
 }
 
+pub struct HostEditState {
+    pub fields: [String; 5],
+    pub clears: [bool; 3],
+    pub password_edited: bool,
+}
+
 pub fn host_edit_workspace(
-    mut fields: [String; 5],
-    mut clears: [bool; 3],
-    mut password_edited: bool,
+    state: HostEditState,
     original_fields: &[String; 5],
     rename_only: bool,
     focus: Option<usize>,
     status: Option<&str>,
     review: Option<&str>,
     preview: bool,
-) -> Result<([String; 5], [bool; 3], bool, usize, HostEditAction), String> {
+) -> Result<(HostEditState, usize, HostEditAction), String> {
+    let HostEditState {
+        mut fields,
+        mut clears,
+        mut password_edited,
+    } = state;
     const LABELS: [&str; 5] = ["Alias", "Host destination", "User", "Port", "Password"];
     let label = if rename_only {
         "Rename HostEntry"
@@ -3342,17 +3701,64 @@ pub fn host_edit_workspace(
                             .style(Style::default().fg(Color::Cyan)), rows[2]);
                     }).map_err(|error| format!("HOST_EDIT_REQUIRED: cannot render review: {error}"))?;
                     match read_key(input, "HOST_EDIT_REQUIRED")? {
-                        KeyEvent { code: KeyCode::Enter, .. } => return Ok((fields, clears, password_edited,
-                            selected, if preview { HostEditAction::PreviewComplete } else { HostEditAction::Apply })),
-                        KeyEvent { code: KeyCode::Esc | KeyCode::Char('e' | 'E'), .. } =>
-                            return Ok((fields, clears, password_edited, selected, HostEditAction::Edit)),
-                        KeyEvent { code: KeyCode::Char('c'), modifiers, .. }
-                            if modifiers.contains(KeyModifiers::CONTROL) => return Err(CANCELLED.to_string()),
-                        KeyEvent { code: KeyCode::Down, .. } => scroll = scroll.saturating_add(1),
-                        KeyEvent { code: KeyCode::Up, .. } => scroll = scroll.saturating_sub(1),
-                        KeyEvent { code: KeyCode::PageDown, .. } => scroll = scroll.saturating_add(10),
-                        KeyEvent { code: KeyCode::PageUp, .. } => scroll = scroll.saturating_sub(10),
-                        KeyEvent { code: KeyCode::Home, .. } => scroll = 0,
+                        KeyEvent {
+                            code: KeyCode::Enter,
+                            ..
+                        } => {
+                            return Ok((
+                                HostEditState {
+                                    fields,
+                                    clears,
+                                    password_edited,
+                                },
+                                selected,
+                                if preview {
+                                    HostEditAction::PreviewComplete
+                                } else {
+                                    HostEditAction::Apply
+                                },
+                            ));
+                        }
+                        KeyEvent {
+                            code: KeyCode::Esc | KeyCode::Char('e' | 'E'),
+                            ..
+                        } => {
+                            return Ok((
+                                HostEditState {
+                                    fields,
+                                    clears,
+                                    password_edited,
+                                },
+                                selected,
+                                HostEditAction::Edit,
+                            ));
+                        }
+                        KeyEvent {
+                            code: KeyCode::Char('c'),
+                            modifiers,
+                            ..
+                        } if modifiers.contains(KeyModifiers::CONTROL) => {
+                            return Err(CANCELLED.to_string());
+                        }
+                        KeyEvent {
+                            code: KeyCode::Down,
+                            ..
+                        } => scroll = scroll.saturating_add(1),
+                        KeyEvent {
+                            code: KeyCode::Up, ..
+                        } => scroll = scroll.saturating_sub(1),
+                        KeyEvent {
+                            code: KeyCode::PageDown,
+                            ..
+                        } => scroll = scroll.saturating_add(10),
+                        KeyEvent {
+                            code: KeyCode::PageUp,
+                            ..
+                        } => scroll = scroll.saturating_sub(10),
+                        KeyEvent {
+                            code: KeyCode::Home,
+                            ..
+                        } => scroll = 0,
                         _ => {}
                     }
                 }
@@ -3456,18 +3862,38 @@ pub fn host_edit_workspace(
                     })
                     .map_err(|error| format!("HOST_EDIT_REQUIRED: cannot render form: {error}"))?;
                 match read_key(input, "HOST_EDIT_REQUIRED")? {
-                    KeyEvent { code: KeyCode::Esc, .. } => return Err(CANCELLED.to_string()),
-                    KeyEvent { code: KeyCode::Char('c'), modifiers, .. }
-                        if modifiers.contains(KeyModifiers::CONTROL) => return Err(CANCELLED.to_string()),
-                    KeyEvent { code: KeyCode::Char('s'), modifiers, .. }
-                        if modifiers.contains(KeyModifiers::CONTROL) =>
-                    {
-                        return Ok((fields, clears, password_edited, selected, HostEditAction::Submit));
+                    KeyEvent {
+                        code: KeyCode::Esc, ..
+                    } => return Err(CANCELLED.to_string()),
+                    KeyEvent {
+                        code: KeyCode::Char('c'),
+                        modifiers,
+                        ..
+                    } if modifiers.contains(KeyModifiers::CONTROL) => {
+                        return Err(CANCELLED.to_string());
                     }
-                    KeyEvent { code: KeyCode::Char('x'), modifiers, .. }
-                        if !rename_only
-                            && modifiers.contains(KeyModifiers::CONTROL)
-                            && (2..=4).contains(&selected) =>
+                    KeyEvent {
+                        code: KeyCode::Char('s'),
+                        modifiers,
+                        ..
+                    } if modifiers.contains(KeyModifiers::CONTROL) => {
+                        return Ok((
+                            HostEditState {
+                                fields,
+                                clears,
+                                password_edited,
+                            },
+                            selected,
+                            HostEditAction::Submit,
+                        ));
+                    }
+                    KeyEvent {
+                        code: KeyCode::Char('x'),
+                        modifiers,
+                        ..
+                    } if !rename_only
+                        && modifiers.contains(KeyModifiers::CONTROL)
+                        && (2..=4).contains(&selected) =>
                     {
                         let index = selected - 2;
                         if selected == 4 {
@@ -3487,31 +3913,43 @@ pub fn host_edit_workspace(
                             };
                         }
                     }
-                    KeyEvent { code: KeyCode::Tab, .. }
-                    | KeyEvent { code: KeyCode::Down, .. }
-                    | KeyEvent { code: KeyCode::Enter, .. } if !rename_only => {
+                    KeyEvent {
+                        code: KeyCode::Tab, ..
+                    }
+                    | KeyEvent {
+                        code: KeyCode::Down,
+                        ..
+                    }
+                    | KeyEvent {
+                        code: KeyCode::Enter,
+                        ..
+                    } if !rename_only => {
                         selected = (selected + 1) % field_count;
                     }
-                    KeyEvent { code: KeyCode::Up, .. } if !rename_only => {
+                    KeyEvent {
+                        code: KeyCode::Up, ..
+                    } if !rename_only => {
                         selected = selected.saturating_sub(1);
                     }
-                    KeyEvent { code: KeyCode::Backspace, .. } => {
+                    KeyEvent {
+                        code: KeyCode::Backspace,
+                        ..
+                    } => {
                         if selected == 4 {
                             password_backspace(&mut fields[selected], &mut password_edited);
                         } else {
                             fields[selected].pop();
                         }
                     }
-                    KeyEvent { code: KeyCode::Char(character), modifiers, .. }
-                        if !modifiers.contains(KeyModifiers::CONTROL)
-                            && !modifiers.contains(KeyModifiers::ALT) =>
+                    KeyEvent {
+                        code: KeyCode::Char(character),
+                        modifiers,
+                        ..
+                    } if !modifiers.contains(KeyModifiers::CONTROL)
+                        && !modifiers.contains(KeyModifiers::ALT) =>
                     {
                         if selected == 4 {
-                            password_insert(
-                                &mut fields[selected],
-                                &mut password_edited,
-                                character,
-                            );
+                            password_insert(&mut fields[selected], &mut password_edited, character);
                         }
                         if (2..=4).contains(&selected) {
                             clears[selected - 2] = false;
@@ -3557,9 +3995,7 @@ pub fn mutation_review_workspace(
                 MutationReviewMode::EditApply => {
                     "Enter apply · E/Esc edit · Ctrl-C cancel · PgUp/PgDn scroll"
                 }
-                MutationReviewMode::Delete => {
-                    "Enter delete · Esc/Ctrl-C cancel · PgUp/PgDn scroll"
-                }
+                MutationReviewMode::Delete => "Enter delete · Esc/Ctrl-C cancel · PgUp/PgDn scroll",
                 MutationReviewMode::PreviewOnly => {
                     "Enter finish preview · Esc/Ctrl-C cancel · PgUp/PgDn scroll"
                 }
@@ -3572,8 +4008,8 @@ pub fn mutation_review_workspace(
                     .draw(|frame| {
                         let area = frame.area();
                         let footer_lines = wrap_status(footer, area.width as usize);
-                        let footer_height = (footer_lines.len() as u16)
-                            .min(area.height.saturating_sub(2));
+                        let footer_height =
+                            (footer_lines.len() as u16).min(area.height.saturating_sub(2));
                         let rows = Layout::default()
                             .direction(Direction::Vertical)
                             .constraints([
@@ -3583,15 +4019,21 @@ pub fn mutation_review_workspace(
                             ])
                             .split(area);
                         frame.render_widget(
-                            Paragraph::new(title)
-                                .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                            Paragraph::new(title).style(
+                                Style::default()
+                                    .fg(Color::Cyan)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
                             rows[0],
                         );
                         let review_lines = wrap_status(review, rows[1].width as usize);
                         scroll_step = rows[1].height.max(1);
-                        scroll = scroll.min(review_lines.len()
-                            .saturating_sub(rows[1].height as usize)
-                            .min(u16::MAX as usize) as u16);
+                        scroll = scroll.min(
+                            review_lines
+                                .len()
+                                .saturating_sub(rows[1].height as usize)
+                                .min(u16::MAX as usize) as u16,
+                        );
                         frame.render_widget(
                             Paragraph::new(review_lines).scroll((scroll, 0)),
                             rows[1],
@@ -3606,14 +4048,16 @@ pub fn mutation_review_workspace(
                     })?;
                 match read_key(input, "MUTATION_REVIEW_REQUIRED")? {
                     KeyEvent {
-                        code: KeyCode::Enter, ..
+                        code: KeyCode::Enter,
+                        ..
                     } if mode == MutationReviewMode::Blocked
                         || mode == MutationReviewMode::PreviewOnly =>
                     {
                         return Ok(MutationReviewAction::Acknowledge);
                     }
                     KeyEvent {
-                        code: KeyCode::Enter, ..
+                        code: KeyCode::Enter,
+                        ..
                     } => return Ok(MutationReviewAction::Apply),
                     KeyEvent {
                         code: KeyCode::Esc, ..
@@ -3621,7 +4065,8 @@ pub fn mutation_review_workspace(
                         return Ok(MutationReviewAction::Edit);
                     }
                     KeyEvent {
-                        code: KeyCode::Char('e' | 'E'), ..
+                        code: KeyCode::Char('e' | 'E'),
+                        ..
                     } if mode == MutationReviewMode::EditApply => {
                         return Ok(MutationReviewAction::Edit);
                     }
@@ -3641,19 +4086,23 @@ pub fn mutation_review_workspace(
                         return Err(CANCELLED.to_string());
                     }
                     KeyEvent {
-                        code: KeyCode::Down, ..
+                        code: KeyCode::Down,
+                        ..
                     } => scroll = scroll.saturating_add(1),
                     KeyEvent {
                         code: KeyCode::Up, ..
                     } => scroll = scroll.saturating_sub(1),
                     KeyEvent {
-                        code: KeyCode::PageDown, ..
+                        code: KeyCode::PageDown,
+                        ..
                     } => scroll = scroll.saturating_add(scroll_step),
                     KeyEvent {
-                        code: KeyCode::PageUp, ..
+                        code: KeyCode::PageUp,
+                        ..
                     } => scroll = scroll.saturating_sub(scroll_step),
                     KeyEvent {
-                        code: KeyCode::Home, ..
+                        code: KeyCode::Home,
+                        ..
                     } => scroll = 0,
                     _ => {}
                 }
@@ -3820,11 +4269,7 @@ fn matching_rows<'a>(entries: &[&'a HostEntry], query: &str) -> Vec<Row<'a>> {
 fn compare_rows(left: &Row<'_>, right: &Row<'_>, query: &str) -> Ordering {
     row_rank(left, query)
         .cmp(&row_rank(right, query))
-        .then_with(|| {
-            left.alias
-                .to_lowercase()
-                .cmp(&right.alias.to_lowercase())
-        })
+        .then_with(|| left.alias.to_lowercase().cmp(&right.alias.to_lowercase()))
         .then_with(|| left.entry.source.path.cmp(&right.entry.source.path))
         .then_with(|| {
             left.entry
@@ -4038,11 +4483,8 @@ fn draw_host_picker(
             }
             let footer_height = footer.lines().count() as u16;
             let detail_max = if area.width < 80 { 10 } else { 8 };
-            let detail_height = detail_max.min(
-                area.height
-                    .saturating_sub(3 + footer_height + 2)
-                    .max(5),
-            );
+            let detail_height =
+                detail_max.min(area.height.saturating_sub(3 + footer_height + 2).max(5));
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
@@ -4098,9 +4540,8 @@ fn draw_host_picker(
                 || empty_message.to_string(),
                 |row| match detail_page {
                     HostDetailPage::Summary => {
-                        let route_line = route.map_or_else(String::new, |route| {
-                            format!("route: {route}\n")
-                        });
+                        let route_line =
+                            route.map_or_else(String::new, |route| format!("route: {route}\n"));
                         format!(
                             "{route_line}destination: {}\nscope: {}\nproject: {}\nsource: {}:{}",
                             row.entry.destination.as_deref().unwrap_or("-"),
@@ -4163,12 +4604,11 @@ fn block(title: impl Into<Line<'static>>, color: Color) -> Block<'static> {
 #[cfg(test)]
 mod tests {
     use super::{
-        clear_preflight_errors, fuzzy_score, matching_rows,
-        password_backspace, password_insert, read_key, restore_edit_row_errors,
-        row_label, source_details, toggle_password_clear, workspace_preflight_issues, wrap_status,
+        clear_preflight_errors, fuzzy_score, matching_rows, password_backspace, password_insert,
+        read_key, restore_edit_row_errors, row_label, source_details, toggle_password_clear,
+        workspace_preflight_issues, wrap_status,
     };
     use sshx::discovery::{HostEntry, SourceIdentity};
-
 
     #[test]
     fn password_clear_toggle_restores_form_baseline() {
@@ -4202,20 +4642,8 @@ mod tests {
         let mut value = original.to_string();
         let mut cleared = false;
         let mut edited = true;
-        toggle_password_clear(
-            &mut value,
-            original,
-            &mut cleared,
-            &mut edited,
-            true,
-        );
-        toggle_password_clear(
-            &mut value,
-            original,
-            &mut cleared,
-            &mut edited,
-            true,
-        );
+        toggle_password_clear(&mut value, original, &mut cleared, &mut edited, true);
+        toggle_password_clear(&mut value, original, &mut cleared, &mut edited, true);
         assert_eq!(value, original);
         assert!(edited);
     }
@@ -4273,10 +4701,7 @@ mod tests {
             vec!["SERVICE_BIND_FAILED: duplicate local listener".to_string()],
         ];
         clear_preflight_errors(&mut row_errors);
-        assert_eq!(
-            row_errors,
-            vec![Vec::<String>::new(), Vec::new()]
-        );
+        assert_eq!(row_errors, vec![Vec::<String>::new(), Vec::new()]);
     }
 
     fn socks(bind: &str) -> sshx::session::ServiceForward {
@@ -4290,27 +4715,22 @@ mod tests {
 
     #[test]
     fn socks_listener_duplicates_normalize_localhost_but_keep_ipv6_distinct() {
-        let duplicate = workspace_preflight_issues(
-            &[socks("localhost:1080"), socks("127.0.0.1:1080")],
-            false,
-        );
+        let duplicate =
+            workspace_preflight_issues(&[socks("localhost:1080"), socks("127.0.0.1:1080")], false);
         assert!(
             duplicate
                 .iter()
                 .any(|issue| issue.message.starts_with("FORWARD_DUPLICATE:"))
         );
 
-        let distinct = workspace_preflight_issues(
-            &[socks("127.0.0.1:1080"), socks("[::1]:1080")],
-            false,
-        );
+        let distinct =
+            workspace_preflight_issues(&[socks("127.0.0.1:1080"), socks("[::1]:1080")], false);
         assert!(
             distinct
                 .iter()
                 .all(|issue| !issue.message.starts_with("FORWARD_DUPLICATE:"))
         );
     }
-
 
     fn host(
         id: &str,
@@ -4484,6 +4904,4 @@ mod tests {
         password_insert(&mut value, &mut edited, 'x');
         assert_eq!(value, "********x");
     }
-
-
 }

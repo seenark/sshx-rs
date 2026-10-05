@@ -79,12 +79,12 @@ pub fn current_values(request: &UpdateRequest) -> Result<CurrentValues, String> 
         let line = loaded.lines[index];
         let raw = &loaded.before[line.start..line.content_end];
         if values.hostname.is_none() && directive_matches(raw, "HostName") {
-            values.hostname = argument_span(raw, "HostName")
-                .map(|(start, end)| decode_token(&raw[start..end]));
+            values.hostname =
+                argument_span(raw, "HostName").map(|(start, end)| decode_token(&raw[start..end]));
         }
         if values.user.is_none() && directive_matches(raw, "User") {
-            values.user = argument_span(raw, "User")
-                .map(|(start, end)| decode_token(&raw[start..end]));
+            values.user =
+                argument_span(raw, "User").map(|(start, end)| decode_token(&raw[start..end]));
         }
         if values.port.is_none()
             && directive_matches(raw, "Port")
@@ -239,10 +239,7 @@ impl WriterLock {
             } else {
                 "MUTATION_LOCK_FAILED"
             };
-            return Err(format!(
-                "{code}: cannot lock {}: {error}",
-                path.display()
-            ));
+            return Err(format!("{code}: cannot lock {}: {error}", path.display()));
         }
         Ok(Self { _file: file })
     }
@@ -379,7 +376,10 @@ pub fn apply_edit(plan: &EditPlan) -> Result<(), String> {
     apply_writes(&plan.lock_path, &plan.writes)
 }
 
-pub fn plan_pair(request: &PairMutationRequest, kind: PairMutationKind) -> Result<PairPlan, String> {
+pub fn plan_pair(
+    request: &PairMutationRequest,
+    kind: PairMutationKind,
+) -> Result<PairPlan, String> {
     validate_value("gateway_id", &request.gateway_id)?;
     validate_value("vm_id", &request.vm_id)?;
     validate_value("transit_host", &request.transit_host)?;
@@ -777,8 +777,9 @@ fn rollback_pair_journal(path: &Path, journal: &PairJournal) -> Result<(), Strin
     }
     fs::remove_file(path)
         .map_err(|error| format!("MUTATION_RECOVERY_FAILED: cannot remove journal: {error}"))?;
-    sync_parent(path)
-        .map_err(|error| format!("MUTATION_RECOVERY_FAILED: cannot sync journal removal: {error}"))?;
+    sync_parent(path).map_err(|error| {
+        format!("MUTATION_RECOVERY_FAILED: cannot sync journal removal: {error}")
+    })?;
     for write in &journal.writes {
         let _ = fs::remove_file(&write.before);
         let _ = fs::remove_file(&write.after);
@@ -2306,11 +2307,8 @@ mod tests {
         };
         fs::write(&journal_path, serde_json::to_vec(&journal).unwrap()).unwrap();
 
-        recover_pair_journals(
-            std::slice::from_ref(&target),
-            std::slice::from_ref(&target),
-        )
-        .unwrap();
+        recover_pair_journals(std::slice::from_ref(&target), std::slice::from_ref(&target))
+            .unwrap();
 
         assert_eq!(fs::read(&target).unwrap(), b"before");
         assert!(lock.is_file());
@@ -2350,8 +2348,7 @@ mod tests {
         fs::write(&journal_path, serde_json::to_vec(&journal).unwrap()).unwrap();
 
         let approved = [directory.join("different-config")];
-        let error =
-            recover_pair_journals(std::slice::from_ref(&target), &approved).unwrap_err();
+        let error = recover_pair_journals(std::slice::from_ref(&target), &approved).unwrap_err();
 
         assert!(error.starts_with("PAIR_RECOVERY_CHANGED"), "{error}");
         assert!(journal_path.exists());
@@ -2390,7 +2387,10 @@ mod tests {
 
         let error = super::cleanup_pair_journal(&journal_path, &journal).unwrap_err();
 
-        assert!(error.starts_with("MUTATION_COMMIT_CLEANUP_FAILED"), "{error}");
+        assert!(
+            error.starts_with("MUTATION_COMMIT_CLEANUP_FAILED"),
+            "{error}"
+        );
         assert!(before.exists());
         assert!(after.exists());
         fs::remove_dir_all(directory).unwrap();

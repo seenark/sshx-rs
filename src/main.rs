@@ -18,7 +18,6 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{self, Stdio};
 
-
 fn main() {
     match run(env::args_os().skip(1).collect()) {
         Ok(()) => {}
@@ -196,7 +195,10 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
                 .to_string(),
         );
     }
-    if matches!(cli.command, Command::UpdateHost(_) | Command::RenameHost(_) | Command::DeleteHost(_)) {
+    if matches!(
+        cli.command,
+        Command::UpdateHost(_) | Command::RenameHost(_) | Command::DeleteHost(_)
+    ) {
         let roots = registered_roots(&cli)?;
         run_host_edit(&cli, &roots)?;
         if cli.tui && matches!(cli.command, Command::DeleteHost(_)) {
@@ -213,7 +215,8 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
         return Ok(());
     }
     let tunnel_incomplete = match &cli.command {
-        Command::TunnelStart(selector) | Command::TunnelDirectStart(selector)
+        Command::TunnelStart(selector)
+        | Command::TunnelDirectStart(selector)
         | Command::TunnelPairedStart(selector) => {
             selector.is_none() && cli.id.is_none()
                 || (cli.forwards.is_empty()
@@ -223,9 +226,14 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
         }
         _ => false,
     };
-    let missing_host = matches!(&cli.command, Command::Connect(None) | Command::Show(None)
-        | Command::TunnelStart(None) | Command::TunnelDirectStart(None) | Command::TunnelPairedStart(None))
-        && cli.id.is_none();
+    let missing_host = matches!(
+        &cli.command,
+        Command::Connect(None)
+            | Command::Show(None)
+            | Command::TunnelStart(None)
+            | Command::TunnelDirectStart(None)
+            | Command::TunnelPairedStart(None)
+    ) && cli.id.is_none();
     if cli.tui || tunnel_incomplete || missing_host {
         let continuation = cli.tui
             || !cli.no_input
@@ -245,7 +253,10 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
             return run_tui_operation(&cli);
         }
         if missing_host {
-            return Err("HOST_REQUIRED: provide a HostEntry selector outside usable interactive terminals".to_string());
+            return Err(
+                "HOST_REQUIRED: provide a HostEntry selector outside usable interactive terminals"
+                    .to_string(),
+            );
         }
     }
     if matches!(cli.command, Command::Setup) {
@@ -267,8 +278,16 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
         return Ok(());
     }
     if let Command::TunnelChoose { action, route } = cli.command {
-        if cli.no_input || cli.format.is_machine() || cli.password_stdin || !io::stdin().is_terminal() || !io::stderr().is_terminal() {
-            return Err("TUNNEL_ID_REQUIRED: provide a Tunnel ID outside usable interactive terminals".to_string());
+        if cli.no_input
+            || cli.format.is_machine()
+            || cli.password_stdin
+            || !io::stdin().is_terminal()
+            || !io::stderr().is_terminal()
+        {
+            return Err(
+                "TUNNEL_ID_REQUIRED: provide a Tunnel ID outside usable interactive terminals"
+                    .to_string(),
+            );
         }
         return run_tunnels_workspace(&cli, &home, 0, Some((action, route)));
     }
@@ -322,7 +341,10 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
                 "HOST_REQUIRED: host show requires a selector outside interactive mode".to_string()
             })?;
             let entries = if cli.id.is_some() {
-                vec![select_connect_entry(&filtered, positional.as_deref(), &cli, "host show")?.entry]
+                vec![
+                    select_connect_entry(&filtered, positional.as_deref(), &cli, "host show")?
+                        .entry,
+                ]
             } else {
                 select_entries(&filtered, selector)?
             };
@@ -352,8 +374,14 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
                 }
                 let alias = selected.alias;
                 if let Some(route) = sshx::pair::paired_route(&catalog.entries, entry)? {
-                    if !cli.local_forwards.is_empty() || !cli.remote_forwards.is_empty() || !cli.dynamic_forwards.is_empty() {
-                        return Err("PAIR_FORWARD_INVALID: Pair routes accept declared VM services only".to_string());
+                    if !cli.local_forwards.is_empty()
+                        || !cli.remote_forwards.is_empty()
+                        || !cli.dynamic_forwards.is_empty()
+                    {
+                        return Err(
+                            "PAIR_FORWARD_INVALID: Pair routes accept declared VM services only"
+                                .to_string(),
+                        );
                     }
                     let gateway_alias = route
                         .gateway
@@ -390,10 +418,20 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
                 } else {
                     let forwards = requested_forwards(entry, &cli)?;
                     let direct = sshx::tunnel::parse_forwards(
-                        &cli.local_forwards, &cli.remote_forwards, &cli.dynamic_forwards, cli.allow_bind,
+                        &cli.local_forwards,
+                        &cli.remote_forwards,
+                        &cli.dynamic_forwards,
+                        cli.allow_bind,
                     )?;
                     sshx::connect::open_with_password_fd_and_all_forwards(
-                        entry, &home, cli.no_input, alias, cli.password_fd, &forwards, &direct, false,
+                        entry,
+                        &home,
+                        cli.no_input,
+                        alias,
+                        cli.password_fd,
+                        &forwards,
+                        &direct,
+                        false,
                     )
                 }
             }
@@ -402,18 +440,32 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
             let selected = select_connect_entry(&filtered, selector.as_deref(), &cli, "tunnel")?;
             let entry = selected.entry;
             if let Some(route) = sshx::pair::paired_route(&catalog.entries, entry)? {
-                if !cli.local_forwards.is_empty() || !cli.remote_forwards.is_empty() || !cli.dynamic_forwards.is_empty() {
-                    return Err("PAIR_FORWARD_INVALID: Pair routes accept declared VM services only".to_string());
+                if !cli.local_forwards.is_empty()
+                    || !cli.remote_forwards.is_empty()
+                    || !cli.dynamic_forwards.is_empty()
+                {
+                    return Err(
+                        "PAIR_FORWARD_INVALID: Pair routes accept declared VM services only"
+                            .to_string(),
+                    );
                 }
-                let gateway_alias = route.gateway.aliases.first()
+                let gateway_alias = route
+                    .gateway
+                    .aliases
+                    .first()
                     .ok_or_else(|| "PAIR_INVALID: gateway has no alias".to_string())?;
                 let forwards = requested_forwards(&route.vm, &cli)?;
                 let response = sshx::tunnel::start_paired(
-                    &route, &home, gateway_alias, selected.alias, cli.no_input,
+                    &route,
+                    &home,
+                    gateway_alias,
+                    selected.alias,
+                    cli.no_input,
                     sshx::connect::PairedCredentials {
                         gateway_password_fd: cli.gateway_password_fd,
                         vm_password_fd: cli.vm_password_fd.or(cli.password_fd),
-                    }, &forwards,
+                    },
+                    &forwards,
                 )?;
                 print!("{}", render_tunnels(&response, cli.format)?);
                 Ok(())
@@ -438,8 +490,16 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
         }
         Command::TunnelRestart(id) => {
             let response = sshx::tunnel::restart(
-                &catalog.entries, &home, id, cli.tunnel_route, cli.no_input,
-                cli.password_fd, cli.gateway_password_fd, cli.vm_password_fd,
+                &catalog.entries,
+                &home,
+                id,
+                cli.tunnel_route,
+                cli.no_input,
+                cli.password_fd,
+                sshx::connect::PairedCredentials {
+                    gateway_password_fd: cli.gateway_password_fd,
+                    vm_password_fd: cli.vm_password_fd,
+                },
             )?;
             print!("{}", render_tunnels(&response, cli.format)?);
             Ok(())
@@ -478,19 +538,30 @@ fn start_direct_tunnel(
     local.extend(cli.local_forwards.iter().cloned());
     let mut credentials = sshx::connect::StandaloneCredentials::new(cli.password_fd);
     sshx::tunnel::start(
-        entry, home, alias, cli.no_input, &mut credentials,
-        &local, &cli.remote_forwards, &cli.dynamic_forwards, cli.allow_bind,
+        entry,
+        home,
+        alias,
+        cli.no_input,
+        &mut credentials,
+        &local,
+        &cli.remote_forwards,
+        &cli.dynamic_forwards,
+        cli.allow_bind,
     )
 }
 
 fn run_hosts(
-    cli: &Cli, home: &Path, roots: &[RegisteredRoot], initial_status: Option<String>,
+    cli: &Cli,
+    home: &Path,
+    roots: &[RegisteredRoot],
+    initial_status: Option<String>,
 ) -> Result<(), String> {
     let mut roots = roots.to_vec();
     let mut state = picker::HostsState::default();
     state.editing_enabled = true;
     let mut status = initial_status;
-    let mut prefill_selector = cli.id.is_some() || cli.location.source.is_some() || cli.location.line.is_some();
+    let mut prefill_selector =
+        cli.id.is_some() || cli.location.source.is_some() || cli.location.line.is_some();
     loop {
         let configured = settings::discovery_roots(&roots);
         let missing_default = cli.config.is_none()
@@ -498,7 +569,13 @@ fn run_hosts(
             && configured[0].path == home.join(".ssh/config")
             && !configured[0].path.exists();
         state.active_tunnels = sshx::tunnel::list(home, None)
-            .map(|response| response.tunnels.iter().filter(|tunnel| tunnel.state == "active").count())
+            .map(|response| {
+                response
+                    .tunnels
+                    .iter()
+                    .filter(|tunnel| tunnel.state == "active")
+                    .count()
+            })
             .unwrap_or(0);
         let mut discovery_error = None;
         let catalog = if missing_default {
@@ -511,36 +588,62 @@ fn run_hosts(
                     None
                 }
             }
-        }.unwrap_or_else(|| Catalog { entries: Vec::new(), diagnostics: Vec::new() });
+        }
+        .unwrap_or_else(|| Catalog {
+            entries: Vec::new(),
+            diagnostics: Vec::new(),
+        });
         let discovery_status = discovery_error.map(|error| match status.as_deref() {
             Some(status) => format!("{status}\n{error}"),
             None => error,
         });
-        let filtered = catalog.entries.iter()
-            .filter(|entry| entry_matches_provenance(entry, cli)).collect::<Vec<_>>();
+        let filtered = catalog
+            .entries
+            .iter()
+            .filter(|entry| entry_matches_provenance(entry, cli))
+            .collect::<Vec<_>>();
         if prefill_selector {
             let selected = if cli.id.is_some() {
                 select_connect_entry(&filtered, None, cli, "Hosts")?
             } else {
-                let path = source_selector_path(cli.location.source.as_ref()
-                    .ok_or_else(|| "SELECTOR_INCOMPLETE: --source and --line must be provided together".to_string())?, home);
-                let matches = filtered.iter().copied().filter(|entry| {
-                    entry.source.path == path.to_string_lossy()
-                        && Some(entry.source.line_start) == cli.location.line
-                }).collect::<Vec<_>>();
+                let path = source_selector_path(
+                    cli.location.source.as_ref().ok_or_else(|| {
+                        "SELECTOR_INCOMPLETE: --source and --line must be provided together"
+                            .to_string()
+                    })?,
+                    home,
+                );
+                let matches = filtered
+                    .iter()
+                    .copied()
+                    .filter(|entry| {
+                        entry.source.path == path.to_string_lossy()
+                            && Some(entry.source.line_start) == cli.location.line
+                    })
+                    .collect::<Vec<_>>();
                 let entry = match matches.as_slice() {
                     [entry] => *entry,
-                    [] => return Err("HOST_NOT_FOUND: source and Host line matched no entries".to_string()),
+                    [] => {
+                        return Err(
+                            "HOST_NOT_FOUND: source and Host line matched no entries".to_string()
+                        );
+                    }
                     many => return Err(format_ambiguous("source and Host line", many)),
                 };
-                picker::Selection { entry, alias: entry.aliases.first().map_or("", String::as_str) }
+                picker::Selection {
+                    entry,
+                    alias: entry.aliases.first().map_or("", String::as_str),
+                }
             };
             state.prefill(selected.entry, selected.alias, "");
             prefill_selector = false;
         }
         let sources = catalog_source_snapshots(&catalog);
         let selection = match picker::browse_hosts(
-            &filtered, &catalog.entries, &mut state, discovery_status.as_deref().or(status.as_deref()),
+            &filtered,
+            &catalog.entries,
+            &mut state,
+            discovery_status.as_deref().or(status.as_deref()),
         ) {
             Ok(selection) => selection,
             Err(action) if action == "HOST_CREATE" => {
@@ -580,7 +683,9 @@ fn run_hosts(
             }
             Err(error) => return Err(error),
         };
-        let Some(selection) = selection else { return Ok(()); };
+        let Some(selection) = selection else {
+            return Ok(());
+        };
         let entry = selection.entry;
         let alias = selection.alias;
         let edit_action = state.edit_action.take();
@@ -594,22 +699,33 @@ fn run_hosts(
             continue;
         }
         if copy_password {
-            status = Some(match run_host_action(HostAction::CopyPassword, &selection, &catalog.entries, cli) {
-                Ok(()) => "Password copied to clipboard.".to_string(),
-                Err(error) => error,
-            });
+            status = Some(
+                match run_host_action(HostAction::CopyPassword, &selection, &catalog.entries, cli) {
+                    Ok(()) => "Password copied to clipboard.".to_string(),
+                    Err(error) => error,
+                },
+            );
             continue;
         }
         if let Some(operation) = edit_action {
-            let before = sources.get(entry.source.path.as_str()).and_then(Option::as_ref)
-                .ok_or_else(|| "HOST_SOURCE_CHANGED: source is unavailable; select again".to_string())?;
-            let alias_index = entry.aliases.iter().position(|value| value == alias).unwrap_or(0);
-            status = match mutation::validate_mutation_roots(&configured)
-                .and_then(|()| if operation == MutationKind::Delete {
+            let before = sources
+                .get(entry.source.path.as_str())
+                .and_then(Option::as_ref)
+                .ok_or_else(|| {
+                    "HOST_SOURCE_CHANGED: source is unavailable; select again".to_string()
+                })?;
+            let alias_index = entry
+                .aliases
+                .iter()
+                .position(|value| value == alias)
+                .unwrap_or(0);
+            status = match mutation::validate_mutation_roots(&configured).and_then(|()| {
+                if operation == MutationKind::Delete {
                     run_host_delete_workspace(cli, home, &configured, entry, alias, before)
                 } else {
                     run_host_edit_workspace(cli, entry, alias, operation, before)
-                }) {
+                }
+            }) {
                 Ok(()) => {
                     if let Ok(updated) = discover_roots(&configured)
                         && let Some(updated) = updated.entries.iter().find(|updated| {
@@ -630,11 +746,13 @@ fn run_hosts(
                         "HostEntry updated.".to_string()
                     })
                 }
-                Err(error) if error == picker::CANCELLED => Some(if operation == MutationKind::Delete {
-                    "HostEntry deletion cancelled.".to_string()
-                } else {
-                    "HostEntry edit cancelled.".to_string()
-                }),
+                Err(error) if error == picker::CANCELLED => {
+                    Some(if operation == MutationKind::Delete {
+                        "HostEntry deletion cancelled.".to_string()
+                    } else {
+                        "HostEntry edit cancelled.".to_string()
+                    })
+                }
                 Err(error) => Some(error),
             };
             continue;
@@ -650,8 +768,15 @@ fn run_hosts(
         }
         let mut standalone_credentials = sshx::connect::StandaloneCredentials::new(None);
         status = match run_connection_workspace(
-            cli, &catalog, selection, home, picker::ConnectionMode::Session, false,
-            &mut standalone_credentials, &sources, true,
+            cli,
+            &catalog,
+            selection,
+            home,
+            picker::ConnectionMode::Session,
+            false,
+            &mut standalone_credentials,
+            &sources,
+            true,
         ) {
             Ok(outcome) if outcome.quit => return Ok(()),
             Ok(outcome) if outcome.completed => outcome.status,
@@ -670,8 +795,16 @@ fn run_pairs_workspace(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), String
         let pairs = sshx::pair::records(&catalog.entries);
         let mut findings = catalog.diagnostics;
         findings.extend(sshx::pair::diagnostics(&catalog.entries));
-        let mut journal_paths = configured.iter().map(|root| root.path.clone()).collect::<Vec<_>>();
-        journal_paths.extend(catalog.entries.iter().map(|entry| PathBuf::from(&entry.source.path)));
+        let mut journal_paths = configured
+            .iter()
+            .map(|root| root.path.clone())
+            .collect::<Vec<_>>();
+        journal_paths.extend(
+            catalog
+                .entries
+                .iter()
+                .map(|entry| PathBuf::from(&entry.source.path)),
+        );
         for path in &mut journal_paths {
             if let Ok(canonical) = std::fs::canonicalize(&path) {
                 *path = canonical;
@@ -690,7 +823,10 @@ fn run_pairs_workspace(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), String
         match picker::pairs_workspace(&pairs, &catalog.entries, &findings, status.as_deref())? {
             picker::PairWorkspaceAction::Exit => return Ok(()),
             picker::PairWorkspaceAction::Validate => {
-                status = Some("Validation refreshed from SSH config; no files changed or OpenSSH started.".to_string());
+                status = Some(
+                    "Validation refreshed from SSH config; no files changed or OpenSSH started."
+                        .to_string(),
+                );
             }
             picker::PairWorkspaceAction::Setup => {
                 let mut pair = Cli::parse(vec!["pair".into(), "setup".into()])?;
@@ -700,14 +836,18 @@ fn run_pairs_workspace(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), String
                 pair.tui = true;
                 status = match run_pair(&pair, roots) {
                     Ok(()) => Some("Pair setup complete.".to_string()),
-                    Err(error) if error == picker::CANCELLED => Some("Pair setup cancelled.".to_string()),
+                    Err(error) if error == picker::CANCELLED => {
+                        Some("Pair setup cancelled.".to_string())
+                    }
                     Err(error) => Some(error),
                 };
             }
             picker::PairWorkspaceAction::Delete(index) => {
-                status = match pairs.get(index)
+                status = match pairs
+                    .get(index)
                     .ok_or_else(|| "PAIR_SELECTION: selected Pair is no longer current".to_string())
-                    .and_then(|selected| run_pair_delete_workspace(roots, selected)) {
+                    .and_then(|selected| run_pair_delete_workspace(roots, selected))
+                {
                     Ok(()) => Some("Pair deleted. Both HostEntries kept.".to_string()),
                     Err(error) if error == picker::CANCELLED => {
                         Some("Pair deletion cancelled.".to_string())
@@ -719,8 +859,11 @@ fn run_pairs_workspace(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), String
                 let recovered = (|| {
                     mutation::validate_mutation_roots(&configured)?;
                     let targets = mutation::pair_recovery_targets(&pending)?;
-                    if cli.no_input || cli.format.is_machine() || cli.password_stdin
-                        || !io::stdin().is_terminal() || !io::stderr().is_terminal()
+                    if cli.no_input
+                        || cli.format.is_machine()
+                        || cli.password_stdin
+                        || !io::stdin().is_terminal()
+                        || !io::stderr().is_terminal()
                     {
                         return Err("PAIR_RECOVERY_REVIEW_REQUIRED: review pending Pair mutation targets in an interactive terminal before recovery".to_string());
                     }
@@ -729,7 +872,10 @@ fn run_pairs_workspace(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), String
                         eprintln!("  {}", path.display());
                     }
                     if !prompt_yes("Recover pending Pair mutation? [y/N]: ")? {
-                        return Err("PAIR_RECOVERY_DECLINED: pending Pair mutation was not recovered".to_string());
+                        return Err(
+                            "PAIR_RECOVERY_DECLINED: pending Pair mutation was not recovered"
+                                .to_string(),
+                        );
                     }
                     mutation::recover_pair_journals(&journal_paths, &targets)
                 })();
@@ -743,14 +889,19 @@ fn run_pairs_workspace(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), String
 }
 
 fn run_pair_delete_workspace(
-    roots: &[RegisteredRoot], selected: &sshx::pair::PairRecord,
+    roots: &[RegisteredRoot],
+    selected: &sshx::pair::PairRecord,
 ) -> Result<(), String> {
     let configured = settings::discovery_roots(roots);
     let mut review = format!(
         "Gateway: {} ({})\nVM: {} ({})\nTransit: {}:{}\n\
          Delete this Pair relationship only. Both HostEntries, IDs, and OpenSSH directives are kept.\n",
-        selected.gateway_alias, selected.gateway_id, selected.vm_alias, selected.vm_id,
-        selected.transit_host, selected.transit_port,
+        selected.gateway_alias,
+        selected.gateway_id,
+        selected.vm_alias,
+        selected.vm_id,
+        selected.transit_host,
+        selected.transit_port,
     );
     let current_catalog = || {
         mutation::validate_mutation_roots(&configured)?;
@@ -763,8 +914,16 @@ fn run_pair_delete_workspace(
         }) {
             mutation::validate_entry_paths(entry)?;
         }
-        let mut paths = configured.iter().map(|root| root.path.clone()).collect::<Vec<_>>();
-        paths.extend(catalog.entries.iter().map(|entry| PathBuf::from(&entry.source.path)));
+        let mut paths = configured
+            .iter()
+            .map(|root| root.path.clone())
+            .collect::<Vec<_>>();
+        paths.extend(
+            catalog
+                .entries
+                .iter()
+                .map(|entry| PathBuf::from(&entry.source.path)),
+        );
         for path in &mut paths {
             if let Ok(canonical) = std::fs::canonicalize(&path) {
                 *path = canonical;
@@ -784,20 +943,33 @@ fn run_pair_delete_workspace(
     };
     let planned = current_catalog().and_then(|catalog| {
         for (role, id) in [("Gateway", &selected.gateway_id), ("VM", &selected.vm_id)] {
-            for entry in catalog.entries.iter().filter(|entry| entry.id.eq_ignore_ascii_case(id)) {
+            for entry in catalog
+                .entries
+                .iter()
+                .filter(|entry| entry.id.eq_ignore_ascii_case(id))
+            {
                 review.push_str(&format!(
                     "{role} HostEntry: {}\nID: {}\nSource: {}:{}\n",
-                    entry.aliases.join(" "), entry.id, entry.source.path, entry.source.line_start,
+                    entry.aliases.join(" "),
+                    entry.id,
+                    entry.source.path,
+                    entry.source.line_start,
                 ));
             }
         }
         let plan = current_plan(&catalog)?;
         let source = |id: &str| {
-            catalog.entries.iter().find(|entry| entry.id.eq_ignore_ascii_case(id))
+            catalog
+                .entries
+                .iter()
+                .find(|entry| entry.id.eq_ignore_ascii_case(id))
                 .map(|entry| entry.source.clone())
                 .ok_or_else(|| "PAIR_SELECTION: selected Pair is no longer current".to_string())
         };
-        Ok((plan, [source(&selected.gateway_id)?, source(&selected.vm_id)?]))
+        Ok((
+            plan,
+            [source(&selected.gateway_id)?, source(&selected.vm_id)?],
+        ))
     });
     let (reviewed_plan, reviewed_sources) = match planned {
         Ok((plan, sources)) => {
@@ -807,22 +979,31 @@ fn run_pair_delete_workspace(
         Err(error) => {
             review.push_str(&format!("\n{error}\n"));
             picker::mutation_review_workspace(
-                "Pair deletion blocked", &review, picker::MutationReviewMode::Blocked,
+                "Pair deletion blocked",
+                &review,
+                picker::MutationReviewMode::Blocked,
             )?;
             return Err(error);
         }
     };
     if picker::mutation_review_workspace(
-        "Review Pair deletion", &review, picker::MutationReviewMode::Delete,
-    )? == picker::MutationReviewAction::Apply {
+        "Review Pair deletion",
+        &review,
+        picker::MutationReviewMode::Delete,
+    )? == picker::MutationReviewAction::Apply
+    {
         let catalog = current_catalog()?;
         current_plan(&catalog)?;
         // Bind endpoint paths; the original plan's snapshots guard same-path bytes and spans.
-        for (id, source) in [&selected.gateway_id, &selected.vm_id].iter().zip(&reviewed_sources) {
-            if !catalog.entries.iter().any(|entry| {
-                entry.id.eq_ignore_ascii_case(id)
-                    && entry.source.path == source.path
-            }) {
+        for (id, source) in [&selected.gateway_id, &selected.vm_id]
+            .iter()
+            .zip(&reviewed_sources)
+        {
+            if !catalog
+                .entries
+                .iter()
+                .any(|entry| entry.id.eq_ignore_ascii_case(id) && entry.source.path == source.path)
+            {
                 return Err("PAIR_SELECTION: selected Pair is no longer current".to_string());
             }
         }
@@ -834,7 +1015,10 @@ fn run_pair_delete_workspace(
 }
 
 fn run_tunnels_workspace(
-    cli: &Cli, home: &Path, mut selected: usize, requested: Option<(char, Option<TunnelRoute>)>,
+    cli: &Cli,
+    home: &Path,
+    mut selected: usize,
+    requested: Option<(char, Option<TunnelRoute>)>,
 ) -> Result<(), String> {
     let mut status = None;
     let mut completed = false;
@@ -842,24 +1026,39 @@ fn run_tunnels_workspace(
         let route = requested.and_then(|(_, route)| route).or(cli.tunnel_route);
         let tunnels = sshx::tunnel::list(home, route)?.tunnels;
         let allowed = requested.map(|(action, _)| action);
-        let (index, action) = match picker::tunnels_workspace(&tunnels, status.as_deref(), selected, allowed) {
-            Ok(result) => result,
-            Err(error) if error == picker::CANCELLED && (requested.is_none() || completed) => return Ok(()),
-            Err(error) => return Err(error),
-        };
+        let (index, action) =
+            match picker::tunnels_workspace(&tunnels, status.as_deref(), selected, allowed) {
+                Ok(result) => result,
+                Err(error) if error == picker::CANCELLED && (requested.is_none() || completed) => {
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            };
         selected = index;
         status = match action {
             's' => sshx::tunnel::stop(home, &tunnels[index].id, route).err(),
-            'v' if allowed == Some('v') => sshx::tunnel::status(home, &tunnels[index].id, route).err(),
+            'v' if allowed == Some('v') => {
+                sshx::tunnel::status(home, &tunnels[index].id, route).err()
+            }
             'v' => None,
             'r' => {
                 let roots = registered_roots(cli)?;
                 discover_roots(&settings::discovery_roots(&roots))
                     .map_err(|error| error.to_string())
-                    .and_then(|catalog| sshx::tunnel::restart(
-                        &catalog.entries, home, &tunnels[index].id, route, false,
-                        cli.password_fd, cli.gateway_password_fd, cli.vm_password_fd,
-                    ))
+                    .and_then(|catalog| {
+                        sshx::tunnel::restart(
+                            &catalog.entries,
+                            home,
+                            &tunnels[index].id,
+                            route,
+                            false,
+                            cli.password_fd,
+                            sshx::connect::PairedCredentials {
+                                gateway_password_fd: cli.gateway_password_fd,
+                                vm_password_fd: cli.vm_password_fd,
+                            },
+                        )
+                    })
                     .err()
             }
             _ => None,
@@ -874,11 +1073,20 @@ fn run_setup_workspace(cli: &Cli, home: &Path) -> Result<(), String> {
     let mut pending = requested_setup_roots(cli, home).into_iter();
     let initial = pending.next();
     let mut fields = [
-        initial.as_ref().map(|root| root.scope.clone())
-            .or_else(|| cli.scopes.first().cloned()).unwrap_or_else(|| "personal".to_string()),
-        initial.as_ref().and_then(|root| root.project.clone())
-            .or_else(|| cli.projects.first().cloned()).unwrap_or_default(),
-        initial.as_ref().map(|root| root.path.to_string_lossy().into_owned()).unwrap_or_default(),
+        initial
+            .as_ref()
+            .map(|root| root.scope.clone())
+            .or_else(|| cli.scopes.first().cloned())
+            .unwrap_or_else(|| "personal".to_string()),
+        initial
+            .as_ref()
+            .and_then(|root| root.project.clone())
+            .or_else(|| cli.projects.first().cloned())
+            .unwrap_or_default(),
+        initial
+            .as_ref()
+            .map(|root| root.path.to_string_lossy().into_owned())
+            .unwrap_or_default(),
     ];
     let mut status = None;
     loop {
@@ -900,7 +1108,11 @@ fn run_setup_workspace(cli: &Cli, home: &Path) -> Result<(), String> {
             continue;
         }
         if let Some(next) = pending.next() {
-            fields = [next.scope, next.project.unwrap_or_default(), next.path.to_string_lossy().into_owned()];
+            fields = [
+                next.scope,
+                next.project.unwrap_or_default(),
+                next.path.to_string_lossy().into_owned(),
+            ];
             status = Some("Config root registered; review the next supplied root.".to_string());
         } else {
             return Ok(());
@@ -915,7 +1127,12 @@ fn run_tui_operation(cli: &Cli) -> Result<(), String> {
     }
     if matches!(cli.command, Command::Setup) {
         run_setup_workspace(cli, &home)?;
-        return run_hosts(cli, &home, &settings::load(&home)?, Some("Config root registered.".to_string()));
+        return run_hosts(
+            cli,
+            &home,
+            &settings::load(&home)?,
+            Some("Config root registered.".to_string()),
+        );
     }
     if matches!(cli.command, Command::Doctor) {
         return run_doctor_workspace(cli, &home);
@@ -926,9 +1143,13 @@ fn run_tui_operation(cli: &Cli) -> Result<(), String> {
     if matches!(cli.command, Command::TunnelList) {
         return run_tunnels_workspace(cli, &home, 0, None);
     }
-    if let Command::TunnelStatus(id) | Command::TunnelStop(id) | Command::TunnelRestart(id) = &cli.command {
+    if let Command::TunnelStatus(id) | Command::TunnelStop(id) | Command::TunnelRestart(id) =
+        &cli.command
+    {
         let tunnels = sshx::tunnel::list(&home, None)?.tunnels;
-        let selected = tunnels.iter().position(|tunnel| &tunnel.id == id)
+        let selected = tunnels
+            .iter()
+            .position(|tunnel| &tunnel.id == id)
             .ok_or_else(|| format!("TUNNEL_NOT_FOUND: no registered tunnel with ID `{id}`"))?;
         if let Some(route) = cli.tunnel_route {
             route.check(&tunnels[selected].kind)?;
@@ -938,8 +1159,12 @@ fn run_tui_operation(cli: &Cli) -> Result<(), String> {
             Command::TunnelStop(_) => 's',
             _ => 'r',
         };
-        let selected = tunnels[..selected].iter()
-            .filter(|tunnel| cli.tunnel_route.is_none_or(|route| tunnel.kind == route.as_str()))
+        let selected = tunnels[..selected]
+            .iter()
+            .filter(|tunnel| {
+                cli.tunnel_route
+                    .is_none_or(|route| tunnel.kind == route.as_str())
+            })
             .count();
         return run_tunnels_workspace(cli, &home, selected, Some((action, cli.tunnel_route)));
     }
@@ -951,13 +1176,18 @@ fn run_tui_operation(cli: &Cli) -> Result<(), String> {
         run_pairs_workspace(cli, &roots)?;
         return run_hosts(cli, &home, &roots, None);
     }
-    let mut catalog = discover_roots(&settings::discovery_roots(&roots))
-        .map_err(|error| error.to_string())?;
-    let filtered = catalog.entries.iter()
-        .filter(|entry| entry_matches_provenance(entry, cli)).collect::<Vec<_>>();
+    let mut catalog =
+        discover_roots(&settings::discovery_roots(&roots)).map_err(|error| error.to_string())?;
+    let filtered = catalog
+        .entries
+        .iter()
+        .filter(|entry| entry_matches_provenance(entry, cli))
+        .collect::<Vec<_>>();
     match &cli.command {
-        Command::Connect(selector) | Command::TunnelStart(selector)
-        | Command::TunnelDirectStart(selector) | Command::TunnelPairedStart(selector) => {
+        Command::Connect(selector)
+        | Command::TunnelStart(selector)
+        | Command::TunnelDirectStart(selector)
+        | Command::TunnelPairedStart(selector) => {
             let mode = if matches!(cli.command, Command::Connect(_)) {
                 picker::ConnectionMode::Session
             } else {
@@ -971,11 +1201,18 @@ fn run_tui_operation(cli: &Cli) -> Result<(), String> {
                 _ => "Tunnel HostEntry",
             };
             let initial = if selector.is_some() || cli.id.is_some() {
-                Some(select_connect_entry(&filtered, selector.as_deref(), cli, label)?)
+                Some(select_connect_entry(
+                    &filtered,
+                    selector.as_deref(),
+                    cli,
+                    label,
+                )?)
             } else {
                 None
             };
-            let mut use_password_fds = cli.password_fd.is_some() || cli.gateway_password_fd.is_some() || cli.vm_password_fd.is_some();
+            let mut use_password_fds = cli.password_fd.is_some()
+                || cli.gateway_password_fd.is_some()
+                || cli.vm_password_fd.is_some();
             let mut credential_gateway: Option<SourceIdentity> = None;
             let mut credential_gateway_bytes = None;
             if let Some(selected) = initial {
@@ -1000,8 +1237,15 @@ fn run_tui_operation(cli: &Cli) -> Result<(), String> {
                 if !cli.bind {
                     requested_forwards(target, cli)?;
                 }
-                if route.is_some() && (!cli.local_forwards.is_empty() || !cli.remote_forwards.is_empty() || !cli.dynamic_forwards.is_empty()) {
-                    return Err("PAIR_FORWARD_INVALID: Pair routes accept declared VM services only".to_string());
+                if route.is_some()
+                    && (!cli.local_forwards.is_empty()
+                        || !cli.remote_forwards.is_empty()
+                        || !cli.dynamic_forwards.is_empty())
+                {
+                    return Err(
+                        "PAIR_FORWARD_INVALID: Pair routes accept declared VM services only"
+                            .to_string(),
+                    );
                 }
             }
             let mut state = picker::HostsState::default();
@@ -1009,21 +1253,29 @@ fn run_tui_operation(cli: &Cli) -> Result<(), String> {
                 state.prefill(initial.entry, initial.alias, "");
             }
             let mut credential_source_bytes = if use_password_fds {
-                initial.map(|selection| std::fs::read(&selection.entry.source.path))
-                    .transpose().map_err(|error| error.to_string())?
+                initial
+                    .map(|selection| std::fs::read(&selection.entry.source.path))
+                    .transpose()
+                    .map_err(|error| error.to_string())?
             } else {
                 None
             };
-            let mut credential_entry = initial.filter(|_| use_password_fds)
+            let mut credential_entry = initial
+                .filter(|_| use_password_fds)
                 .map(|selection| selection.entry.source.clone());
             let mut completed = false;
             let mut status = None;
-            let mut standalone_credentials = sshx::connect::StandaloneCredentials::new(cli.password_fd);
+            let mut standalone_credentials =
+                sshx::connect::StandaloneCredentials::new(cli.password_fd);
             loop {
-                let filtered = catalog.entries.iter()
-                    .filter(|entry| entry_matches_provenance(entry, cli)).collect::<Vec<_>>();
+                let filtered = catalog
+                    .entries
+                    .iter()
+                    .filter(|entry| entry_matches_provenance(entry, cli))
+                    .collect::<Vec<_>>();
                 let sources = catalog_source_snapshots(&catalog);
-                let selected = match picker::select(&filtered, label, &mut state, status.as_deref()) {
+                let selected = match picker::select(&filtered, label, &mut state, status.as_deref())
+                {
                     Ok(selected) => selected,
                     Err(error) if error == picker::CANCELLED && completed => return Ok(()),
                     Err(error) => return Err(error),
@@ -1032,18 +1284,24 @@ fn run_tui_operation(cli: &Cli) -> Result<(), String> {
                 if use_password_fds {
                     let original = credential_entry.get_or_insert_with(|| source.clone());
                     if credential_source_bytes.is_none() {
-                        credential_source_bytes = sources.get(source.path.as_str()).and_then(Option::as_ref).cloned();
+                        credential_source_bytes = sources
+                            .get(source.path.as_str())
+                            .and_then(Option::as_ref)
+                            .cloned();
                     }
                     use_password_fds = original.path == source.path
-                        && original.byte_start == source.byte_start && original.byte_end == source.byte_end
-                        && sources.get(source.path.as_str()).and_then(Option::as_ref) == credential_source_bytes.as_ref();
+                        && original.byte_start == source.byte_start
+                        && original.byte_end == source.byte_end
+                        && sources.get(source.path.as_str()).and_then(Option::as_ref)
+                            == credential_source_bytes.as_ref();
                 }
                 if use_password_fds {
                     let route = sshx::pair::paired_route(&catalog.entries, selected.entry)?;
                     if let Some(original) = &credential_gateway {
                         use_password_fds = route.as_ref().is_some_and(|route| {
                             let gateway = &route.gateway.source;
-                            original.path == gateway.path && original.byte_start == gateway.byte_start
+                            original.path == gateway.path
+                                && original.byte_start == gateway.byte_start
                                 && original.byte_end == gateway.byte_end
                                 && credential_gateway_bytes.as_ref().is_none_or(|before| {
                                     std::fs::read(&gateway.path).is_ok_and(|bytes| bytes == *before)
@@ -1068,21 +1326,40 @@ fn run_tui_operation(cli: &Cli) -> Result<(), String> {
                     standalone_credentials = sshx::connect::StandaloneCredentials::new(None);
                 }
                 if !unchanged {
-                    status = Some("HOST_SOURCE_CHANGED: select the current HostEntry before continuing.".to_string());
-                } else if let Some(action) = cli.action.filter(|action| *action != HostAction::Connect) {
+                    status = Some(
+                        "HOST_SOURCE_CHANGED: select the current HostEntry before continuing."
+                            .to_string(),
+                    );
+                } else if let Some(action) =
+                    cli.action.filter(|action| *action != HostAction::Connect)
+                {
                     status = match run_host_action(action, &selected, &catalog.entries, cli) {
-                        Ok(()) => { completed = true; Some("Action complete.".to_string()) }
+                        Ok(()) => {
+                            completed = true;
+                            Some("Action complete.".to_string())
+                        }
                         Err(error) => Some(error),
                     };
                 } else {
                     status = match run_connection_workspace(
-                        cli, &catalog, selected, &home, mode, use_password_fds,
-                        &mut standalone_credentials, &sources, false,
+                        cli,
+                        &catalog,
+                        selected,
+                        &home,
+                        mode,
+                        use_password_fds,
+                        &mut standalone_credentials,
+                        &sources,
+                        false,
                     ) {
                         Ok(outcome) => {
                             completed |= outcome.completed;
                             if outcome.quit {
-                                return if completed { Ok(()) } else { Err(picker::CANCELLED.to_string()) };
+                                return if completed {
+                                    Ok(())
+                                } else {
+                                    Err(picker::CANCELLED.to_string())
+                                };
                             }
                             None
                         }
@@ -1113,17 +1390,30 @@ fn run_tui_operation(cli: &Cli) -> Result<(), String> {
         Command::Show(selector) => {
             let mut state = picker::HostsState::default();
             if selector.is_some() || cli.id.is_some() {
-                let selected = select_connect_entry(&filtered, selector.as_deref(), cli, "host show")?;
+                let selected =
+                    select_connect_entry(&filtered, selector.as_deref(), cli, "host show")?;
                 state.prefill(selected.entry, selected.alias, "");
             }
             let mut result = None;
             loop {
-                let filtered = catalog.entries.iter()
-                    .filter(|entry| entry_matches_provenance(entry, cli)).collect::<Vec<_>>();
+                let filtered = catalog
+                    .entries
+                    .iter()
+                    .filter(|entry| entry_matches_provenance(entry, cli))
+                    .collect::<Vec<_>>();
                 let sources = catalog_source_snapshots(&catalog);
-                let selection = picker::browse_hosts(&filtered, &catalog.entries, &mut state, result.as_deref())?;
+                let selection = picker::browse_hosts(
+                    &filtered,
+                    &catalog.entries,
+                    &mut state,
+                    result.as_deref(),
+                )?;
                 let Some(selected) = selection else {
-                    return if result.is_some() { Ok(()) } else { Err(picker::CANCELLED.to_string()) };
+                    return if result.is_some() {
+                        Ok(())
+                    } else {
+                        Err(picker::CANCELLED.to_string())
+                    };
                 };
                 let copy_password = std::mem::take(&mut state.copy_password);
                 if !entry_sources_unchanged(selected.entry, &sources) {
@@ -1132,10 +1422,17 @@ fn run_tui_operation(cli: &Cli) -> Result<(), String> {
                         selected.entry.source.path
                     ));
                 } else if copy_password {
-                    result = Some(match run_host_action(HostAction::CopyPassword, &selected, &catalog.entries, cli) {
-                        Ok(()) => "Password copied to clipboard.".to_string(),
-                        Err(error) => error,
-                    });
+                    result = Some(
+                        match run_host_action(
+                            HostAction::CopyPassword,
+                            &selected,
+                            &catalog.entries,
+                            cli,
+                        ) {
+                            Ok(()) => "Password copied to clipboard.".to_string(),
+                            Err(error) => error,
+                        },
+                    );
                 } else {
                     result = Some(format!("Host show:\n{}", render_human(&[selected.entry])));
                     state.prefill(selected.entry, selected.alias, "");
@@ -1159,10 +1456,15 @@ fn run_tui_operation(cli: &Cli) -> Result<(), String> {
 fn catalog_source_snapshots(catalog: &Catalog) -> HashMap<&str, Option<Vec<u8>>> {
     let mut sources = HashMap::new();
     for entry in &catalog.entries {
-        for path in std::iter::once(entry.source.path.as_str())
-            .chain(entry.provenance.iter().flat_map(|provenance| provenance.paths.iter().map(String::as_str)))
-        {
-            sources.entry(path).or_insert_with(|| std::fs::read(path).ok());
+        for path in std::iter::once(entry.source.path.as_str()).chain(
+            entry
+                .provenance
+                .iter()
+                .flat_map(|provenance| provenance.paths.iter().map(String::as_str)),
+        ) {
+            sources
+                .entry(path)
+                .or_insert_with(|| std::fs::read(path).ok());
         }
     }
     sources
@@ -1170,9 +1472,18 @@ fn catalog_source_snapshots(catalog: &Catalog) -> HashMap<&str, Option<Vec<u8>>>
 
 fn entry_sources_unchanged(entry: &HostEntry, sources: &HashMap<&str, Option<Vec<u8>>>) -> bool {
     std::iter::once(entry.source.path.as_str())
-        .chain(entry.provenance.iter().flat_map(|provenance| provenance.paths.iter().map(String::as_str)))
-        .all(|path| sources.get(path).and_then(Option::as_ref)
-            .is_some_and(|before| std::fs::read(path).is_ok_and(|after| after == *before)))
+        .chain(
+            entry
+                .provenance
+                .iter()
+                .flat_map(|provenance| provenance.paths.iter().map(String::as_str)),
+        )
+        .all(|path| {
+            sources
+                .get(path)
+                .and_then(Option::as_ref)
+                .is_some_and(|before| std::fs::read(path).is_ok_and(|after| after == *before))
+        })
 }
 
 struct ConnectionOutcome {
@@ -1193,11 +1504,20 @@ fn run_connection_workspace(
     sources: &HashMap<&str, Option<Vec<u8>>>,
     return_to_hosts: bool,
 ) -> Result<ConnectionOutcome, String> {
-    if catalog.diagnostics.iter().any(|diagnostic| diagnostic.code == "unsupported_match") {
+    if catalog
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "unsupported_match")
+    {
         return Err("UNSUPPORTED_MATCH: Match prevents exact runtime configuration".to_string());
     }
-    if cli.action.is_some_and(|action| action != HostAction::Connect) {
-        return Err("ACTION_TUI_UNAVAILABLE: use the complete CLI command for copy actions".to_string());
+    if cli
+        .action
+        .is_some_and(|action| action != HostAction::Connect)
+    {
+        return Err(
+            "ACTION_TUI_UNAVAILABLE: use the complete CLI command for copy actions".to_string(),
+        );
     }
     if cli.password_fd.is_some() && cli.vm_password_fd.is_some() {
         return Err("PASSWORD_FD_CONFLICT: use only one VM password descriptor".to_string());
@@ -1209,17 +1529,29 @@ fn run_connection_workspace(
     let alias = selected.alias;
     let route = sshx::pair::paired_route(&catalog.entries, entry)?;
     if !entry_sources_unchanged(entry, sources)
-        || route.as_ref().is_some_and(|route| !entry_sources_unchanged(&route.gateway, sources))
+        || route
+            .as_ref()
+            .is_some_and(|route| !entry_sources_unchanged(&route.gateway, sources))
     {
         return Err("HOST_SOURCE_CHANGED: selected HostEntry or Pair gateway changed; select current source again".to_string());
     }
     if matches!(cli.command, Command::TunnelDirectStart(_)) && route.is_some() {
-        return TunnelRoute::Direct.check("paired")
-            .map(|()| ConnectionOutcome { completed: false, quit: false, status: None });
+        return TunnelRoute::Direct
+            .check("paired")
+            .map(|()| ConnectionOutcome {
+                completed: false,
+                quit: false,
+                status: None,
+            });
     }
     if matches!(cli.command, Command::TunnelPairedStart(_)) && route.is_none() {
-        return TunnelRoute::Paired.check("direct")
-            .map(|()| ConnectionOutcome { completed: false, quit: false, status: None });
+        return TunnelRoute::Paired
+            .check("direct")
+            .map(|()| ConnectionOutcome {
+                completed: false,
+                quit: false,
+                status: None,
+            });
     }
     let target = route.as_ref().map_or(entry, |route| &route.vm);
     let mut forward_warning = None;
@@ -1236,18 +1568,33 @@ fn run_connection_workspace(
     } else {
         match requested_forwards(target, cli) {
             Ok(forwards) => forwards,
-            Err(error) if error.starts_with("FORWARD_NOT_FOUND:") || error.starts_with("FORWARD_AMBIGUOUS:") => {
-                forward_warning = Some(format!("{error}\nRequested: {}. Choose current declared services before review.", cli.forwards.join(", ")));
+            Err(error)
+                if error.starts_with("FORWARD_NOT_FOUND:")
+                    || error.starts_with("FORWARD_AMBIGUOUS:") =>
+            {
+                forward_warning = Some(format!(
+                    "{error}\nRequested: {}. Choose current declared services before review.",
+                    cli.forwards.join(", ")
+                ));
                 Vec::new()
             }
             Err(error) => return Err(error),
         }
     };
-    if route.is_some() && (!cli.local_forwards.is_empty() || !cli.remote_forwards.is_empty() || !cli.dynamic_forwards.is_empty()) {
-        return Err("PAIR_FORWARD_INVALID: Pair routes accept declared VM services only".to_string());
+    if route.is_some()
+        && (!cli.local_forwards.is_empty()
+            || !cli.remote_forwards.is_empty()
+            || !cli.dynamic_forwards.is_empty())
+    {
+        return Err(
+            "PAIR_FORWARD_INVALID: Pair routes accept declared VM services only".to_string(),
+        );
     }
     let custom = sshx::tunnel::parse_forwards(
-        &cli.local_forwards, &cli.remote_forwards, &cli.dynamic_forwards, cli.allow_bind,
+        &cli.local_forwards,
+        &cli.remote_forwards,
+        &cli.dynamic_forwards,
+        cli.allow_bind,
     )?;
     for forward in custom {
         let id = match forward.flag() {
@@ -1262,7 +1609,8 @@ fn run_connection_workspace(
             default_local_port: forward.local_port.unwrap_or(0),
         });
         preselected.push(sshx::session::ServiceForward {
-            id, remote_port: forward.remote_port.unwrap_or(0),
+            id,
+            remote_port: forward.remote_port.unwrap_or(0),
             destination_host: forward.remote_host.unwrap_or_default(),
             local_port: forward.local_port.unwrap_or(0),
         });
@@ -1270,34 +1618,55 @@ fn run_connection_workspace(
     let mut route_label = format!(
         "{} · {alias}\nSource: {}:{}\nEntry ID: {}",
         if route.is_some() { "Pair" } else { "Direct" },
-        entry.source.path, entry.source.line_start, entry.id,
+        entry.source.path,
+        entry.source.line_start,
+        entry.id,
     );
     if let Some(route) = &route {
         use std::fmt::Write;
         let _ = write!(
             route_label,
             "\nGateway: {} at {}:{} ({})\nVM: {alias} at {}:{} ({})",
-            route.gateway.aliases.join(", "), route.gateway.source.path,
-            route.gateway.source.line_start, route.gateway.id,
-            route.vm.source.path, route.vm.source.line_start, route.vm.id,
+            route.gateway.aliases.join(", "),
+            route.gateway.source.path,
+            route.gateway.source.line_start,
+            route.gateway.id,
+            route.vm.source.path,
+            route.vm.source.line_start,
+            route.vm.id,
         );
     }
     let mut restored = None;
     let mut status = forward_warning;
     let mut completed = false;
-    let mut paired_credentials = sshx::connect::PairedSessionCredentials::new(
-        sshx::connect::PairedCredentials {
+    let mut paired_credentials =
+        sshx::connect::PairedSessionCredentials::new(sshx::connect::PairedCredentials {
             gateway_password_fd: cli.gateway_password_fd.filter(|_| use_password_fds),
-            vm_password_fd: cli.vm_password_fd.or(cli.password_fd).filter(|_| use_password_fds),
-        },
-    );
+            vm_password_fd: cli
+                .vm_password_fd
+                .or(cli.password_fd)
+                .filter(|_| use_password_fds),
+        });
     loop {
         let choice = match picker::connection_workspace(
-            &route_label, route.is_some(), &services, &preselected,
-            restored.as_ref(), mode, status.as_deref(), cli.allow_bind, |forwards| {
+            &route_label,
+            route.is_some(),
+            &services,
+            &preselected,
+            restored.as_ref(),
+            mode,
+            status.as_deref(),
+            cli.allow_bind,
+            |forwards| {
                 if let Some(route) = &route {
                     return route.gateway.aliases.first().is_some_and(|gateway_alias| {
-                        sshx::tunnel::has_active_paired_request(route, home, gateway_alias, alias, forwards)
+                        sshx::tunnel::has_active_paired_request(
+                            route,
+                            home,
+                            gateway_alias,
+                            alias,
+                            forwards,
+                        )
                     });
                 }
                 let (declared, mut local, remote, dynamic) = split_selected_forwards(forwards);
@@ -1306,73 +1675,144 @@ fn run_connection_workspace(
                     sshx::session::write_local_forward_spec(&mut specification, forward);
                     local.push(specification);
                 }
-                sshx::tunnel::parse_forwards(&local, &remote, &dynamic, cli.allow_bind)
-                    .is_ok_and(|forwards| sshx::tunnel::has_active_direct_request(entry, home, alias, &forwards))
+                sshx::tunnel::parse_forwards(&local, &remote, &dynamic, cli.allow_bind).is_ok_and(
+                    |forwards| {
+                        sshx::tunnel::has_active_direct_request(entry, home, alias, &forwards)
+                    },
+                )
             },
         ) {
             Ok(choice) => choice,
-            Err(error) if error == picker::BACK => return Ok(ConnectionOutcome { completed, quit: false, status }),
-            Err(error) if error == picker::CANCELLED => return Ok(ConnectionOutcome { completed, quit: true, status }),
+            Err(error) if error == picker::BACK => {
+                return Ok(ConnectionOutcome {
+                    completed,
+                    quit: false,
+                    status,
+                });
+            }
+            Err(error) if error == picker::CANCELLED => {
+                return Ok(ConnectionOutcome {
+                    completed,
+                    quit: true,
+                    status,
+                });
+            }
             Err(error) => return Err(error),
         };
         if !entry_sources_unchanged(entry, sources)
-            || route.as_ref().is_some_and(|route| !entry_sources_unchanged(&route.gateway, sources))
+            || route
+                .as_ref()
+                .is_some_and(|route| !entry_sources_unchanged(&route.gateway, sources))
         {
             return Err("HOST_SOURCE_CHANGED: selected HostEntry or Pair gateway changed; select current source again".to_string());
         }
         let outcome = match (&route, choice.mode) {
             (Some(route), picker::ConnectionMode::Session) => {
-                let gateway_alias = route.gateway.aliases.first().ok_or_else(|| "PAIR_INVALID: gateway has no alias".to_string())?;
+                let gateway_alias = route
+                    .gateway
+                    .aliases
+                    .first()
+                    .ok_or_else(|| "PAIR_INVALID: gateway has no alias".to_string())?;
                 sshx::connect::open_paired_with_forwards(
-                    route, home, false, gateway_alias, alias,
+                    route,
+                    home,
+                    false,
+                    gateway_alias,
+                    alias,
                     &mut paired_credentials,
                     &choice.forwards,
                     true,
-                ).map(|()| "Session ended.".to_string())
+                )
+                .map(|()| "Session ended.".to_string())
             }
             (Some(route), picker::ConnectionMode::Tunnel) => {
-                let gateway_alias = route.gateway.aliases.first().ok_or_else(|| "PAIR_INVALID: gateway has no alias".to_string())?;
+                let gateway_alias = route
+                    .gateway
+                    .aliases
+                    .first()
+                    .ok_or_else(|| "PAIR_INVALID: gateway has no alias".to_string())?;
                 sshx::tunnel::start_paired(
-                    route, home, gateway_alias, alias, false,
+                    route,
+                    home,
+                    gateway_alias,
+                    alias,
+                    false,
                     sshx::connect::PairedCredentials {
                         gateway_password_fd: cli.gateway_password_fd.filter(|_| use_password_fds),
-                        vm_password_fd: cli.vm_password_fd.or(cli.password_fd).filter(|_| use_password_fds),
+                        vm_password_fd: cli
+                            .vm_password_fd
+                            .or(cli.password_fd)
+                            .filter(|_| use_password_fds),
                     },
                     &choice.forwards,
-                ).map(|response| format!("Tunnel started: {}", response.tunnels[0].id))
+                )
+                .map(|response| format!("Tunnel started: {}", response.tunnels[0].id))
             }
             (None, picker::ConnectionMode::Session) => {
                 let (declared, local, remote, dynamic) = split_selected_forwards(&choice.forwards);
                 sshx::tunnel::parse_forwards(&local, &remote, &dynamic, cli.allow_bind)
-                    .and_then(|direct| sshx::connect::open_with_password_fd_and_all_forwards(
-                        entry, home, false, alias, cli.password_fd.filter(|_| use_password_fds), &declared, &direct, true,
-                    ))
+                    .and_then(|direct| {
+                        sshx::connect::open_with_password_fd_and_all_forwards(
+                            entry,
+                            home,
+                            false,
+                            alias,
+                            cli.password_fd.filter(|_| use_password_fds),
+                            &declared,
+                            &direct,
+                            true,
+                        )
+                    })
                     .map(|()| "Session ended.".to_string())
             }
             (None, picker::ConnectionMode::Tunnel) => {
-                let (declared, mut local, remote, dynamic) = split_selected_forwards(&choice.forwards);
+                let (declared, mut local, remote, dynamic) =
+                    split_selected_forwards(&choice.forwards);
                 for forward in &declared {
                     let mut specification = String::new();
                     sshx::session::write_local_forward_spec(&mut specification, forward);
                     local.push(specification);
                 }
-                sshx::tunnel::start(entry, home, alias, false, standalone_credentials, &local, &remote, &dynamic, cli.allow_bind)
-                    .map(|response| format!("Tunnel started: {}", response.tunnels[0].id))
+                sshx::tunnel::start(
+                    entry,
+                    home,
+                    alias,
+                    false,
+                    standalone_credentials,
+                    &local,
+                    &remote,
+                    &dynamic,
+                    cli.allow_bind,
+                )
+                .map(|response| format!("Tunnel started: {}", response.tunnels[0].id))
             }
         };
-        let operation_completed = outcome.is_ok() || outcome.as_ref().is_err_and(|error| {
-            error.starts_with("SESSION_EXIT:") || error.starts_with("VM_SESSION_EXIT:")
-        });
+        let operation_completed = outcome.is_ok()
+            || outcome.as_ref().is_err_and(|error| {
+                error.starts_with("SESSION_EXIT:") || error.starts_with("VM_SESSION_EXIT:")
+            });
         completed |= operation_completed;
         status = Some(outcome.unwrap_or_else(|error| error));
-        if return_to_hosts && choice.mode == picker::ConnectionMode::Session && operation_completed {
-            return Ok(ConnectionOutcome { completed, quit: false, status });
+        if return_to_hosts && choice.mode == picker::ConnectionMode::Session && operation_completed
+        {
+            return Ok(ConnectionOutcome {
+                completed,
+                quit: false,
+                status,
+            });
         }
         restored = Some(choice);
     }
 }
 
-fn split_selected_forwards(forwards: &[sshx::session::ServiceForward]) -> (Vec<sshx::session::ServiceForward>, Vec<String>, Vec<String>, Vec<String>) {
+fn split_selected_forwards(
+    forwards: &[sshx::session::ServiceForward],
+) -> (
+    Vec<sshx::session::ServiceForward>,
+    Vec<String>,
+    Vec<String>,
+    Vec<String>,
+) {
     let mut declared = Vec::new();
     let mut local = Vec::new();
     let mut remote = Vec::new();
@@ -1427,8 +1867,11 @@ fn requested_forwards(
     cli: &Cli,
 ) -> Result<Vec<sshx::session::ServiceForward>, String> {
     if cli.bind
-        && (cli.no_input || cli.format.is_machine() || cli.password_stdin
-            || !io::stdin().is_terminal() || !io::stderr().is_terminal())
+        && (cli.no_input
+            || cli.format.is_machine()
+            || cli.password_stdin
+            || !io::stdin().is_terminal()
+            || !io::stderr().is_terminal())
     {
         return Err(
             "FORWARD_INTERACTIVE_REQUIRED: --bind requires usable stdin and stderr terminals without --no-input, piped input, or machine output".to_string(),
@@ -1453,33 +1896,56 @@ fn validate_cli_without_catalog(cli: &Cli) -> Result<(), String> {
     if cli.password_fd.is_some() && cli.vm_password_fd.is_some() {
         return Err("PASSWORD_FD_CONFLICT: use only one VM password descriptor".to_string());
     }
-    if cli.bind || !cli.forwards.is_empty() || !cli.local_forwards.is_empty()
-        || !cli.remote_forwards.is_empty() || !cli.dynamic_forwards.is_empty()
+    if (cli.bind
+        || !cli.forwards.is_empty()
+        || !cli.local_forwards.is_empty()
+        || !cli.remote_forwards.is_empty()
+        || !cli.dynamic_forwards.is_empty())
+        && !matches!(
+            cli.command,
+            Command::Connect(_)
+                | Command::TunnelStart(_)
+                | Command::TunnelDirectStart(_)
+                | Command::TunnelPairedStart(_)
+        )
     {
-        if !matches!(cli.command, Command::Connect(_) | Command::TunnelStart(_)
-            | Command::TunnelDirectStart(_) | Command::TunnelPairedStart(_))
-        {
-            return Err("FORWARD_COMMAND_REQUIRED: forwarding options require Connect or Tunnel".to_string());
-        }
+        return Err(
+            "FORWARD_COMMAND_REQUIRED: forwarding options require Connect or Tunnel".to_string(),
+        );
     }
     sshx::session::validate_forward_specifications(&cli.forwards)?;
-    sshx::tunnel::parse_forwards(&cli.local_forwards, &cli.remote_forwards, &cli.dynamic_forwards, cli.allow_bind)?;
+    sshx::tunnel::parse_forwards(
+        &cli.local_forwards,
+        &cli.remote_forwards,
+        &cli.dynamic_forwards,
+        cli.allow_bind,
+    )?;
     let selector = match &cli.command {
-        Command::Connect(selector) | Command::Show(selector) | Command::TunnelStart(selector)
-        | Command::TunnelDirectStart(selector) | Command::TunnelPairedStart(selector) => selector.as_deref(),
+        Command::Connect(selector)
+        | Command::Show(selector)
+        | Command::TunnelStart(selector)
+        | Command::TunnelDirectStart(selector)
+        | Command::TunnelPairedStart(selector) => selector.as_deref(),
         Command::Hosts { .. } => {
             if cli.location.source.is_some() != cli.location.line.is_some() {
-                return Err("SELECTOR_INCOMPLETE: --source and --line must be provided together".to_string());
+                return Err(
+                    "SELECTOR_INCOMPLETE: --source and --line must be provided together"
+                        .to_string(),
+                );
             }
             return Ok(());
         }
         _ => return Ok(()),
     };
     if cli.location.source.is_some() != cli.location.line.is_some() {
-        return Err("SELECTOR_INCOMPLETE: --source and --line must be provided together".to_string());
+        return Err(
+            "SELECTOR_INCOMPLETE: --source and --line must be provided together".to_string(),
+        );
     }
     if selector.is_none() && cli.id.is_none() && cli.location.source.is_some() {
-        return Err("SELECTOR_INCOMPLETE: alias or ID is required with --source and --line".to_string());
+        return Err(
+            "SELECTOR_INCOMPLETE: alias or ID is required with --source and --line".to_string(),
+        );
     }
     Ok(())
 }
@@ -1525,8 +1991,11 @@ fn run_pair(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), String> {
     let pending = mutation::pending_pair_journals(&journal_paths);
     let catalog = if !pending.is_empty() && matches!(cli.command, Command::PairSetup { .. }) {
         let targets = mutation::pair_recovery_targets(&pending)?;
-        if cli.no_input || cli.format.is_machine() || cli.password_stdin
-            || !io::stdin().is_terminal() || !io::stderr().is_terminal()
+        if cli.no_input
+            || cli.format.is_machine()
+            || cli.password_stdin
+            || !io::stdin().is_terminal()
+            || !io::stderr().is_terminal()
         {
             return Err("PAIR_RECOVERY_REVIEW_REQUIRED: review pending Pair mutation targets in an interactive terminal before setup".to_string());
         }
@@ -1535,7 +2004,9 @@ fn run_pair(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), String> {
             eprintln!("  {}", path.display());
         }
         if !prompt_yes("Recover pending Pair mutation before setup? [y/N]: ")? {
-            return Err("PAIR_RECOVERY_DECLINED: pending Pair mutation was not recovered".to_string());
+            return Err(
+                "PAIR_RECOVERY_DECLINED: pending Pair mutation was not recovered".to_string(),
+            );
         }
         mutation::recover_pair_journals(&journal_paths, &targets)?;
         discover_roots(&configured).map_err(|error| error.to_string())?
@@ -1556,29 +2027,55 @@ fn run_pair(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), String> {
             Ok(())
         }
         Command::PairSetup { gateway, vm } => {
-            let entries = catalog.entries.iter()
-                .filter(|entry| entry_matches_provenance(entry, cli)).collect::<Vec<_>>();
+            let entries = catalog
+                .entries
+                .iter()
+                .filter(|entry| entry_matches_provenance(entry, cli))
+                .collect::<Vec<_>>();
             let gateway = select_pair_entry(
-                &entries, gateway.as_deref(),
-                cli.gateway_location.source.as_ref().or(cli.location.source.as_ref()),
-                cli.gateway_location.line.or(cli.location.line), "gateway",
+                &entries,
+                gateway.as_deref(),
+                cli.gateway_location
+                    .source
+                    .as_ref()
+                    .or(cli.location.source.as_ref()),
+                cli.gateway_location.line.or(cli.location.line),
+                "gateway",
             )?;
             let vm = select_pair_entry(
-                &entries, vm.as_deref(), cli.vm_location.source.as_ref(),
-                cli.vm_location.line, "VM",
+                &entries,
+                vm.as_deref(),
+                cli.vm_location.source.as_ref(),
+                cli.vm_location.line,
+                "VM",
             )?;
-            let interactive = !cli.no_input && !cli.format.is_machine() && !cli.password_stdin
-                && io::stdin().is_terminal() && io::stderr().is_terminal();
-            let plan = if !cli.tui && let (Some(gateway), Some(vm)) = (&gateway, &vm) {
+            let interactive = !cli.no_input
+                && !cli.format.is_machine()
+                && !cli.password_stdin
+                && io::stdin().is_terminal()
+                && io::stderr().is_terminal();
+            let plan = if !cli.tui
+                && let (Some(gateway), Some(vm)) = (&gateway, &vm)
+            {
                 mutation::validate_entry_paths(gateway.entry)?;
                 mutation::validate_entry_paths(vm.entry)?;
                 match sshx::pair::plan_setup(
-                    &catalog.entries, gateway.entry, vm.entry, gateway.alias, vm.alias,
-                    cli.transit_host.as_deref(), cli.transit_port,
+                    &catalog.entries,
+                    gateway.entry,
+                    vm.entry,
+                    gateway.alias,
+                    vm.alias,
+                    cli.transit_host.as_deref(),
+                    cli.transit_port,
                 ) {
                     Ok(plan) => Some(plan),
-                    Err(error) if interactive && (error.starts_with("TRANSIT_REQUIRED:")
-                        || error.starts_with("TRANSIT_INCOMPLETE:")) => None,
+                    Err(error)
+                        if interactive
+                            && (error.starts_with("TRANSIT_REQUIRED:")
+                                || error.starts_with("TRANSIT_INCOMPLETE:")) =>
+                    {
+                        None
+                    }
                     Err(error) => return Err(error),
                 }
             } else {
@@ -1591,7 +2088,10 @@ fn run_pair(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), String> {
                 }
                 if !cli.yes {
                     if !interactive {
-                        return Err("CONSENT_REQUIRED: non-interactive pair setup requires --yes".to_string());
+                        return Err(
+                            "CONSENT_REQUIRED: non-interactive pair setup requires --yes"
+                                .to_string(),
+                        );
                     }
                     eprint!("{}", render_pair(&plan, OutputFormat::Human, false)?);
                     if !prompt_yes("Apply changes? [y/N]: ")? {
@@ -1618,64 +2118,118 @@ fn run_pair(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), String> {
 }
 
 fn run_pair_setup_workspace(
-    cli: &Cli, catalog: &[HostEntry], entries: &[&HostEntry], paths: &[PathBuf],
-    gateway: Option<picker::Selection<'_>>, vm: Option<picker::Selection<'_>>,
+    cli: &Cli,
+    catalog: &[HostEntry],
+    entries: &[&HostEntry],
+    paths: &[PathBuf],
+    gateway: Option<picker::Selection<'_>>,
+    vm: Option<picker::Selection<'_>>,
 ) -> Result<(), String> {
     let selected_index = |selection: picker::Selection<'_>| {
-        entries.iter().position(|entry| std::ptr::eq(*entry, selection.entry))
-            .map(|index| (index, selection.entry.aliases.iter()
-                .position(|alias| alias == selection.alias).unwrap_or(0)))
+        entries
+            .iter()
+            .position(|entry| std::ptr::eq(*entry, selection.entry))
+            .map(|index| {
+                (
+                    index,
+                    selection
+                        .entry
+                        .aliases
+                        .iter()
+                        .position(|alias| alias == selection.alias)
+                        .unwrap_or(0),
+                )
+            })
     };
     let draft = picker::PairSetupDraft {
         gateway: gateway.and_then(selected_index),
         vm: vm.and_then(selected_index),
         transit_host: cli.transit_host.clone().unwrap_or_default(),
-        transit_port: cli.transit_port.map_or_else(String::new, |port| port.to_string()),
+        transit_port: cli
+            .transit_port
+            .map_or_else(String::new, |port| port.to_string()),
     };
-    let snapshots = paths.iter().map(|path| {
-        std::fs::read(path).map(|bytes| (path, bytes)).map_err(|error| error.to_string())
-    }).collect::<Result<Vec<_>, _>>()?;
+    let snapshots = paths
+        .iter()
+        .map(|path| {
+            std::fs::read(path)
+                .map(|bytes| (path, bytes))
+                .map_err(|error| error.to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let mut pending = None;
     let completed = picker::pair_setup_workspace(entries, draft, cli.preview, |draft, action| {
         for (path, before) in &snapshots {
             if !std::fs::read(path).is_ok_and(|after| after == *before) {
                 pending = None;
-                return Err(format!("HOST_SOURCE_CHANGED: {} changed; reopen Pair setup with current sources", path.display()));
+                return Err(format!(
+                    "HOST_SOURCE_CHANGED: {} changed; reopen Pair setup with current sources",
+                    path.display()
+                ));
             }
         }
         if action == picker::PairSetupAction::Apply {
-            let plan = pending.take().ok_or_else(|| "PAIR_REVIEW_REQUIRED: review current Pair changes before applying".to_string())?;
+            let plan = pending.take().ok_or_else(|| {
+                "PAIR_REVIEW_REQUIRED: review current Pair changes before applying".to_string()
+            })?;
             mutation::apply_pair(&plan)?;
-            return Ok(format!("Pair saved.\n{}", render_pair(&plan, OutputFormat::Human, true)?));
+            return Ok(format!(
+                "Pair saved.\n{}",
+                render_pair(&plan, OutputFormat::Human, true)?
+            ));
         }
         pending = None;
         let choice = |selected: Option<(usize, usize)>, role: &str| {
-            selected.and_then(|(entry, alias)| entries.get(entry)
-                .and_then(|entry| entry.aliases.get(alias).map(|alias| (*entry, alias.as_str()))))
-                .ok_or_else(|| format!("{}_REQUIRED: choose an exact {role} HostEntry", role.to_ascii_uppercase()))
+            selected
+                .and_then(|(entry, alias)| {
+                    entries.get(entry).and_then(|entry| {
+                        entry
+                            .aliases
+                            .get(alias)
+                            .map(|alias| (*entry, alias.as_str()))
+                    })
+                })
+                .ok_or_else(|| {
+                    format!(
+                        "{}_REQUIRED: choose an exact {role} HostEntry",
+                        role.to_ascii_uppercase()
+                    )
+                })
         };
         let (gateway, gateway_alias) = choice(draft.gateway, "gateway")?;
         let (vm, vm_alias) = choice(draft.vm, "VM")?;
         mutation::validate_entry_paths(gateway)?;
         mutation::validate_entry_paths(vm)?;
         let host = (!draft.transit_host.trim().is_empty()).then(|| draft.transit_host.trim());
-        let port = if draft.transit_port.trim().is_empty() { None } else {
-            Some(draft.transit_port.trim().parse::<u16>()
-                .map_err(|_| "PORT_INVALID: transit port must be a number from 1 to 65535".to_string())?)
+        let port = if draft.transit_port.trim().is_empty() {
+            None
+        } else {
+            Some(draft.transit_port.trim().parse::<u16>().map_err(|_| {
+                "PORT_INVALID: transit port must be a number from 1 to 65535".to_string()
+            })?)
         };
-        let plan = sshx::pair::plan_setup(
-            catalog, gateway, vm, gateway_alias, vm_alias, host, port,
-        )?;
+        let plan =
+            sshx::pair::plan_setup(catalog, gateway, vm, gateway_alias, vm_alias, host, port)?;
         let review = format!(
             "Gateway: {gateway_alias} ({})\nSource: {}:{}\nVM: {vm_alias} ({})\nSource: {}:{}\nTransit: {}:{}\n{}",
-            gateway.id, gateway.source.path, gateway.source.line_start,
-            vm.id, vm.source.path, vm.source.line_start, plan.transit_host, plan.transit_port,
+            gateway.id,
+            gateway.source.path,
+            gateway.source.line_start,
+            vm.id,
+            vm.source.path,
+            vm.source.line_start,
+            plan.transit_host,
+            plan.transit_port,
             render_pair(&plan, OutputFormat::Human, false)?,
         );
         pending = Some(plan);
         Ok(review)
     })?;
-    if completed { Ok(()) } else { Err(picker::CANCELLED.to_string()) }
+    if completed {
+        Ok(())
+    } else {
+        Err(picker::CANCELLED.to_string())
+    }
 }
 
 fn select_pair_entry<'a>(
@@ -1723,9 +2277,12 @@ fn select_pair_entry<'a>(
         .collect::<Vec<_>>();
     match matches.as_slice() {
         [entry] => {
-            let alias = selector.filter(|_| !id_match)
+            let alias = selector
+                .filter(|_| !id_match)
                 .and_then(|selector| entry.aliases.iter().find(|alias| alias == &selector))
-                .or_else(|| entry.aliases.first()).map(String::as_str).unwrap_or_default();
+                .or_else(|| entry.aliases.first())
+                .map(String::as_str)
+                .unwrap_or_default();
             Ok(Some(picker::Selection { entry, alias }))
         }
         [] if source.is_some() => Err(format!(
@@ -1763,12 +2320,19 @@ fn run_host_create(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), String> {
         && io::stderr().is_terminal()
         && !cli.password_stdin;
     if matches!(cli.command, Command::TuiCreateHost) && !interactive {
-        return Err("HOST_CREATE_REQUIRED: tui host create requires usable stdin and stderr terminals".to_string());
+        return Err(
+            "HOST_CREATE_REQUIRED: tui host create requires usable stdin and stderr terminals"
+                .to_string(),
+        );
     }
     let candidates = roots
         .iter()
         .filter(|root| cli.scopes.first().is_none_or(|scope| root.scope == *scope))
-        .filter(|root| cli.projects.first().is_none_or(|project| root.project.as_ref() == Some(project)))
+        .filter(|root| {
+            cli.projects
+                .first()
+                .is_none_or(|project| root.project.as_ref() == Some(project))
+        })
         .collect::<Vec<_>>();
     let incomplete = cli.scopes.is_empty()
         || cli.file.is_none()
@@ -1778,12 +2342,17 @@ fn run_host_create(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), String> {
     if interactive && (incomplete || matches!(cli.command, Command::TuiCreateHost)) {
         return run_host_create_workspace(cli, roots);
     }
-    let scope = cli.scopes.first().ok_or_else(|| {
-        "SCOPE_REQUIRED: provide --scope in non-interactive mode".to_string()
-    })?;
+    let scope = cli
+        .scopes
+        .first()
+        .ok_or_else(|| "SCOPE_REQUIRED: provide --scope in non-interactive mode".to_string())?;
     let root = match candidates.as_slice() {
         [root] => *root,
-        [] => return Err(format!("ROOT_NOT_FOUND: no registered root matches scope `{scope}`")),
+        [] => {
+            return Err(format!(
+                "ROOT_NOT_FOUND: no registered root matches scope `{scope}`"
+            ));
+        }
         _ => return Err("ROOT_AMBIGUOUS: provide --project or one registered root".to_string()),
     };
     let root_parent = root.path.parent().unwrap_or(Path::new("."));
@@ -1792,13 +2361,24 @@ fn run_host_create(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), String> {
         |path| resolve_relative_path(&path.to_string_lossy(), root_parent),
     );
     let target = resolve_relative_path(
-        &cli.file.as_ref().ok_or_else(|| "FILE_REQUIRED: provide --file in non-interactive mode".to_string())?.to_string_lossy(),
+        &cli.file
+            .as_ref()
+            .ok_or_else(|| "FILE_REQUIRED: provide --file in non-interactive mode".to_string())?
+            .to_string_lossy(),
         &folder,
     );
     let alias = required_create_value(cli.alias.as_deref(), "Alias")?;
     let hostname = required_create_value(cli.hostname.as_deref(), "Hostname")?;
     let password = create_password(cli)?;
-    let request = CreateRequest::new(root.path.clone(), target, alias, hostname, cli.user.clone(), cli.port, password);
+    let request = CreateRequest::new(
+        root.path.clone(),
+        target,
+        alias,
+        hostname,
+        cli.user.clone(),
+        cli.port,
+        password,
+    );
     let plan = mutation::plan_create(&request)?;
     if cli.preview {
         print!("{}", render_create(&plan, cli.format, false)?);
@@ -1819,20 +2399,44 @@ fn run_host_create(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), String> {
 }
 
 fn run_host_create_workspace(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), String> {
-    let matching = roots.iter().filter(|root| {
-        cli.scopes.first().is_none_or(|scope| root.scope == *scope)
-            && cli.projects.first().is_none_or(|project| root.project.as_ref() == Some(project))
-    }).collect::<Vec<_>>();
-    let selected_root = if matching.len() == 1 { Some(matching[0]) } else { None };
+    let matching = roots
+        .iter()
+        .filter(|root| {
+            cli.scopes.first().is_none_or(|scope| root.scope == *scope)
+                && cli
+                    .projects
+                    .first()
+                    .is_none_or(|project| root.project.as_ref() == Some(project))
+        })
+        .collect::<Vec<_>>();
+    let selected_root = if matching.len() == 1 {
+        Some(matching[0])
+    } else {
+        None
+    };
     let mut fields = [
         selected_root.map_or_else(String::new, |root| root.path.to_string_lossy().into_owned()),
-        cli.scopes.first().cloned().or_else(|| selected_root.map(|root| root.scope.clone())).unwrap_or_default(),
-        cli.projects.first().cloned().or_else(|| selected_root.and_then(|root| root.project.clone())).unwrap_or_default(),
+        cli.scopes
+            .first()
+            .cloned()
+            .or_else(|| selected_root.map(|root| root.scope.clone()))
+            .unwrap_or_default(),
+        cli.projects
+            .first()
+            .cloned()
+            .or_else(|| selected_root.and_then(|root| root.project.clone()))
+            .unwrap_or_default(),
         cli.folder.as_ref().map_or_else(
-            || selected_root.and_then(|root| root.path.parent()).map_or_else(String::new, |path| path.to_string_lossy().into_owned()),
+            || {
+                selected_root
+                    .and_then(|root| root.path.parent())
+                    .map_or_else(String::new, |path| path.to_string_lossy().into_owned())
+            },
             |path| path.to_string_lossy().into_owned(),
         ),
-        cli.file.as_ref().map_or_else(String::new, |path| path.to_string_lossy().into_owned()),
+        cli.file
+            .as_ref()
+            .map_or_else(String::new, |path| path.to_string_lossy().into_owned()),
         cli.alias.clone().unwrap_or_default(),
         cli.hostname.clone().unwrap_or_default(),
         cli.user.clone().unwrap_or_default(),
@@ -1843,7 +2447,12 @@ fn run_host_create_workspace(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), 
     let mut status = None::<String>;
     loop {
         let (edited, selected, action) = picker::host_create_workspace(
-            fields, roots, focus, status.as_deref(), None, cli.preview
+            fields,
+            roots,
+            focus,
+            status.as_deref(),
+            None,
+            cli.preview,
         )?;
         fields = edited;
         focus = Some(selected);
@@ -1855,24 +2464,40 @@ fn run_host_create_workspace(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), 
             let root = if root_input.is_empty() {
                 return Err("CONFIG_ROOT_REQUIRED: select a registered config root".to_string());
             } else {
-                let matches = roots.iter().filter(|root| {
-                    root.path.to_string_lossy() == root_input
-                        || root.path.file_name().is_some_and(|name| name == root_input)
-                }).collect::<Vec<_>>();
+                let matches = roots
+                    .iter()
+                    .filter(|root| {
+                        root.path.to_string_lossy() == root_input
+                            || root.path.file_name().is_some_and(|name| name == root_input)
+                    })
+                    .collect::<Vec<_>>();
                 match matches.as_slice() {
                     [root] => *root,
-                    [] => return Err("ROOT_NOT_FOUND: select an existing registered config root".to_string()),
-                    _ => return Err("CONFIG_ROOT_AMBIGUOUS: enter the full config root path".to_string()),
+                    [] => {
+                        return Err(
+                            "ROOT_NOT_FOUND: select an existing registered config root".to_string()
+                        );
+                    }
+                    _ => {
+                        return Err(
+                            "CONFIG_ROOT_AMBIGUOUS: enter the full config root path".to_string()
+                        );
+                    }
                 }
             };
             if fields[1].trim().is_empty() {
                 return Err("SCOPE_REQUIRED: select the config root scope".to_string());
             }
             if fields[1].trim() != root.scope {
-                return Err("SCOPE_ROOT_CONFLICT: scope does not match selected config root".to_string());
+                return Err(
+                    "SCOPE_ROOT_CONFLICT: scope does not match selected config root".to_string(),
+                );
             }
             if fields[2].trim() != root.project.as_deref().unwrap_or("") {
-                return Err("PROJECT_ROOT_CONFLICT: project does not match selected config root".to_string());
+                return Err(
+                    "PROJECT_ROOT_CONFLICT: project does not match selected config root"
+                        .to_string(),
+                );
             }
             if fields[4].trim().is_empty() {
                 return Err("FILE_REQUIRED: enter a destination file".to_string());
@@ -1886,13 +2511,22 @@ fn run_host_create_workspace(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), 
             let port = if fields[8].trim().is_empty() {
                 None
             } else {
-                Some(fields[8].trim().parse::<u16>().ok().filter(|port| *port != 0)
-                    .ok_or_else(|| "PORT_INVALID: enter a port from 1 to 65535".to_string())?)
+                Some(
+                    fields[8]
+                        .trim()
+                        .parse::<u16>()
+                        .ok()
+                        .filter(|port| *port != 0)
+                        .ok_or_else(|| "PORT_INVALID: enter a port from 1 to 65535".to_string())?,
+                )
             };
             let folder = if fields[3].trim().is_empty() {
                 root.path.parent().unwrap_or(Path::new(".")).to_path_buf()
             } else {
-                resolve_relative_path(fields[3].trim(), root.path.parent().unwrap_or(Path::new(".")))
+                resolve_relative_path(
+                    fields[3].trim(),
+                    root.path.parent().unwrap_or(Path::new(".")),
+                )
             };
             let request = CreateRequest::new(
                 root.path.clone(),
@@ -1910,7 +2544,12 @@ fn run_host_create_workspace(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), 
             Ok(plan) => {
                 let review = render_create(&plan, OutputFormat::Human, false)?;
                 let (edited, selected, action) = picker::host_create_workspace(
-                    fields, roots, focus, None, Some(&review), cli.preview
+                    fields,
+                    roots,
+                    focus,
+                    None,
+                    Some(&review),
+                    cli.preview,
                 )?;
                 fields = edited;
                 focus = Some(selected);
@@ -1919,15 +2558,13 @@ fn run_host_create_workspace(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), 
                         print!("{review}");
                         return Ok(());
                     }
-                    picker::HostCreateAction::Apply => {
-                        match mutation::apply(&plan) {
-                            Ok(()) => {
-                                print!("{}", render_create(&plan, cli.format, true)?);
-                                return Ok(());
-                            }
-                            Err(error) => status = Some(error),
+                    picker::HostCreateAction::Apply => match mutation::apply(&plan) {
+                        Ok(()) => {
+                            print!("{}", render_create(&plan, cli.format, true)?);
+                            return Ok(());
                         }
-                    }
+                        Err(error) => status = Some(error),
+                    },
                     picker::HostCreateAction::Edit => status = None,
                     picker::HostCreateAction::Submit => {}
                 }
@@ -1980,30 +2617,63 @@ fn run_host_edit(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), String> {
         return Err("MUTATION_CONFLICT: cannot set and clear one field together".to_string());
     }
     let mut request = UpdateRequest {
-        path: PathBuf::new(), expected_id: String::new(), selected_alias: String::new(),
-        byte_start: 0, byte_end: 0, alias: cli.alias.clone(), hostname: cli.hostname.clone(),
-        user: cli.user.clone(), port: cli.port, password: None, clear_user: cli.clear_user,
-        clear_port: cli.clear_port, clear_password: cli.clear_password,
+        path: PathBuf::new(),
+        expected_id: String::new(),
+        selected_alias: String::new(),
+        byte_start: 0,
+        byte_end: 0,
+        alias: cli.alias.clone(),
+        hostname: cli.hostname.clone(),
+        user: cli.user.clone(),
+        port: cli.port,
+        password: None,
+        clear_user: cli.clear_user,
+        clear_port: cli.clear_port,
+        clear_password: cli.clear_password,
     };
-    if request.alias.is_some() || request.hostname.is_some() || request.user.is_some()
-        || request.port.is_some() || request.clear_user || request.clear_port || request.clear_password
+    if request.alias.is_some()
+        || request.hostname.is_some()
+        || request.user.is_some()
+        || request.port.is_some()
+        || request.clear_user
+        || request.clear_port
+        || request.clear_password
     {
         mutation::validate_update_request(&request)?;
     }
     let incomplete = positional.is_none() && cli.id.is_none()
-        || operation != MutationKind::Delete && cli.alias.is_none() && cli.hostname.is_none()
-            && cli.user.is_none() && cli.port.is_none() && !cli.password_stdin
-            && !cli.clear_user && !cli.clear_port && !cli.clear_password;
+        || operation != MutationKind::Delete
+            && cli.alias.is_none()
+            && cli.hostname.is_none()
+            && cli.user.is_none()
+            && cli.port.is_none()
+            && !cli.password_stdin
+            && !cli.clear_user
+            && !cli.clear_port
+            && !cli.clear_password;
     let workspace = cli.tui
-        || incomplete && !cli.no_input && !cli.format.is_machine() && !cli.password_stdin
-            && io::stdin().is_terminal() && io::stderr().is_terminal();
+        || incomplete
+            && !cli.no_input
+            && !cli.format.is_machine()
+            && !cli.password_stdin
+            && io::stdin().is_terminal()
+            && io::stderr().is_terminal();
     let exact_selection = if cli.tui && (positional.is_some() || cli.id.is_some()) {
-        Some(select_mutation_entry(&filtered, positional, cli, "host edit")?)
+        Some(select_mutation_entry(
+            &filtered,
+            positional,
+            cli,
+            "host edit",
+        )?)
     } else {
         None
     };
-    if cli.tui && (cli.no_input || cli.format.is_machine() || cli.password_stdin
-        || !io::stdin().is_terminal() || !io::stderr().is_terminal())
+    if cli.tui
+        && (cli.no_input
+            || cli.format.is_machine()
+            || cli.password_stdin
+            || !io::stdin().is_terminal()
+            || !io::stderr().is_terminal())
     {
         return Err("TUI_REQUIRED: host editing requires usable stdin and stderr terminals without --no-input, password stdin, or machine output".to_string());
     }
@@ -2038,7 +2708,14 @@ fn run_host_edit(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), String> {
             "HOST_SOURCE_CHANGED: selected source is unavailable; select its current HostEntry again".to_string()
         })?;
         return if operation == MutationKind::Delete {
-            run_host_delete_workspace(cli, &home_dir()?, &configured, entry, selected_alias, before)
+            run_host_delete_workspace(
+                cli,
+                &home_dir()?,
+                &configured,
+                entry,
+                selected_alias,
+                before,
+            )
         } else {
             run_host_edit_workspace(cli, entry, selected_alias, operation, before)
         };
@@ -2092,7 +2769,12 @@ fn run_host_edit(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), String> {
     Ok(())
 }
 fn run_host_delete_workspace(
-    cli: &Cli, home: &Path, roots: &[DiscoveryRoot], entry: &HostEntry, alias: &str, before: &[u8],
+    cli: &Cli,
+    home: &Path,
+    roots: &[DiscoveryRoot],
+    entry: &HostEntry,
+    alias: &str,
+    before: &[u8],
 ) -> Result<(), String> {
     let current_catalog = || {
         mutation::validate_mutation_roots(roots)?;
@@ -2107,26 +2789,43 @@ fn run_host_delete_workspace(
     };
     let catalog = current_catalog()?;
     let plan = mutation::plan_delete(
-        Path::new(&entry.source.path), &entry.id, alias,
-        entry.source.byte_start, entry.source.byte_end,
+        Path::new(&entry.source.path),
+        &entry.id,
+        alias,
+        entry.source.byte_start,
+        entry.source.byte_end,
     )?;
     let mut review = format!(
         "ID: {}\nAlias: {alias}\nSource: {}:{}\nSpan: {}..{}\nDelete this exact HostEntry block.\n{}",
-        entry.id, entry.source.path, entry.source.line_start,
-        entry.source.byte_start, entry.source.byte_end,
+        entry.id,
+        entry.source.path,
+        entry.source.line_start,
+        entry.source.byte_start,
+        entry.source.byte_end,
         render_edit(&plan, OutputFormat::Human, false)?
     );
-    for pair in sshx::pair::records(&catalog.entries).iter().filter(|pair| {
-        pair.gateway_id == entry.id || pair.vm_id == entry.id
-    }) {
-        let gateway = catalog.entries.iter().find(|entry| entry.id == pair.gateway_id);
+    for pair in sshx::pair::records(&catalog.entries)
+        .iter()
+        .filter(|pair| pair.gateway_id == entry.id || pair.vm_id == entry.id)
+    {
+        let gateway = catalog
+            .entries
+            .iter()
+            .find(|entry| entry.id == pair.gateway_id);
         let vm = catalog.entries.iter().find(|entry| entry.id == pair.vm_id);
         if let (Some(gateway), Some(vm)) = (gateway, vm) {
             review.push_str(&format!(
                 "\nPair gateway: {} ({}) at {}:{}\nPair VM: {} ({}) at {}:{}\nTransit: {}:{}\n",
-                pair.gateway_alias, pair.gateway_id, gateway.source.path, gateway.source.line_start,
-                pair.vm_alias, pair.vm_id, vm.source.path, vm.source.line_start,
-                pair.transit_host, pair.transit_port,
+                pair.gateway_alias,
+                pair.gateway_id,
+                gateway.source.path,
+                gateway.source.line_start,
+                pair.vm_alias,
+                pair.vm_id,
+                vm.source.path,
+                vm.source.line_start,
+                pair.transit_host,
+                pair.transit_port,
             ));
         }
     }
@@ -2137,7 +2836,9 @@ fn run_host_delete_workspace(
         ensure_delete_allowed(home, entry)
     };
     let blocker = safety(&catalog).err();
-    if let Some(error) = &blocker { review.push_str(&format!("\n{error}\n")); }
+    if let Some(error) = &blocker {
+        review.push_str(&format!("\n{error}\n"));
+    }
     let mode = if blocker.is_some() {
         picker::MutationReviewMode::Blocked
     } else if cli.preview {
@@ -2151,7 +2852,9 @@ fn run_host_delete_workspace(
         "Review HostEntry mutation"
     };
     let action = picker::mutation_review_workspace(title, &review, mode)?;
-    if let Some(error) = blocker { return Err(error); }
+    if let Some(error) = blocker {
+        return Err(error);
+    }
     safety(&current_catalog()?)?;
     if action == picker::MutationReviewAction::Apply {
         mutation::apply_edit(&plan)?;
@@ -2163,68 +2866,132 @@ fn run_host_delete_workspace(
 }
 
 fn run_host_edit_workspace(
-    cli: &Cli, entry: &HostEntry, alias: &str, operation: MutationKind, before: &[u8],
+    cli: &Cli,
+    entry: &HostEntry,
+    alias: &str,
+    operation: MutationKind,
+    before: &[u8],
 ) -> Result<(), String> {
     let unchanged = || {
         mutation::validate_entry_paths(entry)?;
         if std::fs::read(&entry.source.path).is_ok_and(|bytes| bytes == before) {
             Ok(())
         } else {
-            Err(format!("HOST_SOURCE_CHANGED: {} changed; cancel and select its current HostEntry again",
-                entry.source.path))
+            Err(format!(
+                "HOST_SOURCE_CHANGED: {} changed; cancel and select its current HostEntry again",
+                entry.source.path
+            ))
         }
     };
     unchanged()?;
     let mut request = UpdateRequest {
-        path: PathBuf::from(&entry.source.path), expected_id: entry.id.clone(),
-        selected_alias: alias.to_string(), byte_start: entry.source.byte_start,
-        byte_end: entry.source.byte_end, alias: None, hostname: None, user: None,
-        port: None, password: None, clear_user: false, clear_port: false, clear_password: false,
+        path: PathBuf::from(&entry.source.path),
+        expected_id: entry.id.clone(),
+        selected_alias: alias.to_string(),
+        byte_start: entry.source.byte_start,
+        byte_end: entry.source.byte_end,
+        alias: None,
+        hostname: None,
+        user: None,
+        port: None,
+        password: None,
+        clear_user: false,
+        clear_port: false,
+        clear_password: false,
     };
     let current = mutation::current_values(&request)?;
     let original = [
-        alias.to_string(), current.hostname.unwrap_or_default(), current.user.unwrap_or_default(),
-        current.port.map_or_else(String::new, |port| port.to_string()),
-        if current.has_password { "********".to_string() } else { String::new() },
+        alias.to_string(),
+        current.hostname.unwrap_or_default(),
+        current.user.unwrap_or_default(),
+        current
+            .port
+            .map_or_else(String::new, |port| port.to_string()),
+        if current.has_password {
+            "********".to_string()
+        } else {
+            String::new()
+        },
     ];
     let mut fields = original.clone();
-    if let Some(alias) = &cli.alias { fields[0] = alias.clone(); }
+    if let Some(alias) = &cli.alias {
+        fields[0] = alias.clone();
+    }
     let mut clears = [false; 3];
     if operation == MutationKind::Update {
-        if let Some(hostname) = &cli.hostname { fields[1] = hostname.clone(); }
-        if let Some(user) = &cli.user { fields[2] = user.clone(); }
-        if let Some(port) = cli.port { fields[3] = port.to_string(); }
+        if let Some(hostname) = &cli.hostname {
+            fields[1] = hostname.clone();
+        }
+        if let Some(user) = &cli.user {
+            fields[2] = user.clone();
+        }
+        if let Some(port) = cli.port {
+            fields[3] = port.to_string();
+        }
         clears = [cli.clear_user, cli.clear_port, cli.clear_password];
     }
     for (index, clear) in clears.iter().enumerate() {
-        if *clear { fields[index + 2].clear(); }
+        if *clear {
+            fields[index + 2].clear();
+        }
     }
     let mut password_edited = false;
     let mut focus = None;
     let mut status = None;
-    let identity = format!("ID: {}\nAlias: {alias}\nSource: {}:{}\nSpan: {}..{}\n",
-        entry.id, entry.source.path, entry.source.line_start, entry.source.byte_start, entry.source.byte_end);
+    let identity = format!(
+        "ID: {}\nAlias: {alias}\nSource: {}:{}\nSpan: {}..{}\n",
+        entry.id,
+        entry.source.path,
+        entry.source.line_start,
+        entry.source.byte_start,
+        entry.source.byte_end
+    );
     loop {
-        let (edited, edited_clears, edited_password, selected, action) = picker::host_edit_workspace(
-            fields, clears, password_edited, &original, operation == MutationKind::Rename,
-            focus, status.as_deref(), None, cli.preview,
+        let (edited, selected, action) = picker::host_edit_workspace(
+            picker::HostEditState {
+                fields,
+                clears,
+                password_edited,
+            },
+            &original,
+            operation == MutationKind::Rename,
+            focus,
+            status.as_deref(),
+            None,
+            cli.preview,
         )?;
-        fields = edited;
-        clears = edited_clears;
-        password_edited = edited_password;
+        fields = edited.fields;
+        clears = edited.clears;
+        password_edited = edited.password_edited;
         focus = Some(selected);
-        if action != picker::HostEditAction::Submit { continue; }
+        if action != picker::HostEditAction::Submit {
+            continue;
+        }
         let result = (|| {
             unchanged()?;
             request.alias = (fields[0] != original[0]).then(|| fields[0].clone());
             request.hostname = (fields[1] != original[1]).then(|| fields[1].clone());
             request.user = (!clears[0] && fields[2] != original[2]).then(|| fields[2].clone());
             request.port = if !clears[1] && fields[3] != original[3] {
-                Some(fields[3].parse::<u16>().ok().filter(|port| *port != 0)
-                    .ok_or_else(|| "PORT_INVALID: enter a port from 1 to 65535, or Ctrl-X to clear".to_string())?)
-            } else { None };
+                Some(
+                    fields[3]
+                        .parse::<u16>()
+                        .ok()
+                        .filter(|port| *port != 0)
+                        .ok_or_else(|| {
+                            "PORT_INVALID: enter a port from 1 to 65535, or Ctrl-X to clear"
+                                .to_string()
+                        })?,
+                )
+            } else {
+                None
+            };
             request.password = (!clears[2] && password_edited).then(|| fields[4].clone());
-            [request.clear_user, request.clear_port, request.clear_password] = clears;
+            [
+                request.clear_user,
+                request.clear_port,
+                request.clear_password,
+            ] = clears;
             let mut plan = mutation::plan_update(&request)?;
             plan.operation = operation;
             unchanged()?;
@@ -2232,16 +2999,31 @@ fn run_host_edit_workspace(
         })();
         let plan = match result {
             Ok(plan) => plan,
-            Err(error) => { status = Some(error); continue; }
+            Err(error) => {
+                status = Some(error);
+                continue;
+            }
         };
-        let review = format!("{identity}{}", render_edit(&plan, OutputFormat::Human, false)?);
-        let (edited, edited_clears, edited_password, selected, action) = picker::host_edit_workspace(
-            fields, clears, password_edited, &original, operation == MutationKind::Rename,
-            focus, None, Some(&review), cli.preview,
+        let review = format!(
+            "{identity}{}",
+            render_edit(&plan, OutputFormat::Human, false)?
+        );
+        let (edited, selected, action) = picker::host_edit_workspace(
+            picker::HostEditState {
+                fields,
+                clears,
+                password_edited,
+            },
+            &original,
+            operation == MutationKind::Rename,
+            focus,
+            None,
+            Some(&review),
+            cli.preview,
         )?;
-        fields = edited;
-        clears = edited_clears;
-        password_edited = edited_password;
+        fields = edited.fields;
+        clears = edited.clears;
+        password_edited = edited.password_edited;
         focus = Some(selected);
         match action {
             picker::HostEditAction::Edit => status = None,
@@ -2272,7 +3054,10 @@ fn select_mutation_entry<'a>(
 ) -> Result<picker::Selection<'a>, String> {
     if positional.is_none() && cli.id.is_none() {
         if cli.format.is_machine() || cli.password_stdin || !io::stderr().is_terminal() {
-            return Err("HOST_REQUIRED: host mutation requires an exact selector outside interactive mode".to_string());
+            return Err(
+                "HOST_REQUIRED: host mutation requires an exact selector outside interactive mode"
+                    .to_string(),
+            );
         }
         if cli.no_input {
             return Err(
@@ -2294,20 +3079,36 @@ fn ensure_no_active_use(home: &Path, id: &str) -> Result<(), String> {
     match std::fs::symlink_metadata(&registry_path) {
         Ok(metadata) => {
             if !metadata.is_file() || metadata.file_type().is_symlink() {
-                return Err(format!("DELETE_REGISTRY_INVALID: unsafe registry {}", registry_path.display()));
+                return Err(format!(
+                    "DELETE_REGISTRY_INVALID: unsafe registry {}",
+                    registry_path.display()
+                ));
             }
             let bytes = std::fs::read(&registry_path).map_err(|error| {
-                format!("DELETE_REGISTRY_INVALID: cannot read {}: {error}", registry_path.display())
+                format!(
+                    "DELETE_REGISTRY_INVALID: cannot read {}: {error}",
+                    registry_path.display()
+                )
             })?;
             if has_active_reference(&bytes, id).map_err(|error| {
-                format!("DELETE_REGISTRY_INVALID: {}: {error}", registry_path.display())
+                format!(
+                    "DELETE_REGISTRY_INVALID: {}: {error}",
+                    registry_path.display()
+                )
             })? {
-                return Err(format!("DELETE_ACTIVE: entry {id} has active managed use in {}",
-                    registry_path.display()));
+                return Err(format!(
+                    "DELETE_ACTIVE: entry {id} has active managed use in {}",
+                    registry_path.display()
+                ));
             }
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(format!("DELETE_REGISTRY_INVALID: {}: {error}", registry_path.display())),
+        Err(error) => {
+            return Err(format!(
+                "DELETE_REGISTRY_INVALID: {}: {error}",
+                registry_path.display()
+            ));
+        }
     }
     Ok(())
 }
@@ -2327,7 +3128,9 @@ fn ensure_delete_allowed(home: &std::path::Path, entry: &HostEntry) -> Result<()
     paths.sort();
     paths.dedup();
     for path in paths {
-        if path == registry_path { continue; }
+        if path == registry_path {
+            continue;
+        }
         let Ok(bytes) = std::fs::read(&path) else {
             continue;
         };
@@ -2400,19 +3203,22 @@ fn has_active_reference(bytes: &[u8], id: &str) -> Result<bool, String> {
     }
     Ok(registry.tunnels.iter().any(|record| {
         matches!(record.state.as_str(), "active" | "starting" | "stopping")
-            && (record.entry_id.eq_ignore_ascii_case(id) || record.pair.as_ref().is_some_and(|pair| {
-                pair.gateway_entry_id.eq_ignore_ascii_case(id) || pair.vm_entry_id.eq_ignore_ascii_case(id)
-            }))
+            && (record.entry_id.eq_ignore_ascii_case(id)
+                || record.pair.as_ref().is_some_and(|pair| {
+                    pair.gateway_entry_id.eq_ignore_ascii_case(id)
+                        || pair.vm_entry_id.eq_ignore_ascii_case(id)
+                }))
     }))
 }
 fn required_create_value(value: Option<&str>, label: &str) -> Result<String, String> {
-    value.map(str::to_owned).ok_or_else(|| format!(
-        "{}_REQUIRED: provide --{} in non-interactive mode",
-        label.to_ascii_uppercase(),
-        label.to_ascii_lowercase()
-    ))
+    value.map(str::to_owned).ok_or_else(|| {
+        format!(
+            "{}_REQUIRED: provide --{} in non-interactive mode",
+            label.to_ascii_uppercase(),
+            label.to_ascii_lowercase()
+        )
+    })
 }
-
 
 fn create_password(cli: &Cli) -> Result<Option<String>, String> {
     if cli.password_stdin {
@@ -2428,7 +3234,6 @@ fn create_password(cli: &Cli) -> Result<Option<String>, String> {
     }
     Ok(None)
 }
-
 
 fn prompt_value(prompt: &str, default: Option<String>) -> Result<Option<String>, String> {
     eprint!("{prompt}");
@@ -2462,15 +3267,26 @@ fn resolve_relative_path(value: &str, base: &std::path::Path) -> PathBuf {
 }
 
 fn requested_setup_roots(cli: &Cli, home: &Path) -> Vec<RegisteredRoot> {
-    let mut additions = cli.roots.iter().map(|request| RegisteredRoot {
-        scope: request.scope.clone(),
-        path: settings::normalize_path(&request.path, home),
-        project: request.project.clone().or_else(|| cli.projects.first().cloned()),
-    }).collect::<Vec<_>>();
+    let mut additions = cli
+        .roots
+        .iter()
+        .map(|request| RegisteredRoot {
+            scope: request.scope.clone(),
+            path: settings::normalize_path(&request.path, home),
+            project: request
+                .project
+                .clone()
+                .or_else(|| cli.projects.first().cloned()),
+        })
+        .collect::<Vec<_>>();
     if let Some(config) = &cli.config {
         let path = settings::normalize_path(config, home);
         additions.push(RegisteredRoot {
-            scope: cli.scopes.first().cloned().unwrap_or_else(|| scope_for_path(&path)),
+            scope: cli
+                .scopes
+                .first()
+                .cloned()
+                .unwrap_or_else(|| scope_for_path(&path)),
             path,
             project: cli.projects.first().cloned(),
         });
@@ -2478,13 +3294,19 @@ fn requested_setup_roots(cli: &Cli, home: &Path) -> Vec<RegisteredRoot> {
     additions
 }
 
-fn register_setup_roots(home: &Path, additions: Vec<RegisteredRoot>) -> Result<Vec<RegisteredRoot>, String> {
+fn register_setup_roots(
+    home: &Path,
+    additions: Vec<RegisteredRoot>,
+) -> Result<Vec<RegisteredRoot>, String> {
     for root in &additions {
         if root.scope.trim().is_empty() {
             return Err("SCOPE_INVALID: enter a scope such as personal or work".to_string());
         }
         if !root.path.is_file() {
-            return Err(format!("SETUP_ROOT_NOT_FOUND: config root is not a file: {}", root.path.display()));
+            return Err(format!(
+                "SETUP_ROOT_NOT_FOUND: config root is not a file: {}",
+                root.path.display()
+            ));
         }
     }
     mutation::validate_mutation_roots(&settings::discovery_roots(&additions))?;
@@ -2510,8 +3332,11 @@ fn run_setup(cli: &Cli) -> Result<(), String> {
     }
     additions.extend(requested_setup_roots(cli, &home));
     if additions.is_empty() {
-        if !cli.no_input && !cli.format.is_machine() && !cli.password_stdin
-            && io::stdin().is_terminal() && io::stderr().is_terminal()
+        if !cli.no_input
+            && !cli.format.is_machine()
+            && !cli.password_stdin
+            && io::stdin().is_terminal()
+            && io::stderr().is_terminal()
         {
             return run_tui_operation(cli);
         }
@@ -2784,8 +3609,11 @@ fn registered_roots(cli: &Cli) -> Result<Vec<RegisteredRoot>, String> {
 fn entry_matches_provenance(entry: &HostEntry, cli: &Cli) -> bool {
     entry.provenance.iter().any(|provenance| {
         (cli.scopes.is_empty() || cli.scopes.iter().any(|scope| scope == &provenance.scope))
-            && (cli.projects.is_empty() || cli.projects.iter()
-                .any(|project| provenance.project.as_deref() == Some(project.as_str())))
+            && (cli.projects.is_empty()
+                || cli
+                    .projects
+                    .iter()
+                    .any(|project| provenance.project.as_deref() == Some(project.as_str())))
     })
 }
 
@@ -2866,7 +3694,8 @@ fn select_connect_entry<'a>(
         });
     let source = cli.location.source.as_ref().map(|source| {
         source_selector_path(source, &home_dir().unwrap_or_else(|_| PathBuf::from(".")))
-            .to_string_lossy().into_owned()
+            .to_string_lossy()
+            .into_owned()
     });
     let matches = entries
         .iter()
@@ -2879,10 +3708,14 @@ fn select_connect_entry<'a>(
             }
         })
         .filter(|entry| {
-            positional.is_none_or(|alias| entry.id == alias || entry.aliases.iter().any(|candidate| candidate == alias))
+            positional.is_none_or(|alias| {
+                entry.id == alias || entry.aliases.iter().any(|candidate| candidate == alias)
+            })
         })
         .filter(|entry| {
-            source.as_deref().is_none_or(|source| entry.source.path == source)
+            source
+                .as_deref()
+                .is_none_or(|source| entry.source.path == source)
         })
         .filter(|entry| {
             cli.location
@@ -3314,7 +4147,9 @@ struct ConfigRootChoice {
 #[derive(Debug)]
 enum Command {
     List,
-    Hosts { explicit: bool },
+    Hosts {
+        explicit: bool,
+    },
     Show(Option<String>),
     Connect(Option<String>),
     CreateHost,
@@ -3334,7 +4169,10 @@ enum Command {
     TunnelDirectStart(Option<String>),
     TunnelPairedStart(Option<String>),
     TunnelList,
-    TunnelChoose { action: char, route: Option<TunnelRoute> },
+    TunnelChoose {
+        action: char,
+        route: Option<TunnelRoute>,
+    },
     TunnelStatus(String),
     TunnelStop(String),
     TunnelRestart(String),
@@ -3664,17 +4502,16 @@ impl Cli {
         if tui {
             positional.remove(0);
         }
-        let tunnel_route = if positional.first().is_some_and(|token| token == "tunnel")
-            && positional.len() >= 3
-        {
-            match positional[1].as_str() {
-                "direct" => Some(TunnelRoute::Direct),
-                "paired" => Some(TunnelRoute::Paired),
-                _ => None,
-            }
-        } else {
-            None
-        };
+        let tunnel_route =
+            if positional.first().is_some_and(|token| token == "tunnel") && positional.len() >= 3 {
+                match positional[1].as_str() {
+                    "direct" => Some(TunnelRoute::Direct),
+                    "paired" => Some(TunnelRoute::Paired),
+                    _ => None,
+                }
+            } else {
+                None
+            };
         let command = match positional.as_slice() {
             [] => Command::Hosts { explicit: tui },
             [host, list] if host == "host" && list == "list" => Command::List,
@@ -3683,7 +4520,11 @@ impl Cli {
             }
             [host, show] if host == "host" && show == "show" => Command::Show(None),
             [host, create] if host == "host" && create == "create" => {
-                if tui { Command::TuiCreateHost } else { Command::CreateHost }
+                if tui {
+                    Command::TuiCreateHost
+                } else {
+                    Command::CreateHost
+                }
             }
             [host, update, selector] if host == "host" && update == "update" => {
                 Command::UpdateHost(Some(selector.clone()))
@@ -3771,15 +4612,37 @@ impl Cli {
             [tunnel, restart, id] if tunnel == "tunnel" && restart == "restart" => {
                 Command::TunnelRestart(id.clone())
             }
-            [tunnel, action] if tunnel == "tunnel" && matches!(action.as_str(), "status" | "stop" | "restart") => Command::TunnelChoose {
-                action: match action.as_str() { "status" => 'v', "stop" => 's', _ => 'r' },
-                route: None,
-            },
-            [tunnel, route, action] if tunnel == "tunnel" && matches!(route.as_str(), "direct" | "paired")
-                && matches!(action.as_str(), "status" | "stop" | "restart") => Command::TunnelChoose {
-                    action: match action.as_str() { "status" => 'v', "stop" => 's', _ => 'r' },
-                    route: Some(if route == "direct" { TunnelRoute::Direct } else { TunnelRoute::Paired }),
-                },
+            [tunnel, action]
+                if tunnel == "tunnel"
+                    && matches!(action.as_str(), "status" | "stop" | "restart") =>
+            {
+                Command::TunnelChoose {
+                    action: match action.as_str() {
+                        "status" => 'v',
+                        "stop" => 's',
+                        _ => 'r',
+                    },
+                    route: None,
+                }
+            }
+            [tunnel, route, action]
+                if tunnel == "tunnel"
+                    && matches!(route.as_str(), "direct" | "paired")
+                    && matches!(action.as_str(), "status" | "stop" | "restart") =>
+            {
+                Command::TunnelChoose {
+                    action: match action.as_str() {
+                        "status" => 'v',
+                        "stop" => 's',
+                        _ => 'r',
+                    },
+                    route: Some(if route == "direct" {
+                        TunnelRoute::Direct
+                    } else {
+                        TunnelRoute::Paired
+                    }),
+                }
+            }
             [tunnel] if tunnel == "tunnel" => Command::TunnelStart(None),
             [tunnel, selector] if tunnel == "tunnel" => {
                 Command::TunnelStart(Some(selector.clone()))

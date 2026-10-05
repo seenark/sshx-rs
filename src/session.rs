@@ -75,13 +75,11 @@ pub fn write_local_forward_spec(output: &mut String, forward: &ServiceForward) {
     write!(output, ":{}", forward.remote_port).expect("String writes cannot fail");
 }
 
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ForwardIssue {
     pub service_id: String,
     pub message: String,
 }
-
 
 pub fn resolve_custom_local_forwards(
     specifications: &[String],
@@ -138,16 +136,14 @@ pub fn resolve_custom_local_forwards(
             return Err("FORWARD_BIND_INVALID: bind address must be specific".to_string());
         }
         if !address.is_loopback() && !allow_bind {
-            return Err(
-                "FORWARD_BIND_UNSAFE: non-loopback bind requires --allow-bind".to_string(),
-            );
+            return Err("FORWARD_BIND_UNSAFE: non-loopback bind requires --allow-bind".to_string());
         }
-        let local_port = local.parse::<u16>().map_err(|_| {
-            "FORWARD_INVALID: local port must be between 1 and 65535".to_string()
-        })?;
-        let remote_port = remote.parse::<u16>().map_err(|_| {
-            "FORWARD_INVALID: remote port must be between 1 and 65535".to_string()
-        })?;
+        let local_port = local
+            .parse::<u16>()
+            .map_err(|_| "FORWARD_INVALID: local port must be between 1 and 65535".to_string())?;
+        let remote_port = remote
+            .parse::<u16>()
+            .map_err(|_| "FORWARD_INVALID: remote port must be between 1 and 65535".to_string())?;
         validate_port(local_port, "SERVICE_BIND")?;
         validate_port(remote_port, "SERVICE_REMOTE")?;
         let destination_host = unbracket_ipv6_host(host)?.to_string();
@@ -707,7 +703,6 @@ mod tests {
         fs::remove_file(path).expect("fixture should remove");
     }
 
-
     #[test]
     fn repeated_forward_specs_resolve_multiple_declared_services() {
         let (path, entry) = entry(concat!(
@@ -760,7 +755,11 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["5432#1", "6379#1"]
         );
-        assert!(issues.iter().all(|issue| issue.message.contains("multiple rows")));
+        assert!(
+            issues
+                .iter()
+                .all(|issue| issue.message.contains("multiple rows"))
+        );
         assert!(listener.local_addr().is_ok());
     }
     #[test]
@@ -826,10 +825,7 @@ mod tests {
                     forward.remote_port
                 ))
                 .collect::<Vec<_>>(),
-            [
-                (15432, "db.internal", 5432),
-                (6378, "cache.internal", 6379)
-            ]
+            [(15432, "db.internal", 5432), (6378, "cache.internal", 6379)]
         );
         assert!(
             resolve_custom_local_forwards(
@@ -839,30 +835,22 @@ mod tests {
             .unwrap_err()
             .starts_with("FORWARD_BIND_UNSAFE")
         );
-        let opted_in = resolve_custom_local_forwards(
-            &["192.0.2.10:15432:db.internal:5432".to_string()],
-            true,
-        )
-        .expect("explicit opt-in should allow a specific non-loopback bind");
+        let opted_in =
+            resolve_custom_local_forwards(&["192.0.2.10:15432:db.internal:5432".to_string()], true)
+                .expect("explicit opt-in should allow a specific non-loopback bind");
         assert_eq!(opted_in[0].local_port, 15432);
         assert_eq!(opted_in[0].id, "local:192.0.2.10:15432:db.internal:5432");
         for bind in ["0.0.0.0", "239.1.2.3"] {
             assert!(
-                resolve_custom_local_forwards(
-                    &[format!("{bind}:15432:db.internal:5432")],
-                    true
-                )
-                .unwrap_err()
-                .starts_with("FORWARD_BIND_INVALID")
+                resolve_custom_local_forwards(&[format!("{bind}:15432:db.internal:5432")], true)
+                    .unwrap_err()
+                    .starts_with("FORWARD_BIND_INVALID")
             );
         }
         assert!(
-            resolve_custom_local_forwards(
-                &["127.0.0.1:15432:-host:5432".to_string()],
-                false
-            )
-            .unwrap_err()
-            .starts_with("FORWARD_UNSAFE")
+            resolve_custom_local_forwards(&["127.0.0.1:15432:-host:5432".to_string()], false)
+                .unwrap_err()
+                .starts_with("FORWARD_UNSAFE")
         );
         assert!(
             resolve_custom_local_forwards(

@@ -306,4 +306,6 @@ cargo test --all-targets --all-features
 ./scripts/test-release-package.sh
 ```
 
+PTY integration checks run one interactive fixture at a time so concurrent fixture startup does not consume the interaction deadline. Failed checks terminate and reap their owned fixture processes; they do not stop unrelated processes or lengthen the existing deadlines.
+
 These checks use temporary config trees, local process fixtures, and CI runners. They prove packaging, CLI behavior, and local OpenSSH interactions only. Real user-server authentication, host-key enrollment, host-key rotation, and standalone tunnel lifetime require separate manual validation in an authorized environment and are not implied by this setup guide.
