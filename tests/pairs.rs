@@ -371,13 +371,26 @@ fn pair_setup_keeps_exact_vm_selectable_without_matching_gateway_transit() {
         ),
     ] {
         let fixture = PairFixture::new(case);
-        fs::write(&fixture.config, "Include gateway-source second-vm\n").unwrap();
+        fs::write(
+            &fixture.config,
+            "Include gateway-source first-vm second-vm\n",
+        )
+        .unwrap();
         fs::write(&fixture.gateway, format!(
             "Host pdms-faq-chatbot\n  HostName gateway.example\n  ##PASSWORD pair-stored-secret\n{forward}",
         )).unwrap();
         fs::write(
+            &fixture.decoy,
+            format!(
+                "##SSHX ID={PAIR_OTHER_ID}\nHost pdms-faq-chatbot-vm\n  HostName decoy.example\n  Port 2222\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
             &fixture.vm,
-            "Host pdms-faq-chatbot-vm\n  HostName actual.example\n  Port 2222\n",
+            format!(
+                "##SSHX ID={PAIR_VM_ID}\nHost pdms-faq-chatbot-vm\n  HostName actual.example\n  Port 2222\n"
+            ),
         )
         .unwrap();
         let before = fixture.snapshot();
@@ -385,25 +398,26 @@ fn pair_setup_keeps_exact_vm_selectable_without_matching_gateway_transit() {
             .unwrap()
             .entries
             .remove(0);
-        let mut terminal = PairTerminal::open(&fixture, &["tui", "pair", "setup"]);
-        terminal.expect("Pair setup");
+        let mut terminal = PairTerminal::open_sized(&fixture, &["tui", "pair", "setup"], 120, 40);
+        terminal.expect("Choose: pdms-faq-chatbot");
         terminal.send(b"pdms-faq-chatbot\r");
         terminal.expect("Gateway: pdms-faq-chatbot");
         terminal.send(b"pdms-faq-chatbot-vm");
         terminal.expect("Search: pdms-faq-chatbot-vm");
         terminal.expect("Choose: pdms-faq-chatbot-vm");
-        terminal.expect(&format!("second-vm:{}", vm.source.line_start));
+        terminal.expect(PAIR_OTHER_ID);
+        terminal.send(b"\x1b[B");
+        terminal.expect(&vm.id);
         terminal.send(b"\r");
         terminal.expect("VM: pdms-faq-chatbot-vm");
-        terminal.expect(&format!("second-vm:{}", vm.source.line_start));
-        terminal.expect(vm.id.rsplit('/').next().unwrap());
+        terminal.expect(&vm.id);
         terminal.send(b"\x13");
         terminal.expect("TRANSIT_REQUIRED");
         fixture.assert_snapshot(&before);
         terminal.send(b"127.0.0.9\t2222\x13");
         terminal.expect("TRANSIT_MISMATCH");
         terminal.expect("VM: pdms-faq-chatbot-vm");
-        terminal.expect(&format!("second-vm:{}", vm.source.line_start));
+        terminal.expect(&vm.id);
         fixture.assert_snapshot(&before);
         terminal.send(b"\x1b");
         assert_eq!(terminal.finish(), Some(130));
