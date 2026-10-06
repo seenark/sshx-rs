@@ -22,8 +22,8 @@ The smoke test checks:
 Package a previously built target directly:
 
 ```sh
-./scripts/package-release.sh 0.1.0 x86_64-unknown-linux-gnu dist
-./scripts/verify-release-archive.sh 0.1.0 x86_64-unknown-linux-gnu dist
+./scripts/package-release.sh 0.1.1 x86_64-unknown-linux-gnu dist
+./scripts/verify-release-archive.sh 0.1.1 x86_64-unknown-linux-gnu dist
 ```
 
 Supported targets:
@@ -58,6 +58,8 @@ Mac Intel, Windows, and Alpine/musl are not supported. Apple Silicon support doe
    ```
 
    Both the default stable installation and pinned installation must report `sshx X.Y.Z` for the tag. The installation smoke proves asset selection and execution, not checksum sidecar verification; the package verifier checks sidecars before upload.
+
+   The directory-creation step defines the seven paths with step-scoped `env` and exports them through `GITHUB_ENV` before mise setup and installation. GitHub permits `runner.temp` in step-level `env`, but not job-level `env`; values written to `GITHUB_ENV` are available to subsequent steps. See [context availability](https://docs.github.com/en/actions/reference/workflows-and-actions/contexts#context-availability) and [environment files](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-commands#setting-an-environment-variable).
 
 The release job does not publish when either platform's behavior suite or any packaging check fails. The post-publication mise smoke is a required acceptance gate; if it fails, do not announce the release until the asset selection or installation problem is fixed.
 

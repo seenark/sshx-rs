@@ -110,18 +110,23 @@ jobs:
         os: [macos-14, ubuntu-22.04-arm, ubuntu-22.04]
     runs-on: ${{ matrix.os }}
     env:
-      HOME: ${{ runner.temp }}/sshx-mise-home
-      XDG_CONFIG_HOME: ${{ runner.temp }}/sshx-xdg-config
-      XDG_DATA_HOME: ${{ runner.temp }}/sshx-xdg-data
-      MISE_CONFIG_DIR: ${{ runner.temp }}/sshx-mise-config
-      MISE_DATA_DIR: ${{ runner.temp }}/sshx-mise-data
-      MISE_CACHE_DIR: ${{ runner.temp }}/sshx-mise-cache
-      MISE_STATE_DIR: ${{ runner.temp }}/sshx-mise-state
-      MISE_GITHUB_TOKEN: ${{ github.token }}
+      MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       MISE_YES: '1'
     steps:
       - name: Create isolated mise directories
-        run: mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$MISE_CONFIG_DIR" "$MISE_DATA_DIR" "$MISE_CACHE_DIR" "$MISE_STATE_DIR"
+        env:
+          HOME: ${{ runner.temp }}/sshx-mise-home
+          XDG_CONFIG_HOME: ${{ runner.temp }}/sshx-xdg-config
+          XDG_DATA_HOME: ${{ runner.temp }}/sshx-xdg-data
+          MISE_CONFIG_DIR: ${{ runner.temp }}/sshx-mise-config
+          MISE_DATA_DIR: ${{ runner.temp }}/sshx-mise-data
+          MISE_CACHE_DIR: ${{ runner.temp }}/sshx-mise-cache
+          MISE_STATE_DIR: ${{ runner.temp }}/sshx-mise-state
+        run: |
+          mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$MISE_CONFIG_DIR" "$MISE_DATA_DIR" "$MISE_CACHE_DIR" "$MISE_STATE_DIR"
+          for name in HOME XDG_CONFIG_HOME XDG_DATA_HOME MISE_CONFIG_DIR MISE_DATA_DIR MISE_CACHE_DIR MISE_STATE_DIR; do
+            printf '%s=%s\n' "$name" "${!name}" >> "$GITHUB_ENV"
+          done
       - uses: jdx/mise-action@v2
         with:
           install: false
