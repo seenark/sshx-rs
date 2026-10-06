@@ -37,8 +37,12 @@ sshx --version
 To pin a version:
 
 ```sh
-mise use -g github:seenark/sshx-rs@0.1.2
+mise use -g github:seenark/sshx-rs@0.1.3
 ```
+
+By default, mise's unpinned latest resolution excludes releases younger than 24 hours. The unpinned command may select an older eligible stable release or find none immediately after publication. An explicit version pin bypasses this age filter and can install the newly published version immediately, without changing the default policy. See mise's [minimum release age security policy](https://mise.jdx.dev/security.html#minimum-release-age) and [setting reference](https://mise.jdx.dev/configuration/settings.html#minimum_release_age).
+
+After installation, `mise which sshx` reports the binary path. This backend installs it under `$MISE_DATA_DIR/installs/github-seenark-sshx-rs/<version>/sshx`; mise downloads and extracts the matching GitHub Release archive there. Copying a build into that directory is not a substitute for installation or release selection.
 
 Supported release targets are:
 
@@ -48,7 +52,7 @@ Supported release targets are:
 
 GNU/Linux uses Ubuntu 22.04 as its compatibility baseline. Mac Intel, Windows, and Alpine/musl are not supported. Apple Silicon support does not promise compatibility with every historical macOS version.
 
-Each release contains exactly three `.tar.gz` archives and three companion `.sha256` files. mise selects the matching target asset and extracts executable `sshx` from archive root. Archives do not bundle the system OpenSSH engine or optional `sshpass`; the prerequisites above still apply.
+Each release contains exactly three `.tar.gz` archives and three companion `.sha256` files. GitHub Release assets are the distribution source; mise downloads the matching target asset, extracts executable `sshx` from archive root, and creates local installation state. Copying a binary into mise's cache or installation directories is not equivalent to a GitHub backend installation. Archives do not bundle the system OpenSSH engine or optional `sshpass`; the prerequisites above still apply.
 
 ## Register config roots
 

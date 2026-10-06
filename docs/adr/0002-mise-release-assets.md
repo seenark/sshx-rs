@@ -17,12 +17,12 @@ Supported platforms are Apple Silicon M1 and later and GNU/Linux arm64/x86_64 wi
 
 Release publication depends on the full behavior suite on Ubuntu 22.04 and macOS Apple Silicon. Packaging runs natively on all three supported platforms and verifies each archive and checksum. Publication requires the exact six-file set locally, uploads a draft, and checks the exact uploaded set before making the release stable and latest.
 
-After publication, fresh isolated HOME, XDG config/data, and mise data/config/cache/state directories install the published GitHub release on all three native platforms. Both the default stable installation and version pinning must execute `sshx` with the expected version. Executable selection must resolve inside the isolated mise installation, without a source build or cached `sshx`. This installation smoke does not itself verify checksum sidecars.
+Release CI ends after exact-six-asset stable publication; it does not run mise consumer installation checks. Independent download/native archive verification checks the actual published bytes. An isolated local mise installation can separately prove GitHub asset selection and execution without changing the owner's global state or relying on a source build, cached `sshx`, or hand-copied installation. An explicit version pin can install a newly published release immediately; default unpinned latest resolution follows mise's 24-hour release-age filter. These independent checks are not CI gates, and mise installation alone does not verify checksum sidecars.
 
 ## Consequences
 
 - Target triples are part of the public artifact contract.
 - The archive layout stays independent of source checkout layout.
 - Checksums and executable mode are verified before upload.
-- A release is not accepted from local packaging alone; the post-publication mise smoke test must pass.
+- Native source and archive gates plus exact-six-asset stable publication determine release CI acceptance. Independent published-archive and local mise evidence is reported separately.
 - Real user-server access remains outside CI and is reported separately from fixture/local validation.
