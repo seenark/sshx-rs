@@ -37,7 +37,7 @@ sshx --version
 To pin a version:
 
 ```sh
-mise use -g github:seenark/sshx-rs@0.1.1
+mise use -g github:seenark/sshx-rs@0.1.2
 ```
 
 Supported release targets are:

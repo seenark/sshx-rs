@@ -70,6 +70,7 @@ Do not replace a Pair route with `ProxyJump`. The approved route uses separate O
   - macOS: `brew install sshpass` from the maintained Homebrew formula.
   - Ubuntu CI/local: `sudo apt-get install --no-install-recommends -y openssh-client sshpass`.
 - Keep password-bearing config files owned by the user with mode `0600`. `doctor` reports unsafe permissions without changes by default. Use `sshx doctor --fix-permissions` or Hosts → Doctor → Repair eligible permissions to review one path-and-mode plan and confirm once. Wrong-owner, symlink, shared, and otherwise ineligible paths remain unchanged.
+- On GNU/Linux arm64 and x86_64, permission repair uses `fchmodat2` with a held file descriptor. Only when the kernel reports `ENOSYS` does repair use `/proc/self/fd` to reach that same inode; it never falls back to chmod of the original path. Older kernels therefore need accessible procfs for repair. If that safe repair fails, the result reports the failure without following a replacement symlink.
 - Keep app-owned runtime and registry directories user-owned with mode `0700`. Do not replace a control socket with a symlink or manually adopt a process.
 - Use `IdentityFile`, `ssh-agent`, or an inherited password file descriptor. Passwords must not appear in argv, environment, runtime config, logs, JSON/YAML, or previews.
 - A wrong configured password is not retried silently. Supply a corrected secret and run the command again.

@@ -17,6 +17,16 @@ use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 
+#[cfg(all(target_os = "linux", target_arch = "aarch64", target_env = "gnu"))]
+// libc 0.2.189 omits this binding; arm64 uses asm-generic syscall number 452:
+// https://github.com/torvalds/linux/blob/v6.6/include/uapi/asm-generic/unistd.h
+const SYS_FCHMODAT2: libc::c_long = 452;
+#[cfg(all(
+    target_os = "linux",
+    not(all(target_arch = "aarch64", target_env = "gnu"))
+))]
+const SYS_FCHMODAT2: libc::c_long = libc::SYS_fchmodat2;
+
 #[cfg(target_os = "linux")]
 const DIRECTORY_ACCESS: i32 = libc::O_PATH;
 #[cfg(any(
@@ -128,7 +138,7 @@ fn repair_opened_target(
     #[cfg(target_os = "linux")]
     let mut changed = unsafe {
         libc::syscall(
-            libc::SYS_fchmodat2,
+            SYS_FCHMODAT2,
             target_file.as_raw_fd(),
             c"".as_ptr(),
             mode,

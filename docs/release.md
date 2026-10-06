@@ -1,7 +1,7 @@
 # Build and publish releases
 
-Releases use `vX.Y.Z` tags. GitHub Actions runs the full behavior suite on Ubuntu 22.04 and macOS Apple Silicon before publishing assets.
-Verification installs the pinned Rust toolchain's `rustfmt` and `clippy` components before running the formatting, linting, and behavior gates.
+Releases use `vX.Y.Z` tags. Ordinary CI and tag verification run natively on Ubuntu 22.04 x86_64 (`ubuntu-22.04`), Ubuntu 22.04 arm64 (`ubuntu-22.04-arm`), and macOS Apple Silicon (`macos-14`) before publishing assets.
+Verification installs the pinned Rust toolchain's `rustfmt` and `clippy` components before running the formatting, linting, full behavior suite, and native package smoke gates on each platform.
 
 ## Local package smoke test
 
@@ -22,8 +22,8 @@ The smoke test checks:
 Package a previously built target directly:
 
 ```sh
-./scripts/package-release.sh 0.1.1 x86_64-unknown-linux-gnu dist
-./scripts/verify-release-archive.sh 0.1.1 x86_64-unknown-linux-gnu dist
+./scripts/package-release.sh 0.1.2 x86_64-unknown-linux-gnu dist
+./scripts/verify-release-archive.sh 0.1.2 x86_64-unknown-linux-gnu dist
 ```
 
 Supported targets:
@@ -61,7 +61,7 @@ Mac Intel, Windows, and Alpine/musl are not supported. Apple Silicon support doe
 
    The directory-creation step defines the seven paths with step-scoped `env` and exports them through `GITHUB_ENV` before mise setup and installation. GitHub permits `runner.temp` in step-level `env`, but not job-level `env`; values written to `GITHUB_ENV` are available to subsequent steps. See [context availability](https://docs.github.com/en/actions/reference/workflows-and-actions/contexts#context-availability) and [environment files](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-commands#setting-an-environment-variable).
 
-The release job does not publish when either platform's behavior suite or any packaging check fails. The post-publication mise smoke is a required acceptance gate; if it fails, do not announce the release until the asset selection or installation problem is fixed.
+The release job does not publish when any platform's verification gates or any packaging check fails. The post-publication mise smoke is a required acceptance gate; if it fails, do not announce the release until the asset selection or installation problem is fixed.
 
 ## Artifact contract
 
