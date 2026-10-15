@@ -1803,7 +1803,8 @@ mod tests {
         let next = next_free_local_port("127.0.0.1", port - 1, &[]);
         assert!(next.is_some_and(|candidate| candidate > port));
         let after = next_free_local_port("127.0.0.1", port - 1, &[next.unwrap()]);
-        assert!(after.is_some_and(|candidate| candidate > next.unwrap()));
+        // Other tests may free lower ports between calls, so only the exclusions are stable.
+        assert!(after.is_some_and(|candidate| candidate != port && candidate != next.unwrap()));
         assert_eq!(next_free_local_port("127.0.0.1", u16::MAX, &[]), None);
     }
 

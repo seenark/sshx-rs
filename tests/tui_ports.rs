@@ -596,14 +596,14 @@ fn busy_tunnel_port_offers_the_next_free_port_and_persists_the_choice() {
     assert_ne!(offered, busy);
     tui.send("n");
     tui.expect(&format!(":{offered} listener ready"));
-    assert!(tui.saw("db master responsive"));
+    tui.expect("db master responsive");
     let listed = cli_json(&fixture, &bin, &["tunnel", "list", "--format", "json"]);
     let tunnel = &listed["tunnels"][0];
     assert_eq!(tunnel["state"], "active");
     assert_eq!(tunnel["forwards"][0]["local_port"], offered);
     assert_eq!(tunnel["listener_status"], "bound");
     let id = tunnel["id"].as_str().unwrap().to_string();
-    assert!(tui.saw(&format!("id {id}")));
+    tui.expect(&format!("id {id}"));
     tui.send("q");
     let (status, output) = tui.finish();
     assert!(status.success(), "{status:?} {output}");
