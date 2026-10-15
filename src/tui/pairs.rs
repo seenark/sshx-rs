@@ -6,9 +6,8 @@ use ratatui::{
 };
 use sshx::discovery::HostEntry;
 
-use super::connection_view::wrap_status;
 use super::terminal::{read_key, with_terminal};
-use super::widgets::block;
+use super::widgets::{block, wrap_status};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PairWorkspaceAction {

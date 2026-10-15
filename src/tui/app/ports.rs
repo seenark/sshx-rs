@@ -1,5 +1,5 @@
 use super::{
-    ConnectRequest, Ctx, Effect, EffectResult, ForwardRequest, Outcome, Runtime, Screen,
+    ConnectRequest, Ctx, Effect, EffectResult, ForwardRequest, Outcome, Pick, Runtime, Screen,
     ScreenStatus, cmdline::CommandLine, copy::CopyRequest, finder::relative_time, service_bind,
     tunnel_progress, tunnels, undo::Rekey, yesno::YesNo,
 };
@@ -12,7 +12,7 @@ use ratatui::{
     widgets::{List, ListItem, ListState, Paragraph},
 };
 use sshx::discovery::HostEntry;
-use sshx::keymap::{self, Action, Availability, InputMode, Key};
+use sshx::keymap::{self, Action, Availability, ForwardArg, InputMode, Key};
 use sshx::mutation::{self, ServiceDeclaration};
 use sshx::session::DeclaredService;
 use sshx::usage::{self, UsedForward};
@@ -82,7 +82,7 @@ pub(super) fn endpoint(bind: &str, local: u16) -> String {
     }
 }
 
-fn find_entry<'a>(
+pub(super) fn find_entry<'a>(
     entries: &'a [HostEntry],
     id: &str,
     path: &str,
@@ -132,7 +132,12 @@ impl Ports {
             usage.map_or(&[][..], |usage| usage.forwards.as_slice()),
             usage.map(|usage| usage.last_used).filter(|time| *time > 0),
         );
-        Ok(Self::with_rows(entry, alias, declared, rows, 0))
+        let mut ports = Self::with_rows(entry, alias, declared, rows, 0);
+        for forward in &ctx.intent.preselect {
+            ports.add(*forward);
+        }
+        ports.selected = 0;
+        Ok(ports)
     }
 
     fn with_rows(
@@ -186,13 +191,13 @@ impl Ports {
     }
 
     fn add_draft(&mut self) {
-        let forward = match keymap::parse_forward(self.draft.trim()) {
-            Ok(forward) => forward,
-            Err(error) => {
-                self.error = Some(error);
-                return;
-            }
-        };
+        match keymap::parse_forward(self.draft.trim()) {
+            Ok(forward) => self.add(forward),
+            Err(error) => self.error = Some(error),
+        }
+    }
+
+    fn add(&mut self, forward: ForwardArg) {
         let default_local = self
             .declaration(forward.remote)
             .map_or(forward.remote, |service| service.default_local_port);
@@ -290,6 +295,9 @@ impl Ports {
         let Some(entry) = self.entry(ctx) else {
             return Outcome::Toast(self.missing());
         };
+        if matches!(ctx.intent.pick, Pick::Tunnel) {
+            return tunnel_progress::begin(ctx, entry, &self.alias, requests(&self.rows));
+        }
         if let Some((_, message)) = self.issues(ctx).into_iter().next() {
             return Outcome::Toast(message);
         }
@@ -530,8 +538,12 @@ impl Screen for Ports {
             frame.render_widget(Paragraph::new(Line::from(spans)), input_area);
         }
         frame.render_widget(
-            Paragraph::new("x toggle · o add · s save · dd remove · ⏎ connect · space t t tunnel")
-                .style(dim),
+            Paragraph::new(if matches!(ctx.intent.pick, Pick::Tunnel) {
+                "x toggle · o add · s save · dd remove · ⏎ start tunnel"
+            } else {
+                "x toggle · o add · s save · dd remove · ⏎ connect · space t t tunnel"
+            })
+            .style(dim),
             hint_area,
         );
     }

@@ -117,62 +117,6 @@ esac
 }
 
 #[test]
-fn continuation_exact_prefills_remain_editable_and_cancel_without_side_effect() {
-    let original = concat!(
-        "##SSHX ID=11111111-1111-4111-8111-111111111111\n",
-        "Host duplicate secondary\n  HostName first.example\n",
-        "##SSHX ID=22222222-2222-4222-8222-222222222222\n",
-        "Host duplicate other\n  HostName second.example\n",
-    );
-    let (root, home, config) = host_edit_fixture("editable-continuation", original);
-    let bin = root.join("bin");
-    fs::create_dir(&bin).unwrap();
-    let ssh = bin.join("ssh");
-    fs::write(&ssh, "#!/bin/sh\ntouch \"$SSHX_SENTINEL\"\nexit 97\n").unwrap();
-    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
-    let path = format!(
-        "{}:{}",
-        bin.display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
-    let sentinel = root.join("ssh-started");
-    for selection in [
-        vec!["--id", "11111111-1111-4111-8111-111111111111"],
-        vec!["--source", config.to_str().unwrap(), "--line", "2"],
-    ] {
-        let mut arguments = vec!["tui", "connect", "secondary"];
-        arguments.extend(selection);
-        let mut terminal = HostEditTerminal::open_with_env(
-            &home,
-            &config,
-            &arguments,
-            &[
-                ("PATH", &path),
-                ("SSHX_SENTINEL", sentinel.to_str().unwrap()),
-            ],
-        );
-        terminal.expect("> secondary");
-        terminal.expect("first.example");
-        terminal.send(b"other\r");
-        terminal.expect("Connection workspace");
-        terminal.expect("other");
-        terminal.expect("config:5");
-        terminal.expect("22222222-2222-4222-8222-222222222222");
-        terminal.send(b"\x1b");
-        terminal.expect("Search:");
-        terminal.send(b"\x03");
-        assert_eq!(terminal.finish(), Some(130));
-        assert_eq!(fs::read_to_string(&config).unwrap(), original);
-        assert!(!sentinel.exists(), "cancellation started OpenSSH");
-        assert!(
-            !home.join(".config/sshx").exists(),
-            "cancellation persisted state"
-        );
-    }
-    fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
 fn continuation_explicit_selectors_reject_prefixes_ambiguity_and_conflicts() {
     let original = concat!(
         "##SSHX ID=11111111-1111-4111-8111-111111111111\n",
@@ -219,366 +163,6 @@ fn continuation_explicit_selectors_reject_prefixes_ambiguity_and_conflicts() {
 }
 
 #[test]
-fn missing_show_selector_and_tunnel_id_cancel_without_effect() {
-    let root = std::env::temp_dir().join(format!(
-        "sshx-missing-selection-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let home = root.join("home");
-    let ssh_dir = home.join(".ssh");
-    fs::create_dir_all(&ssh_dir).unwrap();
-    fs::set_permissions(&ssh_dir, fs::Permissions::from_mode(0o700)).unwrap();
-    let config = ssh_dir.join("config");
-    let contents = "Host exact\n  HostName exact.example\n";
-    fs::write(&config, contents).unwrap();
-    fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
-    let binary = env!("CARGO_BIN_EXE_sshx");
-    for (command, marker) in [
-        (["host", "show"], "sshx Hosts"),
-        (["tunnel", "stop"], "Tunnels"),
-    ] {
-        let mut master = -1;
-        let mut slave = -1;
-        let mut size = libc::winsize {
-            ws_row: 40,
-            ws_col: 100,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
-        };
-        assert_eq!(
-            unsafe {
-                libc::openpty(
-                    &mut master,
-                    &mut slave,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    &raw mut size,
-                )
-            },
-            0
-        );
-        let slave = unsafe { File::from_raw_fd(slave) };
-        let mut child = Command::new(binary)
-            .arg("--config")
-            .arg(&config)
-            .args(command)
-            .env("HOME", &home)
-            .stdin(Stdio::from(slave.try_clone().unwrap()))
-            .stdout(Stdio::from(slave.try_clone().unwrap()))
-            .stderr(Stdio::from(slave))
-            .spawn()
-            .unwrap();
-        let mut master = unsafe { File::from_raw_fd(master) };
-        let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
-        assert_eq!(
-            unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
-            0
-        );
-        let mut output = Vec::new();
-        let deadline = Instant::now() + Duration::from_secs(8);
-        while !contains_tui_text(&output, marker) && Instant::now() < deadline {
-            let mut buffer = [0u8; 4096];
-            match master.read(&mut buffer) {
-                Ok(size) => output.extend_from_slice(&buffer[..size]),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(error) => panic!("PTY read failed: {error}"),
-            }
-            if child.try_wait().unwrap().is_some() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(
-            contains_tui_text(&output, marker),
-            "missing selector did not enter {marker}: {}",
-            String::from_utf8_lossy(&output)
-        );
-        master.write_all(b"\x1b").unwrap();
-        let deadline = Instant::now() + Duration::from_secs(8);
-        while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
-            let mut buffer = [0u8; 4096];
-            if let Ok(size) = master.read(&mut buffer) {
-                output.extend_from_slice(&buffer[..size]);
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        if child.try_wait().unwrap().is_none() {
-            child.kill().unwrap();
-            panic!("{marker} did not cancel after Esc");
-        }
-        assert_eq!(child.wait().unwrap().code(), Some(130));
-    }
-    assert_eq!(fs::read_to_string(&config).unwrap(), contents);
-    assert!(!home.join(".config/sshx/tunnels").exists());
-    fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn host_delete_explicit_tui_result_refreshes_hosts_and_stays_open() {
-    let before = "Host selected secondary\n  HostName old.example\n  ##PASSWORD stored-secret\nHost untouched\n  HostName untouched.example\n";
-    let (root, home, config) = host_edit_fixture("explicit-tui-delete", before);
-    for preview in [false, true] {
-        fs::write(&config, before).unwrap();
-        let mut arguments = vec!["tui", "host", "delete", "secondary", "--yes"];
-        if preview {
-            arguments.push("--preview");
-        }
-        let mut terminal = HostEditTerminal::open(&home, &config, &arguments);
-        terminal.expect("Review HostEntry mutation");
-        terminal.expect("Alias: secondary");
-        assert!(!String::from_utf8_lossy(&terminal.output).contains("stored-secret"));
-        terminal.send(b"\r");
-        terminal.expect(if preview {
-            "HostEntry preview complete."
-        } else {
-            "HostEntry deleted."
-        });
-        terminal.expect("Search:");
-        assert!(!String::from_utf8_lossy(&terminal.output).contains("stored-secret"));
-        assert_eq!(
-            fs::read_to_string(&config).unwrap(),
-            if preview {
-                before
-            } else {
-                "Host untouched\n  HostName untouched.example\n"
-            }
-        );
-        assert!(terminal.child.try_wait().unwrap().is_none());
-        let size = libc::winsize {
-            ws_row: 39,
-            ws_col: 119,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
-        };
-        assert_eq!(
-            unsafe { libc::ioctl(terminal.master.as_raw_fd(), libc::TIOCSWINSZ, &size) },
-            0
-        );
-        terminal.send(b"secondary");
-        terminal.expect(if preview {
-            "old.example"
-        } else {
-            "No matching HostEntry aliases."
-        });
-        assert!(terminal.child.try_wait().unwrap().is_none());
-        terminal.send(b"\x1b");
-        terminal.expect("NORMAL");
-        terminal.send(b"q");
-        assert_eq!(terminal.finish(), Some(0));
-    }
-    fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn host_delete_explicit_selectors_do_not_filter_refreshed_hosts() {
-    let id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-    let before = format!(
-        "##SSHX ID={id}\nHost selected\n  HostName old.example\nHost untouched\n  HostName untouched.example\n"
-    );
-    let (root, home, config) = host_edit_fixture("delete-selectors", &before);
-    let source = config.canonicalize().unwrap();
-    for by_id in [true, false] {
-        fs::write(&config, &before).unwrap();
-        let mut arguments = vec!["tui", "host", "delete"];
-        if by_id {
-            arguments.extend(["--id", id]);
-        } else {
-            arguments.extend([
-                "selected",
-                "--source",
-                source.to_str().unwrap(),
-                "--line",
-                "2",
-            ]);
-        }
-        arguments.push("--yes");
-        let mut terminal = HostEditTerminal::open(&home, &config, &arguments);
-        terminal.expect("Review HostEntry mutation");
-        terminal.send(b"\r");
-        terminal.expect("HostEntry deleted.");
-        terminal.expect("untouched.example");
-        assert_eq!(
-            fs::read_to_string(&config).unwrap(),
-            "Host untouched\n  HostName untouched.example\n"
-        );
-        assert!(terminal.child.try_wait().unwrap().is_none());
-        terminal.send(b"\x1b");
-        terminal.expect("NORMAL");
-        terminal.send(b"q");
-        assert_eq!(terminal.finish(), Some(0));
-    }
-    fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn host_delete_preview_and_review_cancellation_preserve_source() {
-    let before = "Host prod secondary\n  HostName old.example\n  ##PASSWORD stored-secret\n";
-    let (root, home, config) = host_edit_fixture("preview-delete", before);
-    for (arguments, exit, key) in [
-        (
-            vec!["tui", "host", "delete", "secondary", "--preview", "--yes"],
-            0,
-            b"\r".as_slice(),
-        ),
-        (
-            vec!["tui", "host", "delete", "secondary", "--yes"],
-            130,
-            b"\x03".as_slice(),
-        ),
-    ] {
-        let mut terminal = HostEditTerminal::open(&home, &config, &arguments);
-        terminal.expect("Review HostEntry mutation");
-        terminal.expect("Alias: secondary");
-        terminal.expect("<redacted>");
-        assert!(!String::from_utf8_lossy(&terminal.output).contains("stored-secret"));
-        if arguments.contains(&"--preview") {
-            let size = libc::winsize {
-                ws_row: 8,
-                ws_col: 24,
-                ws_xpixel: 0,
-                ws_ypixel: 0,
-            };
-            assert_eq!(
-                unsafe { libc::ioctl(terminal.master.as_raw_fd(), libc::TIOCSWINSZ, &size) },
-                0
-            );
-            terminal.send(b"\x1b[6~");
-            terminal.expect("Enter finish preview");
-            let size = libc::winsize {
-                ws_row: 40,
-                ws_col: 120,
-                ws_xpixel: 0,
-                ws_ypixel: 0,
-            };
-            assert_eq!(
-                unsafe { libc::ioctl(terminal.master.as_raw_fd(), libc::TIOCSWINSZ, &size) },
-                0
-            );
-        }
-        terminal.send(key);
-        if arguments.contains(&"--preview") {
-            terminal.expect("HostEntry preview complete.");
-            assert!(!contains_tui_text(&terminal.output, "HostEntry deleted."));
-            assert!(terminal.child.try_wait().unwrap().is_none());
-            terminal.send(b"\x1b");
-            terminal.expect("NORMAL");
-            terminal.send(b"q");
-        }
-        assert_eq!(terminal.finish(), Some(exit));
-        assert_eq!(fs::read_to_string(&config).unwrap(), before);
-    }
-    fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn host_delete_rejects_changed_source_and_new_dependencies_after_review() {
-    let id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-    let before = format!("##SSHX ID={id}\nHost selected\n  HostName old.example\n");
-    let (root, home, config) = host_edit_fixture("stale-delete", &before);
-    for after_review in [false, true] {
-        fs::write(&config, &before).unwrap();
-        let arguments = if after_review {
-            vec!["tui", "host", "delete", "selected"]
-        } else {
-            vec!["host", "delete"]
-        };
-        let mut terminal = HostEditTerminal::open(&home, &config, &arguments);
-        terminal.expect(if after_review {
-            "Review HostEntry mutation"
-        } else {
-            "host delete"
-        });
-        let external = format!("{before}# external edit\n");
-        fs::write(&config, &external).unwrap();
-        terminal.send(b"\r");
-        terminal.expect("HOST_SOURCE_CHANGED");
-        assert_eq!(terminal.finish(), Some(2));
-        assert_eq!(fs::read_to_string(&config).unwrap(), external);
-    }
-    fs::write(&config, &before).unwrap();
-    let replacement = home.join(".ssh/replacement");
-    fs::write(&replacement, &before).unwrap();
-    let mut terminal =
-        HostEditTerminal::open(&home, &config, &["tui", "host", "delete", "selected"]);
-    terminal.expect("Review HostEntry mutation");
-    fs::remove_file(&config).unwrap();
-    std::os::unix::fs::symlink(&replacement, &config).unwrap();
-    terminal.send(b"\r");
-    terminal.expect("CONFIG_ROOT_SYMLINK");
-    assert_eq!(terminal.finish(), Some(2));
-    assert!(
-        fs::symlink_metadata(&config)
-            .unwrap()
-            .file_type()
-            .is_symlink()
-    );
-    assert_eq!(fs::read_to_string(&replacement).unwrap(), before);
-    fs::remove_file(&config).unwrap();
-    let dependency = home.join(".ssh/dependency");
-    fs::write(&dependency, "Host vm\n  HostName vm.example\n").unwrap();
-    fs::set_permissions(&dependency, fs::Permissions::from_mode(0o600)).unwrap();
-    let included = format!("Include dependency\n{before}");
-    fs::write(&config, &included).unwrap();
-    let mut terminal =
-        HostEditTerminal::open(&home, &config, &["tui", "host", "delete", "selected"]);
-    terminal.expect("Review HostEntry mutation");
-    fs::write(
-        &dependency,
-        format!("##SSHX GATEWAY={id}\nHost vm\n  HostName vm.example\n"),
-    )
-    .unwrap();
-    terminal.send(b"\r");
-    terminal.expect("DELETE_REFERENCED");
-    assert_eq!(terminal.finish(), Some(2));
-    assert_eq!(fs::read_to_string(&config).unwrap(), included);
-    fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn host_delete_pair_blocker_shows_exact_sources_and_redacts_password() {
-    let gateway = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-    let vm = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
-    let before = format!(
-        "##SSHX ID={gateway}\n##SSHX VM={vm}\nHost gateway\n  HostName gateway.example\n  ##PASSWORD stored-secret\n##SSHX ID={vm}\n##SSHX GATEWAY={gateway}\n##SSHX TRANSIT=127.0.0.1:2222\nHost vm\n  HostName vm.example\n"
-    );
-    let (root, home, config) = host_edit_fixture("pair-delete", &before);
-    let mut terminal = HostEditTerminal::open(
-        &home,
-        &config,
-        &["tui", "host", "delete", "gateway", "--yes"],
-    );
-    terminal.expect("HostEntry deletion blocked");
-    terminal.expect("-Host gateway");
-    terminal.expect("<redacted>");
-    terminal.expect("Pair gateway: gateway");
-    terminal.expect("Pair VM: vm");
-    terminal.expect("Transit: 127.0.0.1:2222");
-    terminal.expect("DELETE_REFERENCED");
-    assert!(!String::from_utf8_lossy(&terminal.output).contains("stored-secret"));
-    terminal.send(b"\r");
-    assert_eq!(terminal.finish(), Some(2));
-    assert_eq!(fs::read_to_string(&config).unwrap(), before);
-    fs::write(
-        &config,
-        format!(
-            "##SSHX ID={gateway}\n##SSHX TRANSIT=broken\nHost gateway\n  HostName gateway.example\n"
-        ),
-    )
-    .unwrap();
-    let mut terminal =
-        HostEditTerminal::open(&home, &config, &["tui", "host", "delete", "gateway"]);
-    terminal.expect("HostEntry deletion blocked");
-    terminal.expect("DELETE_REFERENCED");
-    terminal.send(b"\x1b");
-    assert_eq!(terminal.finish(), Some(2));
-    fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
 fn host_delete_blocks_active_registry_uuid_with_different_case() {
     let selected = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
     let unrelated = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
@@ -618,7 +202,7 @@ fn host_delete_blocks_active_registry_uuid_with_different_case() {
 }
 
 #[test]
-fn host_delete_registry_safety_matches_each_record_and_rechecks_after_review() {
+fn host_delete_registry_safety_matches_each_record() {
     let selected = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
     let unrelated = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
     let before = format!("##SSHX ID={selected}\nHost selected\n  HostName selected.example\n");
@@ -671,30 +255,6 @@ fn host_delete_registry_safety_matches_each_record_and_rechecks_after_review() {
         );
         assert_eq!(fs::read_to_string(&config).unwrap(), before);
     }
-    fs::write(
-        &registry,
-        serde_json::json!({"version": 1, "tunnels": [
-            {"state": "stopped", "entry_id": selected},
-            {"state": "active", "entry_id": unrelated}
-        ]})
-        .to_string(),
-    )
-    .unwrap();
-    let mut terminal =
-        HostEditTerminal::open(&home, &config, &["tui", "host", "delete", "selected"]);
-    terminal.expect("Review HostEntry mutation");
-    fs::write(
-        &registry,
-        serde_json::json!({"version": 1, "tunnels": [
-            {"state": "starting", "entry_id": selected}
-        ]})
-        .to_string(),
-    )
-    .unwrap();
-    terminal.send(b"\r");
-    terminal.expect("DELETE_ACTIVE");
-    assert_eq!(terminal.finish(), Some(2));
-    assert_eq!(fs::read_to_string(&config).unwrap(), before);
     fs::write(
         &registry,
         serde_json::json!({"version": 1, "tunnels": [
@@ -784,260 +344,6 @@ fn host_delete_complete_cli_keeps_consent_and_exact_selector_errors() {
         fs::read_to_string(&config).unwrap(),
         "Host prod\n  HostName duplicate.example\n"
     );
-    fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn host_delete_selectorless_reviews_exact_duplicate_before_apply() {
-    let before = "Host duplicate\n  HostName first.example\n  ##PASSWORD stored-secret\nHost duplicate\n  HostName second.example\nHost other\n  HostName untouched.example\n";
-    let (root, home, config) = host_edit_fixture("delete-duplicate", before);
-    let mut terminal = HostEditTerminal::open(&home, &config, &["host", "delete", "--yes"]);
-    terminal.expect("host delete");
-    terminal.send(b"duplicate\x1b[B\r");
-    terminal.expect("Review HostEntry mutation");
-    terminal.expect("-  HostName second.example");
-    assert_eq!(fs::read_to_string(&config).unwrap(), before);
-    terminal.send(b"\x1b");
-    assert_eq!(terminal.finish(), Some(130));
-    assert_eq!(fs::read_to_string(&config).unwrap(), before);
-    let mut terminal = HostEditTerminal::open(&home, &config, &["host", "delete", "--yes"]);
-    terminal.expect("host delete");
-    terminal.send(b"duplicate\x1b[B\r");
-    terminal.expect("Review HostEntry mutation");
-    terminal.send(b"\r");
-    assert_eq!(terminal.finish(), Some(0));
-    assert_eq!(
-        fs::read_to_string(&config).unwrap(),
-        "Host duplicate\n  HostName first.example\n  ##PASSWORD stored-secret\nHost other\n  HostName untouched.example\n"
-    );
-    fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn partial_host_update_reviews_prefilled_values_before_apply() {
-    let root = std::env::temp_dir().join(format!(
-        "sshx-edit-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let home = root.join("home");
-    fs::create_dir_all(home.join(".ssh")).unwrap();
-    fs::set_permissions(home.join(".ssh"), fs::Permissions::from_mode(0o700)).unwrap();
-    let config = home.join(".ssh/config");
-    let before = "Host prod secondary\n  HostName old.example\n  User alice\n  Port 2222\n";
-    fs::write(&config, before).unwrap();
-    fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
-    let mut terminal = HostEditTerminal::open(&home, &config, &["host", "update", "secondary"]);
-    terminal.expect("Edit HostEntry");
-    terminal.expect("old.example");
-    terminal.send(b"\t");
-    terminal.send(&[0x7f; 11]);
-    terminal.send(b"new.example\x13");
-    terminal.expect("Review HostEntry changes");
-    terminal.expect("Alias: secondary");
-    assert_eq!(fs::read_to_string(&config).unwrap(), before);
-    terminal.send(b"\r");
-    assert_eq!(terminal.finish(), Some(0));
-    assert_eq!(
-        without_added_id(&fs::read_to_string(&config).unwrap()),
-        "Host prod secondary\n  HostName new.example\n  User alice\n  Port 2222\n"
-    );
-    fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn tui_rename_changes_only_selected_secondary_alias_and_keeps_review_edits() {
-    let (root, home, config) = host_edit_fixture(
-        "rename",
-        "Host prod secondary\n  HostName old.example\n  User alice\n  Port 2222\n  ##PASSWORD stored-secret\nHost other\n  HostName untouched.example\n",
-    );
-    let mut terminal = HostEditTerminal::open(
-        &home,
-        &config,
-        &[
-            "tui",
-            "host",
-            "rename",
-            "secondary",
-            "--alias",
-            "renamed",
-            "--yes",
-        ],
-    );
-    terminal.expect("Rename HostEntry");
-    terminal.expect("renamed");
-    terminal.send(b"\x13");
-    terminal.expect("Review HostEntry changes");
-    terminal.expect("Host prod renamed");
-    assert!(!String::from_utf8_lossy(&terminal.output).contains("stored-secret"));
-    terminal.send(b"e");
-    terminal.expect("Rename HostEntry");
-    terminal.expect("renamed");
-    terminal.send(b"2\x13");
-    terminal.expect("Host prod renamed2");
-    terminal.send(b"\r");
-    assert_eq!(terminal.finish(), Some(0));
-    assert_eq!(
-        without_added_id(&fs::read_to_string(&config).unwrap()),
-        "Host prod renamed2\n  HostName old.example\n  User alice\n  Port 2222\n  ##PASSWORD stored-secret\nHost other\n  HostName untouched.example\n"
-    );
-    fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn tui_update_keeps_replaces_and_clears_optional_values_without_exposing_passwords() {
-    let before = "Host prod secondary\n  HostName old.example\n  User alice\n  Port 2222\n  ##PASSWORD stored-secret\n";
-    let (root, home, config) = host_edit_fixture("fields", before);
-    let mut terminal = HostEditTerminal::open(
-        &home,
-        &config,
-        &[
-            "tui",
-            "host",
-            "update",
-            "secondary",
-            "--hostname",
-            "new.example",
-        ],
-    );
-    terminal.expect("Edit HostEntry");
-    terminal.expect("Password [keep]");
-    assert!(!String::from_utf8_lossy(&terminal.output).contains("stored-secret"));
-    terminal.send(b"\t\t\x18\t\x18\tnew-secret\x13");
-    terminal.expect("Review HostEntry changes");
-    terminal.expect("<redacted>");
-    assert!(!String::from_utf8_lossy(&terminal.output).contains("new-secret"));
-    assert!(!String::from_utf8_lossy(&terminal.output).contains("stored-secret"));
-    terminal.send(b"e");
-    terminal.expect("Password [replace]");
-    terminal.send(b"\x18\x13");
-    terminal.expect("Review HostEntry changes");
-    terminal.send(b"\r");
-    assert_eq!(terminal.finish(), Some(0));
-    assert_eq!(
-        without_added_id(&fs::read_to_string(&config).unwrap()),
-        "Host prod secondary\n  HostName new.example\n"
-    );
-    fs::write(&config, before).unwrap();
-    let mut terminal = HostEditTerminal::open(
-        &home,
-        &config,
-        &["tui", "host", "update", "secondary", "--user", "bob"],
-    );
-    terminal.expect("Edit HostEntry");
-    terminal.send(b"\t\t\t\tnew-secret\x13");
-    terminal.expect("Review HostEntry changes");
-    terminal.send(b"\r");
-    assert_eq!(terminal.finish(), Some(0));
-    assert_eq!(
-        without_added_id(&fs::read_to_string(&config).unwrap()),
-        "Host prod secondary\n  HostName old.example\n  User bob\n  Port 2222\n  ##PASSWORD new-secret\n"
-    );
-    fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn host_edit_rejects_source_changes_before_selection_after_selection_and_after_review() {
-    let before = "Host prod secondary\n  HostName old.example\n  User alice\n";
-    let (root, home, config) = host_edit_fixture("stale-edit", before);
-    for stage in 0..3 {
-        fs::write(&config, before).unwrap();
-        let arguments = if stage == 0 {
-            vec!["host", "update", "--hostname", "new.example"]
-        } else {
-            vec![
-                "tui",
-                "host",
-                "update",
-                "secondary",
-                "--hostname",
-                "new.example",
-            ]
-        };
-        let mut terminal = HostEditTerminal::open(&home, &config, &arguments);
-        terminal.expect(if stage == 0 {
-            "host update"
-        } else {
-            "Edit HostEntry"
-        });
-        if stage == 2 {
-            terminal.send(b"\x13");
-            terminal.expect("Review HostEntry changes");
-        }
-        let external = format!("{before}# edited externally\n");
-        fs::write(&config, &external).unwrap();
-        terminal.send(if stage == 1 { b"\x13" } else { b"\r" });
-        terminal.expect("HOST_SOURCE_CHANGED");
-        if stage != 0 {
-            terminal.send(b"\x1b");
-        }
-        assert_eq!(terminal.finish(), Some(if stage == 0 { 2 } else { 130 }));
-        assert_eq!(fs::read_to_string(&config).unwrap(), external);
-    }
-    fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn host_edit_preview_and_cancel_never_apply_pending_changes() {
-    let before = "Host prod secondary\n  HostName old.example\n  User alice\n";
-    let (root, home, config) = host_edit_fixture("preview-edit", before);
-    for arguments in [
-        vec![
-            "tui",
-            "host",
-            "rename",
-            "secondary",
-            "--alias",
-            "renamed",
-            "--preview",
-            "--yes",
-        ],
-        vec!["host", "update", "secondary"],
-        vec![
-            "tui",
-            "host",
-            "update",
-            "secondary",
-            "--hostname",
-            "new.example",
-            "--yes",
-        ],
-    ] {
-        let mut terminal = HostEditTerminal::open(&home, &config, &arguments);
-        terminal.expect(if arguments.contains(&"rename") {
-            "Rename HostEntry"
-        } else {
-            "Edit HostEntry"
-        });
-        if arguments.contains(&"--preview") {
-            let size = libc::winsize {
-                ws_row: 8,
-                ws_col: 24,
-                ws_xpixel: 0,
-                ws_ypixel: 0,
-            };
-            assert_eq!(
-                unsafe { libc::ioctl(terminal.master.as_raw_fd(), libc::TIOCSWINSZ, &size) },
-                0
-            );
-            terminal.send(b"\x13");
-            terminal.expect("Enter finish preview");
-            terminal.send(b"\r");
-            assert_eq!(terminal.finish(), Some(0));
-        } else if arguments.contains(&"--hostname") {
-            terminal.send(b"\x13");
-            terminal.expect("Review HostEntry changes");
-            terminal.send(b"\x03");
-            assert_eq!(terminal.finish(), Some(130));
-        } else {
-            terminal.send(b"\x1b");
-            assert_eq!(terminal.finish(), Some(130));
-        }
-        assert_eq!(fs::read_to_string(&config).unwrap(), before);
-    }
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -1206,90 +512,6 @@ fn invalid_partial_host_edit_fails_before_interactive_selection() {
             "Host prod\n  HostName old.example\n"
         );
     }
-    fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn host_edit_validation_keeps_values_and_focuses_invalid_port() {
-    let (root, home, config) = host_edit_fixture(
-        "validation-edit",
-        "Host prod secondary\n  HostName old.example\n  User alice\n  Port 2222\n",
-    );
-    let mut terminal = HostEditTerminal::open(
-        &home,
-        &config,
-        &[
-            "tui",
-            "host",
-            "update",
-            "secondary",
-            "--hostname",
-            "new.example",
-        ],
-    );
-    terminal.expect("Edit HostEntry");
-    terminal.send(b"\t\t\t");
-    terminal.send(&[0x7f; 4]);
-    terminal.send(b"0\x13");
-    terminal.expect("PORT_INVALID");
-    terminal.expect("new.example");
-    terminal.expect("> Port [replace]: 0");
-    terminal.send(b"\x7f22\x13");
-    terminal.expect("Review HostEntry changes");
-    terminal.expect("+  Port 22");
-    terminal.send(b"\r");
-    assert_eq!(terminal.finish(), Some(0));
-    assert_eq!(
-        without_added_id(&fs::read_to_string(&config).unwrap()),
-        "Host prod secondary\n  HostName new.example\n  User alice\n  Port 22\n"
-    );
-    fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn missing_host_selector_prefills_clear_flag_and_can_replace_that_field() {
-    let (root, home, config) = host_edit_fixture(
-        "partial-clear",
-        "Host prod secondary\n  HostName old.example\n  User alice\n  Port 2222\n",
-    );
-    let mut terminal = HostEditTerminal::open(&home, &config, &["host", "update", "--clear-user"]);
-    terminal.expect("host update");
-    terminal.send(b"secondary\r");
-    terminal.expect("Edit HostEntry");
-    terminal.expect("User [clear]");
-    terminal.send(b"\t\tbob\x13");
-    terminal.expect("Review HostEntry changes");
-    terminal.expect("+  User bob");
-    terminal.send(b"\r");
-    assert_eq!(terminal.finish(), Some(0));
-    assert_eq!(
-        without_added_id(&fs::read_to_string(&config).unwrap()),
-        "Host prod secondary\n  HostName old.example\n  User bob\n  Port 2222\n"
-    );
-    fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn host_update_prefills_quoted_port_and_preserves_it_when_kept() {
-    let (root, home, config) = host_edit_fixture(
-        "quoted-port",
-        "Host prod secondary\n  HostName old.example\n  User alice\n  Port \"2222\"\n",
-    );
-    let mut terminal = HostEditTerminal::open(
-        &home,
-        &config,
-        &["tui", "host", "update", "secondary", "--user", "bob"],
-    );
-    terminal.expect("Edit HostEntry");
-    terminal.expect("Port [keep]: 2222");
-    terminal.send(b"\x13");
-    terminal.expect("Review HostEntry changes");
-    terminal.send(b"\r");
-    assert_eq!(terminal.finish(), Some(0));
-    assert_eq!(
-        without_added_id(&fs::read_to_string(&config).unwrap()),
-        "Host prod secondary\n  HostName old.example\n  User bob\n  Port \"2222\"\n"
-    );
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -1554,6 +776,282 @@ fn pair_inspection_fixture(
     fs::write(&ssh, "#!/bin/sh\ntouch \"$SSHX_SENTINEL\"\nexit 97\n").unwrap();
     fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
     (root, home, config)
+}
+
+#[test]
+fn continuation_exact_selection_opens_ports_and_cancels_without_side_effect() {
+    let original = concat!(
+        "##SSHX ID=11111111-1111-4111-8111-111111111111\n",
+        "Host duplicate secondary\n  HostName first.example\n",
+        "##SSHX ID=22222222-2222-4222-8222-222222222222\n",
+        "Host duplicate other\n  HostName second.example\n",
+    );
+    let (root, home, config) = host_edit_fixture("exact-continuation", original);
+    let bin = root.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let ssh = bin.join("ssh");
+    fs::write(&ssh, "#!/bin/sh\ntouch \"$SSHX_SENTINEL\"\nexit 97\n").unwrap();
+    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let sentinel = root.join("ssh-started");
+    for selection in [
+        vec!["--id", "11111111-1111-4111-8111-111111111111"],
+        vec!["--source", config.to_str().unwrap(), "--line", "2"],
+    ] {
+        let mut arguments = vec!["tui", "connect", "secondary"];
+        arguments.extend(selection);
+        let mut terminal = HostEditTerminal::open_with_env(
+            &home,
+            &config,
+            &arguments,
+            &[
+                ("PATH", &path),
+                ("SSHX_SENTINEL", sentinel.to_str().unwrap()),
+            ],
+        );
+        terminal.expect("ports · secondary");
+        terminal.send(b"\x03");
+        assert_eq!(terminal.finish(), Some(130));
+        assert_eq!(fs::read_to_string(&config).unwrap(), original);
+        assert!(!sentinel.exists(), "cancellation started OpenSSH");
+        assert!(
+            !home.join(".config/sshx").exists(),
+            "cancellation persisted state"
+        );
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn missing_show_selector_and_tunnel_id_cancel_without_effect() {
+    let contents = "Host exact\n  HostName exact.example\n";
+    let (root, home, config) = host_edit_fixture("missing-selection", contents);
+    for (command, marker) in [
+        (["host", "show"], "Search:"),
+        (["tunnel", "stop"], "No standalone tunnels"),
+    ] {
+        let mut terminal = HostEditTerminal::open(&home, &config, &command);
+        terminal.expect(marker);
+        terminal.send(b"\x03");
+        assert_eq!(terminal.finish(), Some(130), "{command:?}");
+    }
+    assert_eq!(fs::read_to_string(&config).unwrap(), contents);
+    assert!(!home.join(".config/sshx/tunnels").exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn host_show_without_a_selector_prints_the_chosen_entry_after_the_finder() {
+    let contents = "Host first\n  HostName first.example\nHost second\n  HostName second.example\n";
+    let (root, home, config) = host_edit_fixture("show-picker", contents);
+    let mut terminal = HostEditTerminal::open(&home, &config, &["host", "show"]);
+    terminal.expect("Search:");
+    terminal.send(b"second\r");
+    terminal.expect("second.example");
+    assert_eq!(terminal.finish(), Some(0));
+    assert_eq!(fs::read_to_string(&config).unwrap(), contents);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn tui_host_delete_confirms_then_returns_to_the_finder_without_the_host() {
+    let before = "Host selected secondary\n  HostName old.example\n  ##PASSWORD stored-secret\nHost untouched\n  HostName untouched.example\n";
+    let (root, home, config) = host_edit_fixture("explicit-tui-delete", before);
+    let mut terminal =
+        HostEditTerminal::open(&home, &config, &["tui", "host", "delete", "secondary"]);
+    terminal.expect("Delete this HostEntry block");
+    terminal.expect("Host selected");
+    assert!(!String::from_utf8_lossy(&terminal.output).contains("stored-secret"));
+    assert_eq!(fs::read_to_string(&config).unwrap(), before);
+    terminal.send(b"y");
+    terminal.expect("deleted secondary");
+    assert_eq!(
+        fs::read_to_string(&config).unwrap(),
+        "Host untouched\n  HostName untouched.example\n"
+    );
+    terminal.send(b"secondary");
+    terminal.expect("No matching HostEntry aliases.");
+    terminal.send(b"\x1b");
+    terminal.expect("NORMAL");
+    terminal.send(b"q");
+    assert_eq!(terminal.finish(), Some(0));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn host_update_with_a_selector_opens_the_form_and_writes_on_wq() {
+    let before = "Host prod secondary\n  HostName old.example\n  User alice\n  Port 2222\n";
+    let (root, home, config) = host_edit_fixture("update-form", before);
+    let mut terminal = HostEditTerminal::open(&home, &config, &["host", "update", "secondary"]);
+    terminal.expect("edit host");
+    terminal.expect("old.example");
+    terminal.send(b"ji");
+    terminal.send(&[0x7f; 11]);
+    terminal.send(b"new.example\r");
+    assert_eq!(fs::read_to_string(&config).unwrap(), before);
+    terminal.send(b":wq\r");
+    terminal.expect("Search:");
+    terminal.send(b"\x1b");
+    terminal.expect("NORMAL");
+    terminal.send(b"q");
+    assert_eq!(terminal.finish(), Some(0));
+    assert_eq!(
+        without_added_id(&fs::read_to_string(&config).unwrap()),
+        "Host prod secondary\n  HostName new.example\n  User alice\n  Port 2222\n"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn tui_rename_prefills_the_alias_and_changes_only_the_selected_alias() {
+    let (root, home, config) = host_edit_fixture(
+        "rename",
+        "Host prod secondary\n  HostName old.example\n  User alice\n  Port 2222\n  ##PASSWORD stored-secret\nHost other\n  HostName untouched.example\n",
+    );
+    let mut terminal = HostEditTerminal::open(
+        &home,
+        &config,
+        &["tui", "host", "rename", "secondary", "--alias", "renamed"],
+    );
+    terminal.expect("edit host");
+    terminal.expect("renamed");
+    terminal.expect("+Host prod renamed");
+    assert!(!String::from_utf8_lossy(&terminal.output).contains("stored-secret"));
+    terminal.send(b":wq\r");
+    terminal.expect("Search:");
+    terminal.send(b"\x1b");
+    terminal.expect("NORMAL");
+    terminal.send(b"q");
+    assert_eq!(terminal.finish(), Some(0));
+    assert_eq!(
+        without_added_id(&fs::read_to_string(&config).unwrap()),
+        "Host prod renamed\n  HostName old.example\n  User alice\n  Port 2222\n  ##PASSWORD stored-secret\nHost other\n  HostName untouched.example\n"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn tui_update_prefills_flags_and_clears_a_stored_password_without_showing_it() {
+    let before = "Host prod secondary\n  HostName old.example\n  User alice\n  Port 2222\n  ##PASSWORD stored-secret\n";
+    let (root, home, config) = host_edit_fixture("fields", before);
+    let mut terminal = HostEditTerminal::open(
+        &home,
+        &config,
+        &[
+            "tui",
+            "host",
+            "update",
+            "secondary",
+            "--hostname",
+            "new.example",
+        ],
+    );
+    terminal.expect("edit host");
+    terminal.expect("new.example");
+    assert!(!String::from_utf8_lossy(&terminal.output).contains("stored-secret"));
+    terminal.send(b"jjjjjji\x7f\r");
+    terminal.expect("-  ##PASSWORD ••••");
+    terminal.send(b":wq\r");
+    terminal.expect("Search:");
+    terminal.send(b"\x1b");
+    terminal.expect("NORMAL");
+    terminal.send(b"q");
+    assert_eq!(terminal.finish(), Some(0));
+    assert_eq!(
+        without_added_id(&fs::read_to_string(&config).unwrap()),
+        "Host prod secondary\n  HostName new.example\n  User alice\n  Port 2222\n"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn missing_host_selector_opens_the_finder_and_prefills_the_clear_flag() {
+    let (root, home, config) = host_edit_fixture(
+        "partial-clear",
+        "Host prod secondary\n  HostName old.example\n  User alice\n  Port 2222\n",
+    );
+    let mut terminal = HostEditTerminal::open(&home, &config, &["host", "update", "--clear-user"]);
+    terminal.expect("Search:");
+    terminal.send(b"secondary\r");
+    terminal.expect("edit host");
+    terminal.expect("-  User alice");
+    terminal.send(b"jjibob\r");
+    terminal.send(b":wq\r");
+    terminal.expect("Search:");
+    terminal.send(b"\x1b");
+    terminal.expect("NORMAL");
+    terminal.send(b"q");
+    assert_eq!(terminal.finish(), Some(0));
+    assert_eq!(
+        without_added_id(&fs::read_to_string(&config).unwrap()),
+        "Host prod secondary\n  HostName old.example\n  User bob\n  Port 2222\n"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn host_update_keeps_a_quoted_port_that_the_form_did_not_change() {
+    let (root, home, config) = host_edit_fixture(
+        "quoted-port",
+        "Host prod secondary\n  HostName old.example\n  User alice\n  Port \"2222\"\n",
+    );
+    let mut terminal = HostEditTerminal::open(
+        &home,
+        &config,
+        &["tui", "host", "update", "secondary", "--user", "bob"],
+    );
+    terminal.expect("edit host");
+    terminal.expect("2222");
+    terminal.send(b":wq\r");
+    terminal.expect("Search:");
+    terminal.send(b"\x1b");
+    terminal.expect("NORMAL");
+    terminal.send(b"q");
+    assert_eq!(terminal.finish(), Some(0));
+    assert_eq!(
+        without_added_id(&fs::read_to_string(&config).unwrap()),
+        "Host prod secondary\n  HostName old.example\n  User bob\n  Port \"2222\"\n"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn host_edit_refuses_to_write_over_a_source_that_changed_after_the_form_opened() {
+    let before = "Host prod secondary\n  HostName old.example\n  User alice\n";
+    let (root, home, config) = host_edit_fixture("stale-edit", before);
+    for via_finder in [false, true] {
+        fs::write(&config, before).unwrap();
+        let arguments: &[&str] = if via_finder {
+            &["host", "update", "--hostname", "new.example"]
+        } else {
+            &[
+                "tui",
+                "host",
+                "update",
+                "secondary",
+                "--hostname",
+                "new.example",
+            ]
+        };
+        let mut terminal = HostEditTerminal::open(&home, &config, arguments);
+        if via_finder {
+            terminal.expect("Search:");
+            terminal.send(b"secondary\r");
+        }
+        terminal.expect("edit host");
+        let external = format!("{before}# edited externally\n");
+        fs::write(&config, &external).unwrap();
+        terminal.send(b":w\r");
+        terminal.expect("HOST_SOURCE_CHANGED");
+        terminal.send(b"\x03");
+        assert_eq!(terminal.finish(), Some(130));
+        assert_eq!(fs::read_to_string(&config).unwrap(), external);
+    }
+    fs::remove_dir_all(root).unwrap();
 }
 
 fn host_edit_fixture(

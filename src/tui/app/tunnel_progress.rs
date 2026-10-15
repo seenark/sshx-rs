@@ -630,17 +630,23 @@ fn open(runtime: &Runtime, request: &TunnelStartRequest) -> Result<TunnelView, S
     {
         return Err("UNSUPPORTED_MATCH: Match prevents exact runtime configuration".to_string());
     }
-    let route = sshx::pair::paired_route(&data.catalog.entries, &request.entry)?;
-    if !crate::entry_sources_unchanged(&request.entry, &data.sources)
-        || route
-            .as_ref()
-            .is_some_and(|route| !crate::entry_sources_unchanged(&route.gateway, &data.sources))
-    {
-        return Err(format!(
+    let changed = || {
+        format!(
             "HOST_SOURCE_CHANGED: {} changed; select its current HostEntry again",
             request.entry.source.path
-        ));
+        )
+    };
+    if !crate::entry_sources_unchanged(&request.entry, &data.sources) {
+        return Err(changed());
     }
+    let route = sshx::pair::paired_route(&data.catalog.entries, &request.entry)?;
+    if route
+        .as_ref()
+        .is_some_and(|route| !crate::entry_sources_unchanged(&route.gateway, &data.sources))
+    {
+        return Err(changed());
+    }
+    crate::check_start_route(runtime.cli, route.is_some())?;
     let target = route.as_ref().map_or(&request.entry, |route| &route.vm);
     let forwards = super::resolve_forwards(&data.prefs, target, &request.forwards)?;
     let response = match &route {
@@ -769,6 +775,7 @@ mod tests {
         let usage = UsageIndex::default();
         let prefs = Preferences::default();
         let counts = HashMap::new();
+        let intent = crate::tui::app::Intent::default();
         run(&Ctx {
             home: Path::new("/nonexistent-home"),
             entries: &[],
@@ -778,6 +785,7 @@ mod tests {
             tunnels: &[],
             prefs: &prefs,
             service_counts: &counts,
+            intent: &intent,
             now: 0,
             toast: None,
         })

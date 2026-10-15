@@ -51,6 +51,13 @@ impl Tunnels {
         }
     }
 
+    pub(super) fn selecting(mut self, id: &str, ctx: &Ctx) -> Self {
+        if let Some(index) = ctx.tunnels.iter().position(|tunnel| tunnel.id == id) {
+            self.selected = index;
+        }
+        self
+    }
+
     fn current<'a>(&self, ctx: &Ctx<'a>) -> Option<&'a TunnelView> {
         ctx.tunnels
             .get(self.selected.min(ctx.tunnels.len().saturating_sub(1)))

@@ -15,6 +15,8 @@ mod undo;
 mod whichkey;
 mod yesno;
 
+pub(crate) use host_form::Prefill;
+
 use crate::Cli;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
@@ -22,10 +24,12 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
 };
 use sshx::discovery::{Catalog, HostEntry, discover_roots};
-use sshx::keymap::{self, Action, Availability, InputMode, Key, Keymap, MenuEntry, Step};
+use sshx::keymap::{
+    self, Action, Availability, ForwardArg, InputMode, Key, Keymap, MenuEntry, Step,
+};
 use sshx::session::ServiceForward;
 use sshx::settings::{self, Preferences, RegisteredRoot, StartMode};
-use sshx::tunnel::TunnelView;
+use sshx::tunnel::{TunnelRoute, TunnelView};
 use sshx::usage::UsageIndex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -74,6 +78,71 @@ pub(crate) struct ConnectRequest {
     pub forwards: Vec<ForwardRequest>,
 }
 
+/// What Enter does on a finder row. `sshx tui` always uses `Session`; the CLI continuations
+/// pick the variant that matches the command they stand in for.
+#[derive(Clone, Copy, Default)]
+pub(crate) enum Pick {
+    #[default]
+    Session,
+    Tunnel,
+    Action(crate::HostAction),
+    Show,
+    Edit,
+    Delete,
+}
+
+/// Finder behavior chosen by the CLI command, and `--forward` values every ports screen
+/// starts with.
+#[derive(Clone, Default)]
+pub(crate) struct Intent {
+    pub pick: Pick,
+    pub preselect: Vec<ForwardArg>,
+    pub prefill: Prefill,
+}
+
+/// A HostEntry located again in the app's own discovery.
+pub(crate) struct HostRef {
+    pub id: String,
+    pub path: String,
+    pub alias: String,
+}
+
+impl HostRef {
+    pub(crate) fn new(entry: &HostEntry, alias: &str) -> Self {
+        Self {
+            id: entry.id.clone(),
+            path: entry.source.path.clone(),
+            alias: alias.to_string(),
+        }
+    }
+}
+
+pub(crate) enum StartScreen {
+    Finder,
+    Ports(HostRef),
+    Tunnels {
+        selected: Option<String>,
+        route: Option<TunnelRoute>,
+    },
+    NewHost,
+    EditHost(HostRef),
+    DeleteHost(HostRef),
+}
+
+pub(crate) struct AppStart {
+    pub intent: Intent,
+    pub screen: StartScreen,
+}
+
+impl Default for AppStart {
+    fn default() -> Self {
+        Self {
+            intent: Intent::default(),
+            screen: StartScreen::Finder,
+        }
+    }
+}
+
 pub(crate) enum PreferenceChange {
     StartMode(StartMode),
     AutoInfo(bool),
@@ -104,6 +173,8 @@ pub(crate) enum Effect {
     CopyTunnelId(String),
     DeleteHosts(Vec<delete::DeleteRequest>),
     TunnelStartMany(Box<tunnel_progress::TunnelBatch>),
+    HostAction(Box<effects::HostActionRequest>),
+    Print(String),
 }
 
 #[derive(Default)]
@@ -164,12 +235,12 @@ pub(crate) struct Ctx<'a> {
     pub home: &'a Path,
     pub entries: &'a [HostEntry],
     pub visible: Vec<&'a HostEntry>,
-    #[allow(dead_code)]
     pub roots: &'a [RegisteredRoot],
     pub usage: &'a UsageIndex,
     pub tunnels: &'a [TunnelView],
     pub prefs: &'a Preferences,
     pub service_counts: &'a HashMap<String, usize>,
+    pub intent: &'a Intent,
     pub now: u64,
     pub toast: Option<&'a str>,
 }
@@ -204,6 +275,8 @@ struct Data {
     tunnels: Vec<TunnelView>,
     prefs: Preferences,
     service_counts: HashMap<String, usize>,
+    intent: Intent,
+    tunnel_route: Option<TunnelRoute>,
 }
 
 impl Data {
@@ -221,6 +294,7 @@ impl Data {
             tunnels: &self.tunnels,
             prefs: &self.prefs,
             service_counts: &self.service_counts,
+            intent: &self.intent,
             now: sshx::usage::now(),
             toast,
         }
@@ -272,7 +346,7 @@ impl Data {
     }
 
     fn refresh_tunnels(&mut self) {
-        self.tunnels = sshx::tunnel::list(&self.home, None)
+        self.tunnels = sshx::tunnel::list(&self.home, self.tunnel_route)
             .map(|response| response.tunnels)
             .unwrap_or_default();
     }
@@ -299,7 +373,17 @@ pub(crate) fn run_app(
     roots: Vec<RegisteredRoot>,
     initial_toast: Option<String>,
 ) -> Result<(), String> {
-    Runtime::new(cli, home, roots, initial_toast)?.run()
+    run_app_with(cli, home, roots, initial_toast, AppStart::default())
+}
+
+pub(crate) fn run_app_with(
+    cli: &Cli,
+    home: &Path,
+    roots: Vec<RegisteredRoot>,
+    initial_toast: Option<String>,
+    start: AppStart,
+) -> Result<(), String> {
+    Runtime::new(cli, home, roots, initial_toast, start)?.run()
 }
 
 fn input_mode(start: StartMode) -> InputMode {
@@ -335,8 +419,11 @@ impl<'a> Runtime<'a> {
         home: &Path,
         roots: Vec<RegisteredRoot>,
         initial_toast: Option<String>,
+        start: AppStart,
     ) -> Result<Self, String> {
-        let first_run = cli.config.is_none() && settings::load(home)?.is_empty();
+        let first_run = cli.config.is_none()
+            && matches!(start.screen, StartScreen::Finder)
+            && settings::load(home)?.is_empty();
         let mut data = Data {
             home: home.to_path_buf(),
             roots,
@@ -350,6 +437,11 @@ impl<'a> Runtime<'a> {
             tunnels: Vec::new(),
             prefs: settings::load_preferences(home)?,
             service_counts: HashMap::new(),
+            intent: start.intent,
+            tunnel_route: match &start.screen {
+                StartScreen::Tunnels { route, .. } => *route,
+                _ => None,
+            },
         };
         let discovery_error = data.refresh(cli);
         let mode = input_mode(data.prefs.startmode);
@@ -357,15 +449,15 @@ impl<'a> Runtime<'a> {
         if let Some((id, alias)) = prefill_selection(&data, cli)? {
             finder.select_entry(&data.ctx(None), &id, &alias);
         }
-        let screen: Box<dyn Screen> = if first_run {
-            Box::new(first_run::FirstRun::new(home))
+        let stack = if first_run {
+            vec![Box::new(first_run::FirstRun::new(home)) as Box<dyn Screen>]
         } else {
-            Box::new(finder)
+            start_stack(&data, finder, start.screen)?
         };
         Ok(Self {
             cli,
             data,
-            stack: vec![screen],
+            stack,
             keymap: Keymap::new(),
             which_key: None,
             undo: undo::UndoStack::default(),
@@ -558,6 +650,50 @@ impl<'a> Runtime<'a> {
             whichkey::draw(frame, body, which_key.title, &which_key.entries);
         }
     }
+}
+
+/// The finder, with the screen the CLI command asked for opened on top of it. The tunnel list
+/// stands alone: it is the whole operation for `tunnel status|stop|restart`.
+fn start_stack(
+    data: &Data,
+    finder: finder::Finder,
+    screen: StartScreen,
+) -> Result<Vec<Box<dyn Screen>>, String> {
+    let ctx = data.ctx(None);
+    let locate = |host: &HostRef| {
+        ports::find_entry(ctx.entries, &host.id, &host.path, &host.alias).ok_or_else(|| {
+            format!(
+                "HOST_NOT_FOUND: {} is no longer in {}",
+                host.alias, host.path
+            )
+        })
+    };
+    let top: Box<dyn Screen> = match screen {
+        StartScreen::Finder => return Ok(vec![Box::new(finder)]),
+        StartScreen::Tunnels { selected, .. } => {
+            let list = tunnels::Tunnels::new();
+            return Ok(vec![Box::new(match selected {
+                Some(id) => list.selecting(&id, &ctx),
+                None => list,
+            })]);
+        }
+        StartScreen::Ports(host) => {
+            Box::new(ports::Ports::open(&ctx, locate(&host)?, &host.alias)?)
+        }
+        StartScreen::NewHost => {
+            Box::new(host_form::HostForm::create(&ctx)?.prefilled(ctx.intent.prefill.clone()))
+        }
+        StartScreen::EditHost(host) => Box::new(
+            host_form::HostForm::edit(&ctx, locate(&host)?, &host.alias)?
+                .prefilled(ctx.intent.prefill.clone()),
+        ),
+        StartScreen::DeleteHost(host) => Box::new(delete::DeleteConfirm::new(
+            &ctx,
+            locate(&host)?,
+            &host.alias,
+        )?),
+    };
+    Ok(vec![Box::new(finder), top])
 }
 
 /// `--id` or `--source`/`--line` preselect a HostEntry in the finder.

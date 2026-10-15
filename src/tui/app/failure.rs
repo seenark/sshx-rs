@@ -211,6 +211,7 @@ mod tests {
         let usage = UsageIndex::default();
         let prefs = Preferences::default();
         let counts = HashMap::new();
+        let intent = crate::tui::app::Intent::default();
         run(&Ctx {
             home: Path::new("/h"),
             entries: &[],
@@ -220,6 +221,7 @@ mod tests {
             tunnels: &[],
             prefs: &prefs,
             service_counts: &counts,
+            intent: &intent,
             now: 0,
             toast: None,
         })

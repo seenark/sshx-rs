@@ -120,3 +120,10 @@ sshx tunnel paired stop <tunnel-id>
 CI and local tests use fixtures, temporary HOME/config trees, controlled command paths, local OpenSSH behavior, and release archives. They are **fixture/local validation**. They do not prove access to a real user server.
 
 **User-server validation** is a separate manual step in an authorized environment. Report its server, host-key, authentication, and detached-lifetime results separately. Never convert a fixture pass into a real-server acceptance claim.
+
+## TUI continuations
+
+- `TUI_FORWARD_UNSUPPORTED` / `TUI_PASSWORD_FD_UNSUPPORTED`: the ports screen only models `REMOTE[=LOCAL]` service forwards and never reads password descriptors. Run the command with a HostEntry selector (without `tui`) to use `-L`, `-R`, `-D`, or `--password-fd`.
+- `PREVIEW_TUI_CONFLICT`: the host form already previews the exact block while you type. Use `--preview` with a complete CLI command instead.
+- `TUNNEL_ROUTE_MISMATCH` after choosing a host: `tunnel direct start` needs a direct HostEntry and `tunnel paired start` a Pair VM.
+- A ports screen with no rows still connects with `Enter`; press `o` to add a `REMOTE[=LOCAL]` row first.
