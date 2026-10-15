@@ -1929,7 +1929,7 @@ fn paired_nonzero_session_exit_returns_to_hosts() {
     );
     assert!(status.success(), "status={status:?} output={output}");
     assert!(
-        contains_tui_text(output.as_bytes(), b"VM_SESSION_EXIT"),
+        contains_tui_text(output.as_bytes(), b"Session ended (exit 7)"),
         "{output}"
     );
     let returned_hosts = output
@@ -8878,6 +8878,16 @@ fn fake_clipboard(bin: &Path, root: &Path) -> &'static str {
     backend
 }
 
+const CONFIRMING_PREFERENCES: &str =
+    r#"{"password_confirm":true,"password_warning_acknowledged":true,"clipboard_clear":null}"#;
+
+fn write_preferences(home: &Path, preferences: &str) {
+    write(
+        &home.join(".config/sshx/config.json"),
+        &format!("{{\"version\":1,\"roots\":[],\"preferences\":{preferences}}}\n"),
+    );
+}
+
 #[cfg(unix)]
 fn run_with_pty_header(
     home: &Path,
@@ -9642,6 +9652,7 @@ fn selectorless_password_action_confirms_without_exposing_secret() {
     fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
     let bin = fake_ssh(&root);
     fake_clipboard(&bin, &root);
+    write_preferences(&home, CONFIRMING_PREFERENCES);
 
     let (status, output) = run_with_pty_interactions(
         &home,
@@ -9696,6 +9707,7 @@ fn hosts_copy_password_shortcut_confirms_and_preserves_selection() {
         fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
         let bin = fake_ssh(&root);
         fake_clipboard(&bin, &root);
+        write_preferences(&home, CONFIRMING_PREFERENCES);
         let mut args = vec!["--config", config.to_str().unwrap()];
         args.extend_from_slice(operation);
 
@@ -9781,6 +9793,7 @@ fn hosts_copy_password_shortcut_decline_and_unavailable_do_not_copy() {
     fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
     let bin = fake_ssh(&root);
     fake_clipboard(&bin, &root);
+    write_preferences(&home, CONFIRMING_PREFERENCES);
 
     let (status, output) = run_with_pty_interactions(
         &home,
@@ -9960,6 +9973,7 @@ fn copy_password_without_clipboard_never_falls_back_to_stdout() {
     let config = home.join(".ssh/config");
     let empty_path = root.join("empty-bin");
     fs::create_dir(&empty_path).unwrap();
+    write_preferences(&home, CONFIRMING_PREFERENCES);
     write(
         &config,
         "Host direct\n  HostName direct.example\n  ##PASSWORD secret-value\n",
@@ -10001,6 +10015,7 @@ fn copy_password_without_tty_rejects_without_secret_output() {
     let config = home.join(".ssh/config");
     let empty_path = root.join("empty-bin");
     fs::create_dir(&empty_path).unwrap();
+    write_preferences(&home, CONFIRMING_PREFERENCES);
     write(
         &config,
         "Host direct\n  HostName direct.example\n  ##PASSWORD secret-value\n",
@@ -11198,7 +11213,7 @@ fn continuation_nonzero_shell_exit_stays_interactive_and_completed() {
             (b"Search:", b"\r"),
             (b"Connection workspace", b"\r"),
             (b"Enter confirm", b"\r"),
-            (b"SESSION_EXIT", b"\x1b"),
+            (b"Session ended (exit 7)", b"\x1b"),
             (b"Search:", b"\x1b"),
         ],
         None,
@@ -11206,5 +11221,163 @@ fn continuation_nonzero_shell_exit_stays_interactive_and_completed() {
     );
     assert!(status.success(), "{output}");
     assert!(root.join("master-closed").exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn connect_exits_with_the_shell_exit_code() {
+    for (shell, code, stdout) in [
+        ("exit 7", Some(7), ""),
+        ("kill -9 $$", Some(137), ""),
+        ("printf 'direct-shell\\n'", Some(0), "direct-shell\n"),
+    ] {
+        let (root, home) = fixture_root();
+        write(
+            &home.join(".ssh/config"),
+            "Host prod\n  HostName prod.example\n",
+        );
+        let bin = fake_ssh(&root);
+        let ssh = bin.join("ssh");
+        let script = fs::read_to_string(&ssh).unwrap();
+        write(&ssh, &script.replace("printf 'direct-shell\\n'", shell));
+        let output = run_fake_ssh(&home, &["connect", "prod", "--no-input"], &bin, &root);
+        assert_eq!(output.status.code(), code, "{shell}: {output:?}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), stdout, "{shell}");
+        assert!(
+            !String::from_utf8_lossy(&output.stderr).contains("SESSION_EXIT"),
+            "{shell}: {output:?}"
+        );
+        assert!(root.join("master-closed").exists(), "{shell}");
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(all(unix, any(target_os = "macos", target_os = "linux")))]
+fn fake_readback_clipboard(bin: &Path, store: &Path) {
+    #[cfg(target_os = "macos")]
+    let (copy, paste) = ("pbcopy", "pbpaste");
+    #[cfg(target_os = "linux")]
+    let (copy, paste) = ("wl-copy", "wl-paste");
+    fs::create_dir_all(bin).unwrap();
+    for (name, body) in [
+        (
+            copy,
+            format!("#!/bin/sh\n/bin/cat > '{}'\n", store.display()),
+        ),
+        (
+            paste,
+            format!("#!/bin/sh\n/bin/cat '{}'\n", store.display()),
+        ),
+    ] {
+        let script = bin.join(name);
+        write(&script, &body);
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
+#[cfg(all(unix, any(target_os = "macos", target_os = "linux")))]
+fn copy_password_command(home: &Path, config: &Path, bin: &Path) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_sshx"))
+        .env("HOME", home)
+        .env("PATH", bin)
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "connect",
+            "direct",
+            "--action",
+            "copy-password",
+        ])
+        .output()
+        .unwrap()
+}
+
+#[cfg(all(unix, any(target_os = "macos", target_os = "linux")))]
+fn password_fixture(preferences: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf, PathBuf) {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(
+        &config,
+        "Host direct\n  HostName direct.example\n  ##PASSWORD secret-value\n",
+    );
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+    write_preferences(&home, preferences);
+    let bin = root.join("clip-bin");
+    let store = root.join("clip-store");
+    fake_readback_clipboard(&bin, &store);
+    (root, home, config, bin, store)
+}
+
+#[cfg(all(unix, any(target_os = "macos", target_os = "linux")))]
+fn wait_for_clipboard(store: &Path, expected: &str) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while Instant::now() < deadline {
+        if fs::read_to_string(store).is_ok_and(|content| content == expected) {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
+#[cfg(all(unix, any(target_os = "macos", target_os = "linux")))]
+#[test]
+fn copied_password_is_cleared_by_detached_helper_when_unchanged() {
+    let (root, home, config, bin, store) = password_fixture(r#"{"clipboard_clear":1}"#);
+    let output = copy_password_command(&home, &config, &bin);
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("clears in 1s"), "{stderr}");
+    assert!(!stderr.contains("secret-value"), "{stderr}");
+    assert_eq!(fs::read_to_string(&store).unwrap(), "secret-value");
+    assert!(
+        wait_for_clipboard(&store, ""),
+        "clipboard still holds {:?}",
+        fs::read_to_string(&store)
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(all(unix, any(target_os = "macos", target_os = "linux")))]
+#[test]
+fn copied_password_is_kept_when_clipboard_changed_meanwhile() {
+    let (root, home, config, bin, store) = password_fixture(r#"{"clipboard_clear":1}"#);
+    let output = copy_password_command(&home, &config, &bin);
+    assert!(output.status.success(), "{output:?}");
+    fs::write(&store, "copied-later").unwrap();
+    thread::sleep(Duration::from_millis(2500));
+    assert_eq!(fs::read_to_string(&store).unwrap(), "copied-later");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(all(unix, any(target_os = "macos", target_os = "linux")))]
+#[test]
+fn copy_password_defaults_skip_confirmation_and_warn_once() {
+    let (root, home, config, bin, store) = password_fixture("{}");
+    fs::remove_file(bin.join(if cfg!(target_os = "macos") {
+        "pbpaste"
+    } else {
+        "wl-paste"
+    }))
+    .unwrap();
+
+    let first = copy_password_command(&home, &config, &bin);
+    assert!(first.status.success(), "{first:?}");
+    let stderr = String::from_utf8_lossy(&first.stderr);
+    assert!(stderr.contains("Warning: Clipboard history"), "{stderr}");
+    assert!(!stderr.contains("Copy stored password now?"), "{stderr}");
+    assert!(stderr.contains("cannot auto-clear"), "{stderr}");
+    assert_eq!(fs::read_to_string(&store).unwrap(), "secret-value");
+    let settings = fs::read_to_string(home.join(".config/sshx/config.json")).unwrap();
+    assert!(
+        settings.contains("\"password_warning_acknowledged\": true"),
+        "{settings}"
+    );
+
+    let second = copy_password_command(&home, &config, &bin);
+    assert!(second.status.success(), "{second:?}");
+    assert!(!String::from_utf8_lossy(&second.stderr).contains("Warning:"));
     fs::remove_dir_all(root).unwrap();
 }

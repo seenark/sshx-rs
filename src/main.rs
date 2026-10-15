@@ -16,7 +16,7 @@ use std::env;
 use std::ffi::OsString;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{self, Stdio};
+use std::process;
 
 fn main() {
     match run(env::args_os().skip(1).collect()) {
@@ -149,6 +149,16 @@ fn nearest_usage(positional: &[String]) -> &'static str {
 }
 
 fn run(args: Vec<OsString>) -> Result<(), String> {
+    if args
+        .first()
+        .is_some_and(|first| first == sshx::copy::CLEAR_COMMAND)
+    {
+        let seconds = args
+            .get(1)
+            .and_then(|value| value.to_str())
+            .unwrap_or_default();
+        return sshx::copy::run_clear_helper(seconds);
+    }
     if args.is_empty() && (!io::stdin().is_terminal() || !io::stderr().is_terminal()) {
         println!("{}", help::render(&[])?);
         return Ok(());
@@ -1291,8 +1301,7 @@ fn run_tui_operation(cli: &Cli) -> Result<(), String> {
                     .filter(|entry| entry_matches_provenance(entry, cli))
                     .collect::<Vec<_>>();
                 let sources = catalog_source_snapshots(&catalog);
-                let selected = match tui::select(&filtered, label, &mut state, status.as_deref())
-                {
+                let selected = match tui::select(&filtered, label, &mut state, status.as_deref()) {
                     Ok(selected) => selected,
                     Err(error) if error == tui::CANCELLED && completed => return Ok(()),
                     Err(error) => return Err(error),
@@ -1419,12 +1428,8 @@ fn run_tui_operation(cli: &Cli) -> Result<(), String> {
                     .filter(|entry| entry_matches_provenance(entry, cli))
                     .collect::<Vec<_>>();
                 let sources = catalog_source_snapshots(&catalog);
-                let selection = tui::browse_hosts(
-                    &filtered,
-                    &catalog.entries,
-                    &mut state,
-                    result.as_deref(),
-                )?;
+                let selection =
+                    tui::browse_hosts(&filtered, &catalog.entries, &mut state, result.as_deref())?;
                 let Some(selected) = selection else {
                     return if result.is_some() {
                         Ok(())
@@ -1615,7 +1620,8 @@ fn run_connection_workspace(
             || !cli.dynamic_forwards.is_empty())
     {
         return Err(
-            "PAIR_FORWARD_INVALID: Pair routes accept only REMOTE[=LOCAL] service forwards".to_string(),
+            "PAIR_FORWARD_INVALID: Pair routes accept only REMOTE[=LOCAL] service forwards"
+                .to_string(),
         );
     }
     let custom = sshx::tunnel::parse_forwards(
@@ -1819,8 +1825,7 @@ fn run_connection_workspace(
         let operation_completed = outcome.is_ok();
         completed |= operation_completed;
         status = Some(outcome.unwrap_or_else(|error| error));
-        if return_to_hosts && choice.mode == tui::ConnectionMode::Session && operation_completed
-        {
+        if return_to_hosts && choice.mode == tui::ConnectionMode::Session && operation_completed {
             return Ok(ConnectionOutcome {
                 completed,
                 quit: false,
@@ -2472,14 +2477,8 @@ fn run_host_create_workspace(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), 
     let mut focus = None;
     let mut status = None::<String>;
     loop {
-        let (edited, selected, action) = tui::host_create_workspace(
-            fields,
-            roots,
-            focus,
-            status.as_deref(),
-            None,
-            cli.preview,
-        )?;
+        let (edited, selected, action) =
+            tui::host_create_workspace(fields, roots, focus, status.as_deref(), None, cli.preview)?;
         fields = edited;
         focus = Some(selected);
         if action != tui::HostCreateAction::Submit {
@@ -3820,42 +3819,45 @@ fn run_host_action(
                 entries,
                 root.as_ref(),
             ));
+    let config = root
+        .as_ref()
+        .map(|root| root.path.to_string_lossy().into_owned());
     let command = match action {
-        HostAction::CopySsh => format!(
-            "ssh -F {} {}",
-            shell_quote(&root.expect("copy-ssh root").path.to_string_lossy()),
-            shell_quote(selected.alias)
+        HostAction::CopySsh => sshx::copy::ssh_command(
+            config.as_deref().expect("copy-ssh root"),
+            selected.alias,
+            "127.0.0.1",
+            &[],
         ),
-        HostAction::CopySshx => {
-            let mut command = format!(
-                "sshx connect {} --id {}",
-                shell_quote(selected.alias),
-                shell_quote(&selected.entry.id)
-            );
-            if let Some(root) = root {
-                command.push_str(&format!(
-                    " --config {}",
-                    shell_quote(&root.path.to_string_lossy())
-                ));
-            }
-            if source_needed {
-                command.push_str(&format!(
-                    " --source {} --line {}",
-                    shell_quote(&selected.entry.source.path),
-                    selected.entry.source.line_start
-                ));
-            }
-            command
-        }
+        HostAction::CopySshx => sshx::copy::sshx_command(
+            selected.alias,
+            &selected.entry.id,
+            config.as_deref(),
+            source_needed.then_some((
+                selected.entry.source.path.as_str(),
+                selected.entry.source.line_start,
+            )),
+            &[],
+        ),
         HostAction::Connect | HostAction::CopyPassword => {
             return Err("ACTION_INVALID: action must use normal connection flow".to_string());
         }
     };
-    publish_action_command(&command)
+    if !sshx::copy::clipboard_available() {
+        println!("{command}");
+        eprintln!(
+            "CLIPBOARD_UNAVAILABLE: no supported clipboard backend; command printed to stdout"
+        );
+        return Ok(());
+    }
+    eprintln!("{}", sshx::copy::publish_command(&command)?);
+    Ok(())
 }
 
 fn run_password_action(entry: &HostEntry, cli: &Cli) -> Result<(), String> {
-    if cli.no_input || !io::stdin().is_terminal() {
+    let home = home_dir()?;
+    let mut preferences = settings::load_preferences(&home)?;
+    if preferences.password_confirm && (cli.no_input || !io::stdin().is_terminal()) {
         return Err(
             "PASSWORD_COPY_TTY_REQUIRED: copy-password requires an interactive terminal"
                 .to_string(),
@@ -3864,13 +3866,20 @@ fn run_password_action(entry: &HostEntry, cli: &Cli) -> Result<(), String> {
     let password = sshx::connect::stored_password(entry, false)?.ok_or_else(|| {
         "PASSWORD_UNAVAILABLE: selected HostEntry has no non-empty stored password".to_string()
     })?;
-    eprintln!(
-        "Warning: clipboard manager history may retain this password; sshx does not automatically clear the clipboard."
-    );
-    if !prompt_yes("Copy stored password now? [y/N]: ")? {
+    if !preferences.password_warning_acknowledged {
+        eprintln!("Warning: {}", sshx::copy::PASSWORD_WARNING);
+    }
+    if preferences.password_confirm && !prompt_yes("Copy stored password now? [y/N]: ")? {
         return Err("PASSWORD_COPY_DECLINED: password was not copied".to_string());
     }
-    publish_password(&password)
+    eprintln!(
+        "{}",
+        sshx::copy::publish_secret(&password, "password", &preferences)?
+    );
+    if !preferences.password_warning_acknowledged {
+        sshx::copy::acknowledge_password_warning(&home, &mut preferences)?;
+    }
+    Ok(())
 }
 
 fn source_disambiguation_needed(
@@ -4011,107 +4020,6 @@ fn choose_config_root(
                 .ok_or_else(|| "ACTION_ROOT_REQUIRED: root choice is out of range".to_string())
         }
     }
-}
-
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
-}
-
-#[derive(Clone, Copy)]
-struct ClipboardBackend {
-    program: &'static str,
-    args: &'static [&'static str],
-}
-
-#[cfg(target_os = "macos")]
-const CLIPBOARD_BACKENDS: &[ClipboardBackend] = &[ClipboardBackend {
-    program: "pbcopy",
-    args: &[],
-}];
-#[cfg(target_os = "linux")]
-const CLIPBOARD_BACKENDS: &[ClipboardBackend] = &[
-    ClipboardBackend {
-        program: "wl-copy",
-        args: &[],
-    },
-    ClipboardBackend {
-        program: "xclip",
-        args: &["-selection", "clipboard"],
-    },
-    ClipboardBackend {
-        program: "xsel",
-        args: &["--clipboard", "--input"],
-    },
-];
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-const CLIPBOARD_BACKENDS: &[ClipboardBackend] = &[];
-
-fn clipboard_backend() -> Option<ClipboardBackend> {
-    let path = env::var_os("PATH")?;
-    CLIPBOARD_BACKENDS.iter().copied().find(|backend| {
-        env::split_paths(&path).any(|directory| directory.join(backend.program).is_file())
-    })
-}
-
-fn publish_action_command(command: &str) -> Result<(), String> {
-    let Some(backend) = clipboard_backend() else {
-        println!("{command}");
-        eprintln!(
-            "CLIPBOARD_UNAVAILABLE: no supported clipboard backend; command printed to stdout"
-        );
-        return Ok(());
-    };
-    send_clipboard(backend, command, "command")
-}
-
-fn publish_password(password: &str) -> Result<(), String> {
-    let Some(backend) = clipboard_backend() else {
-        return Err(
-            "CLIPBOARD_UNAVAILABLE: no supported clipboard backend; password not copied"
-                .to_string(),
-        );
-    };
-    send_clipboard(backend, password, "password")
-}
-
-fn send_clipboard(backend: ClipboardBackend, content: &str, label: &str) -> Result<(), String> {
-    let mut child = process::Command::new(backend.program)
-        .args(backend.args)
-        .stdin(Stdio::piped())
-        .spawn()
-        .map_err(|error| {
-            format!(
-                "CLIPBOARD_FAILED: cannot start {}: {error}",
-                backend.program
-            )
-        })?;
-    child
-        .stdin
-        .take()
-        .ok_or_else(|| "CLIPBOARD_FAILED: clipboard stdin is unavailable".to_string())?
-        .write_all(content.as_bytes())
-        .map_err(|error| format!("CLIPBOARD_FAILED: cannot write clipboard content: {error}"))?;
-    let status = child.wait().map_err(|error| {
-        format!(
-            "CLIPBOARD_FAILED: cannot wait for {}: {error}",
-            backend.program
-        )
-    })?;
-    if !status.success() {
-        return Err(format!(
-            "CLIPBOARD_FAILED: {} exited with {status}",
-            backend.program
-        ));
-    }
-    if label == "password" {
-        eprintln!(
-            "Copied password to {}; clipboard manager history may retain it.",
-            backend.program
-        );
-    } else {
-        eprintln!("Copied command to {}.", backend.program);
-    }
-    Ok(())
 }
 
 fn format_ambiguous(selector: &str, entries: &[&HostEntry]) -> String {
@@ -4851,24 +4759,4 @@ impl Cli {
 #[allow(dead_code)]
 fn default_config() -> Result<PathBuf, String> {
     Ok(home_dir()?.join(".ssh/config"))
-}
-
-#[cfg(all(test, target_os = "linux"))]
-mod tests {
-    use super::CLIPBOARD_BACKENDS;
-
-    #[test]
-    fn linux_clipboard_backends_target_clipboard_selection() {
-        let xclip = CLIPBOARD_BACKENDS
-            .iter()
-            .find(|backend| backend.program == "xclip")
-            .expect("xclip backend should exist");
-        assert_eq!(xclip.args, &["-selection", "clipboard"]);
-
-        let xsel = CLIPBOARD_BACKENDS
-            .iter()
-            .find(|backend| backend.program == "xsel")
-            .expect("xsel backend should exist");
-        assert_eq!(xsel.args, &["--clipboard", "--input"]);
-    }
 }
