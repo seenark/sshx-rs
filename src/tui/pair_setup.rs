@@ -7,9 +7,9 @@ use ratatui::{
 };
 use sshx::discovery::HostEntry;
 
-use super::connection_view::wrap_status;
 use super::matcher::{Row, compare_rows, row_rank};
 use super::terminal::{read_key, with_terminal};
+use super::widgets::wrap_status;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct PairSetupDraft {

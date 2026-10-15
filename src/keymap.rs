@@ -499,7 +499,7 @@ static BINDINGS: &[Binding] = &[
     bind("r", NORMAL, TUNNELS, A::TunnelRestart, S::Tunnels, "Restart tunnel").req(Row),
 
     // Ports screen
-    bind("<enter>", NORMAL, PORTS, A::Connect, S::Ports, "Connect with checked forwards").req(Row),
+    bind("<enter>", NORMAL, PORTS, A::Connect, S::Ports, "Connect with checked forwards"),
     bind("x", NORMAL, PORTS, A::ToggleRow, S::Ports, "Toggle row").req(Row),
     bind("o", NORMAL, PORTS, A::AddRow, S::Ports, "Add row (REMOTE[=LOCAL])"),
     bind("d d", NORMAL, PORTS, A::DeleteRow, S::Ports, "Remove row").req(Row),

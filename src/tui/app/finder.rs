@@ -1,8 +1,9 @@
 use super::{
-    ConnectRequest, Ctx, Effect, Outcome, Screen, ScreenStatus,
+    ConnectRequest, Ctx, Effect, Outcome, Pick, Screen, ScreenStatus,
     cmdline::CommandLine,
     copy::CopyRequest,
     delete::{self, DeleteConfirm},
+    effects::HostActionRequest,
     host_form::{EditorRequest, HostForm, open},
     ports::Ports,
     tunnel_progress, tunnels,
@@ -413,11 +414,28 @@ impl Screen for Finder {
                 let Some(row) = rows.get(self.selected.min(last)) else {
                     return Outcome::Stay;
                 };
-                return Outcome::Effect(Effect::Connect(Box::new(ConnectRequest {
-                    entry: row.row.entry.clone(),
-                    alias: row.row.alias.to_string(),
-                    forwards: Vec::new(),
-                })));
+                let (entry, alias) = (row.row.entry, row.row.alias);
+                return match ctx.intent.pick {
+                    Pick::Session => Outcome::Effect(Effect::Connect(Box::new(ConnectRequest {
+                        entry: entry.clone(),
+                        alias: alias.to_string(),
+                        forwards: Vec::new(),
+                    }))),
+                    Pick::Tunnel => open(Ports::open(ctx, entry, alias)),
+                    Pick::Action(action) => {
+                        Outcome::Effect(Effect::HostAction(Box::new(HostActionRequest {
+                            action,
+                            entry: entry.clone(),
+                            alias: alias.to_string(),
+                        })))
+                    }
+                    Pick::Show => Outcome::Effect(Effect::Print(crate::render_human(&[entry]))),
+                    Pick::Edit => open(
+                        HostForm::edit(ctx, entry, alias)
+                            .map(|form| form.prefilled(ctx.intent.prefill.clone())),
+                    ),
+                    Pick::Delete => open(DeleteConfirm::new(ctx, entry, alias)),
+                };
             }
             Action::OpenPorts => {
                 let Some(row) = rows.get(self.selected.min(last)) else {

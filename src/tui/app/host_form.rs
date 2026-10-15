@@ -67,6 +67,18 @@ impl Field {
     }
 }
 
+#[derive(Clone, Default)]
+pub(crate) struct Prefill {
+    pub alias: Option<String>,
+    pub host: Option<String>,
+    pub user: Option<String>,
+    pub port: Option<u16>,
+    pub file: Option<String>,
+    pub clear_user: bool,
+    pub clear_port: bool,
+    pub clear_password: bool,
+}
+
 type Values = [String; 8];
 
 /// A config file a new HostEntry can be written into, with the registered root that reaches it.
@@ -274,6 +286,37 @@ impl HostForm {
         };
         form.refresh();
         Ok(form)
+    }
+
+    /// Values from CLI flags; `file` only applies to a new HostEntry.
+    pub(crate) fn prefilled(mut self, prefill: Prefill) -> Self {
+        let mut set = |field: Field, text: Option<String>| {
+            if let Some(text) = text {
+                self.values[field as usize] = text;
+            }
+        };
+        set(Field::Alias, prefill.alias);
+        set(Field::Host, prefill.host);
+        set(
+            Field::User,
+            prefill.user.or(prefill.clear_user.then(String::new)),
+        );
+        set(
+            Field::Port,
+            prefill
+                .port
+                .map(|port| port.to_string())
+                .or(prefill.clear_port.then(String::new)),
+        );
+        if self.edit.is_none() {
+            set(Field::File, prefill.file);
+        }
+        if prefill.clear_password {
+            self.values[Field::Pass as usize].clear();
+            self.password_edited = true;
+        }
+        self.refresh();
+        self
     }
 
     fn field(&self) -> Field {

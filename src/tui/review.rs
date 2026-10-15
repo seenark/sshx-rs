@@ -6,8 +6,8 @@ use ratatui::{
 };
 
 use super::CANCELLED;
-use super::connection_view::wrap_status;
 use super::terminal::{read_key, with_terminal};
+use super::widgets::wrap_status;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MutationReviewAction {

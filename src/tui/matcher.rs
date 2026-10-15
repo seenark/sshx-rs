@@ -52,27 +52,6 @@ pub(super) fn row_label<'a>(row: &Row<'a>, rows: &[Row<'a>]) -> std::borrow::Cow
     }
 }
 
-pub(super) fn source_details(entry: &HostEntry) -> String {
-    let mut details = format!(
-        "HostEntry ID: {}\nSource: {}\nHost line: {}–{}\nSource bytes: {}–{}\nProvenance:",
-        entry.id,
-        entry.source.path,
-        entry.source.line_start,
-        entry.source.line_end,
-        entry.source.byte_start,
-        entry.source.byte_end
-    );
-    for provenance in &entry.provenance {
-        details.push_str(&format!(
-            "\n- scope: {}; project: {}; paths: {}",
-            provenance.scope,
-            provenance.project.as_deref().unwrap_or("-"),
-            provenance.paths.join(", ")
-        ));
-    }
-    details
-}
-
 pub(super) fn row_rank(row: &Row<'_>, query: &str) -> Option<(u8, usize)> {
     if query.is_empty() {
         return Some((0, 0));
@@ -124,7 +103,7 @@ fn fuzzy_score(haystack: &str, needle: &str) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{fuzzy_score, matching_rows, row_label, source_details};
+    use super::{fuzzy_score, matching_rows, row_label};
     use sshx::discovery::{HostEntry, SourceIdentity};
 
     fn host(
@@ -150,29 +129,6 @@ mod tests {
             scopes: Vec::new(),
             projects: project.into_iter().map(str::to_string).collect(),
         }
-    }
-
-    #[test]
-    fn source_details_include_ranges_and_provenance_paths() {
-        let mut entry = host("host-id", "alias", None, None, "/config/main", 7);
-        entry.source.byte_start = 12;
-        entry.source.byte_end = 42;
-        entry.source.line_end = 9;
-        entry.provenance.push(sshx::discovery::Provenance {
-            paths: vec!["/config/main".to_string(), "/config/included".to_string()],
-            scope: "work".to_string(),
-            project: Some("app".to_string()),
-        });
-
-        let details = source_details(&entry);
-
-        assert!(details.contains("HostEntry ID: host-id"));
-        assert!(details.contains("Source: /config/main"));
-        assert!(details.contains("Host line: 7–9"));
-        assert!(details.contains("Source bytes: 12–42"));
-        assert!(
-            details.contains("- scope: work; project: app; paths: /config/main, /config/included")
-        );
     }
 
     #[test]

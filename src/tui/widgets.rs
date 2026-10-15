@@ -1,6 +1,6 @@
 use ratatui::{
     style::{Color, Style},
-    text::Line,
+    text::{Line, Span},
     widgets::{Block, Borders},
 };
 
@@ -20,24 +20,6 @@ pub(super) fn password_insert(value: &mut String, edited: &mut bool, character: 
     *edited = true;
     value.push(character);
 }
-
-pub(super) fn toggle_password_clear(
-    value: &mut String,
-    original: &str,
-    cleared: &mut bool,
-    edited: &mut bool,
-    original_edited: bool,
-) {
-    *cleared = !*cleared;
-    if *cleared {
-        value.clear();
-    } else {
-        value.clear();
-        value.push_str(original);
-        *edited = original_edited;
-    }
-}
-
 pub(super) fn block(title: impl Into<Line<'static>>, color: Color) -> Block<'static> {
     Block::default()
         .title(title)
@@ -45,47 +27,29 @@ pub(super) fn block(title: impl Into<Line<'static>>, color: Color) -> Block<'sta
         .border_style(Style::default().fg(color))
 }
 
+pub(super) fn wrap_status(value: &str, width: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    for paragraph in value.split('\n') {
+        let mut line = String::new();
+        let mut line_width = 0;
+        for grapheme in Span::raw(paragraph).styled_graphemes(Style::default()) {
+            let grapheme_width = Span::raw(grapheme.symbol).width();
+            if line_width > 0 && line_width + grapheme_width > width {
+                lines.push(Line::from(std::mem::take(&mut line)));
+                line_width = 0;
+            }
+            line.push_str(grapheme.symbol);
+            line_width += grapheme_width;
+        }
+        lines.push(Line::from(line));
+    }
+    lines
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{password_backspace, password_insert, toggle_password_clear};
-
-    #[test]
-    fn password_clear_toggle_restores_form_baseline() {
-        let original = "********";
-        let mut value = "replacement-secret".to_string();
-        let mut cleared = false;
-        let mut edited = true;
-        let original_edited = false;
-
-        toggle_password_clear(
-            &mut value,
-            original,
-            &mut cleared,
-            &mut edited,
-            original_edited,
-        );
-        assert!(cleared);
-        assert!(value.is_empty());
-        toggle_password_clear(
-            &mut value,
-            original,
-            &mut cleared,
-            &mut edited,
-            original_edited,
-        );
-        assert!(!cleared);
-        assert_eq!(value, original);
-        assert!(!edited);
-
-        let original = "edited-secret";
-        let mut value = original.to_string();
-        let mut cleared = false;
-        let mut edited = true;
-        toggle_password_clear(&mut value, original, &mut cleared, &mut edited, true);
-        toggle_password_clear(&mut value, original, &mut cleared, &mut edited, true);
-        assert_eq!(value, original);
-        assert!(edited);
-    }
+    use super::{password_backspace, password_insert, wrap_status};
 
     #[test]
     fn password_marker_backspace_and_literal_stars_are_distinct() {
@@ -102,5 +66,34 @@ mod tests {
         }
         password_insert(&mut value, &mut edited, 'x');
         assert_eq!(value, "********x");
+    }
+
+    #[test]
+    fn wraps_wide_unicode_route_by_display_cell_width() {
+        let lines = wrap_status("Route: /项目/服务", 8);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0].spans[0].content.as_ref(), "Route: /");
+        assert_eq!(lines[1].spans[0].content.as_ref(), "项目/服");
+        assert_eq!(lines[2].spans[0].content.as_ref(), "务");
+        assert_eq!(
+            lines.iter().map(|line| line.width()).collect::<Vec<_>>(),
+            [8, 7, 2]
+        );
+    }
+
+    #[test]
+    fn preserves_repeated_spaces_when_wrapping() {
+        let lines = wrap_status("/a  b", 3);
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| line.spans[0].content.as_ref())
+                .collect::<Vec<&str>>(),
+            ["/a ", " b"]
+        );
+        assert_eq!(
+            lines.iter().map(|line| line.width()).collect::<Vec<_>>(),
+            [3, 2]
+        );
     }
 }

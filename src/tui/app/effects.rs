@@ -31,6 +31,11 @@ pub(super) fn execute(runtime: &mut Runtime, effect: Effect) -> Result<EffectRes
         Effect::CopyTunnelId(id) => copy::copy_tunnel_id(&id),
         Effect::DeleteHosts(requests) => delete::delete_many(runtime, &requests),
         Effect::TunnelStartMany(batch) => super::tunnel_progress::start_many(runtime, &batch),
+        Effect::HostAction(request) => host_action(runtime, &request),
+        Effect::Print(text) => {
+            print!("{text}");
+            quit(false)
+        }
     }
 }
 
@@ -39,6 +44,39 @@ fn toast(message: impl Into<String>) -> EffectResult {
         toast: Some(message.into()),
         ..EffectResult::default()
     }
+}
+
+/// A CLI `--action copy-*` continuation: the finder only picks the row, the existing
+/// action runs on the cooked terminal.
+pub(crate) struct HostActionRequest {
+    pub action: crate::HostAction,
+    pub entry: sshx::discovery::HostEntry,
+    pub alias: String,
+}
+
+fn host_action(runtime: &Runtime, request: &HostActionRequest) -> Result<EffectResult, String> {
+    let data = &runtime.data;
+    if !crate::entry_sources_unchanged(&request.entry, &data.sources) {
+        return Ok(toast(format!(
+            "HOST_SOURCE_CHANGED: {} changed; select its current HostEntry again",
+            request.entry.source.path
+        )));
+    }
+    let selection = crate::Selection {
+        entry: &request.entry,
+        alias: &request.alias,
+    };
+    Ok(toast(
+        match crate::run_host_action(
+            request.action,
+            &selection,
+            &data.catalog.entries,
+            runtime.cli,
+        ) {
+            Ok(()) => "Action complete.".to_string(),
+            Err(error) => error,
+        },
+    ))
 }
 
 fn quit(cancelled: bool) -> Result<EffectResult, String> {
@@ -73,24 +111,33 @@ fn start_session(runtime: &Runtime, request: &ConnectRequest) -> Result<EffectRe
             "UNSUPPORTED_MATCH: Match prevents exact runtime configuration",
         ));
     }
+    let changed = || {
+        toast(format!(
+            "HOST_SOURCE_CHANGED: {} changed; select its current HostEntry again",
+            request.entry.source.path
+        ))
+    };
+    if !crate::entry_sources_unchanged(&request.entry, &data.sources) {
+        return Ok(changed());
+    }
     let route = match sshx::pair::paired_route(&data.catalog.entries, &request.entry) {
         Ok(route) => route,
         Err(error) => return Ok(toast(error)),
     };
-    if !crate::entry_sources_unchanged(&request.entry, &data.sources)
-        || route
-            .as_ref()
-            .is_some_and(|route| !crate::entry_sources_unchanged(&route.gateway, &data.sources))
+    if route
+        .as_ref()
+        .is_some_and(|route| !crate::entry_sources_unchanged(&route.gateway, &data.sources))
     {
-        return Ok(toast(format!(
-            "HOST_SOURCE_CHANGED: {} changed; select its current HostEntry again",
-            request.entry.source.path
-        )));
+        return Ok(changed());
     }
     let target = route.as_ref().map_or(&request.entry, |route| &route.vm);
-    let forwards = match super::resolve_forwards(&data.prefs, target, &request.forwards) {
-        Ok(forwards) => forwards,
-        Err(error) => return Ok(toast(error)),
+    let forwards = if request.forwards.is_empty() {
+        Vec::new()
+    } else {
+        match super::resolve_forwards(&data.prefs, target, &request.forwards) {
+            Ok(forwards) => forwards,
+            Err(error) => return Ok(toast(error)),
+        }
     };
     let outcome = match &route {
         Some(route) => {
