@@ -23,6 +23,8 @@ pub struct CreateRequest {
     pub hostname: String,
     pub user: Option<String>,
     pub port: Option<u16>,
+    pub proxy_jump: Option<String>,
+    pub identity_file: Option<String>,
     password: Option<String>,
 }
 
@@ -43,12 +45,14 @@ impl CreateRequest {
             hostname,
             user,
             port,
+            proxy_jump: None,
+            identity_file: None,
             password,
         }
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct UpdateRequest {
     pub path: PathBuf,
     pub expected_id: String,
@@ -63,6 +67,10 @@ pub struct UpdateRequest {
     pub clear_user: bool,
     pub clear_port: bool,
     pub clear_password: bool,
+    pub proxy_jump: Option<String>,
+    pub identity_file: Option<String>,
+    pub clear_proxy_jump: bool,
+    pub clear_identity_file: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -70,6 +78,8 @@ pub struct CurrentValues {
     pub hostname: Option<String>,
     pub user: Option<String>,
     pub port: Option<u16>,
+    pub proxy_jump: Option<String>,
+    pub identity_file: Option<String>,
     pub has_password: bool,
 }
 
@@ -92,6 +102,14 @@ pub fn current_values(request: &UpdateRequest) -> Result<CurrentValues, String> 
             && let Some((start, end)) = argument_span(raw, "Port")
         {
             values.port = decode_token(&raw[start..end]).parse().ok();
+        }
+        if values.proxy_jump.is_none() && directive_matches(raw, "ProxyJump") {
+            values.proxy_jump =
+                argument_span(raw, "ProxyJump").map(|(start, end)| decode_token(&raw[start..end]));
+        }
+        if values.identity_file.is_none() && directive_matches(raw, "IdentityFile") {
+            values.identity_file = argument_span(raw, "IdentityFile")
+                .map(|(start, end)| decode_token(&raw[start..end]));
         }
         values.has_password |= password_line(raw);
     }
@@ -379,6 +397,113 @@ pub fn apply_edit(plan: &EditPlan) -> Result<(), String> {
     apply_writes(&plan.lock_path, &plan.writes)
 }
 
+/// The writes of one applied plan, kept in memory so a caller can undo and redo it.
+#[derive(Clone, Debug)]
+pub struct AppliedChange {
+    lock_path: PathBuf,
+    writes: Vec<WriteFile>,
+}
+
+impl EditPlan {
+    pub fn change(&self) -> AppliedChange {
+        AppliedChange {
+            lock_path: self.lock_path.clone(),
+            writes: self.writes.clone(),
+        }
+    }
+}
+
+impl CreatePlan {
+    pub fn change(&self) -> AppliedChange {
+        AppliedChange {
+            lock_path: self.lock_path.clone(),
+            writes: self.writes.clone(),
+        }
+    }
+}
+
+impl AppliedChange {
+    pub fn is_empty(&self) -> bool {
+        self.writes.is_empty()
+    }
+
+    /// Puts every file back to its bytes before the plan, refusing unless each one still
+    /// holds exactly what the plan wrote.
+    pub fn undo(&self) -> Result<(), String> {
+        self.shift(false)
+    }
+
+    /// Applies the plan again, refusing unless each file still holds its bytes before the plan.
+    pub fn redo(&self) -> Result<(), String> {
+        self.shift(true)
+    }
+
+    fn shift(&self, forward: bool) -> Result<(), String> {
+        let _lock = WriterLock::acquire(&self.lock_path)?;
+        let mut order = self.writes.iter().collect::<Vec<_>>();
+        if !forward {
+            order.reverse();
+        }
+        for write in &order {
+            let (expected, exists) = write_state(write, !forward);
+            let current = fingerprint(&write.path)?;
+            if current.exists != exists
+                || (exists
+                    && (current.length != expected.len() as u64
+                        || current.digest != digest(expected)))
+            {
+                return Err(format!(
+                    "UNDO_REFUSED: {} changed since sshx wrote it",
+                    display_path(&write.path)
+                ));
+            }
+        }
+        let mut done = Vec::new();
+        for write in order {
+            if let Err(error) = rewrite(write, write_state(write, !forward), write_state(write, forward)) {
+                for earlier in done.into_iter().rev() {
+                    let _ = rewrite(
+                        earlier,
+                        write_state(earlier, forward),
+                        write_state(earlier, !forward),
+                    );
+                }
+                return Err(error);
+            }
+            done.push(write);
+        }
+        Ok(())
+    }
+}
+
+/// The file's bytes and whether it exists, before or after the plan.
+fn write_state(write: &WriteFile, after: bool) -> (&[u8], bool) {
+    if after {
+        (&write.after, true)
+    } else {
+        (&write.before, write.existed)
+    }
+}
+
+fn rewrite(write: &WriteFile, from: (&[u8], bool), to: (&[u8], bool)) -> Result<(), String> {
+    if !to.1 {
+        return fs::remove_file(&write.path).map_err(|error| {
+            format!(
+                "MUTATION_WRITE_FAILED: cannot remove {}: {error}",
+                write.path.display()
+            )
+        });
+    }
+    write_atomic(&WriteFile {
+        path: write.path.clone(),
+        before: from.0.to_vec(),
+        after: to.0.to_vec(),
+        mode: write.mode,
+        existed: from.1,
+        snapshot: fingerprint(&write.path)?,
+    })
+}
+
 pub fn plan_pair(
     request: &PairMutationRequest,
     kind: PairMutationKind,
@@ -410,6 +535,7 @@ pub fn plan_pair(
         clear_user: false,
         clear_port: false,
         clear_password: false,
+        ..UpdateRequest::default()
     };
     let vm_request = UpdateRequest {
         path: request.vm_path.clone(),
@@ -425,6 +551,7 @@ pub fn plan_pair(
         clear_user: false,
         clear_port: false,
         clear_password: false,
+        ..UpdateRequest::default()
     };
     let (gateway, vm, gateway_changes, vm_changes) = match kind {
         PairMutationKind::Setup => {
@@ -1012,6 +1139,16 @@ pub fn plan_update(request: &UpdateRequest) -> Result<EditPlan, String> {
         ("HostName", request.hostname.as_deref(), false),
         ("User", request.user.as_deref(), request.clear_user),
         ("Port", port_value.as_deref(), request.clear_port),
+        (
+            "ProxyJump",
+            request.proxy_jump.as_deref(),
+            request.clear_proxy_jump,
+        ),
+        (
+            "IdentityFile",
+            request.identity_file.as_deref(),
+            request.clear_identity_file,
+        ),
     ] {
         if value.is_some() || clear {
             changes.extend(replace_directive(&loaded, keyword, value, clear)?);
@@ -1217,6 +1354,7 @@ fn span_request(
         clear_user: false,
         clear_port: false,
         clear_password: false,
+        ..UpdateRequest::default()
     }
 }
 
@@ -1324,6 +1462,10 @@ pub fn validate_update_request(request: &UpdateRequest) -> Result<(), String> {
         && !request.clear_user
         && !request.clear_port
         && !request.clear_password
+        && request.proxy_jump.is_none()
+        && request.identity_file.is_none()
+        && !request.clear_proxy_jump
+        && !request.clear_identity_file
     {
         return Err("MUTATION_EMPTY: provide at least one host field".to_string());
     }
@@ -1334,6 +1476,8 @@ pub fn validate_update_request(request: &UpdateRequest) -> Result<(), String> {
         ("hostname", request.hostname.as_deref()),
         ("user", request.user.as_deref()),
         ("password", request.password.as_deref()),
+        ("proxy_jump", request.proxy_jump.as_deref()),
+        ("identity_file", request.identity_file.as_deref()),
     ] {
         if let Some(value) = value {
             validate_value(name, value)?;
@@ -1342,6 +1486,8 @@ pub fn validate_update_request(request: &UpdateRequest) -> Result<(), String> {
     if request.user.is_some() && request.clear_user
         || request.port.is_some() && request.clear_port
         || request.password.is_some() && request.clear_password
+        || request.proxy_jump.is_some() && request.clear_proxy_jump
+        || request.identity_file.is_some() && request.clear_identity_file
     {
         return Err("MUTATION_CONFLICT: cannot set and clear one field together".to_string());
     }
@@ -1901,6 +2047,14 @@ fn validate_request(request: &CreateRequest) -> Result<(), String> {
     if let Some(user) = &request.user {
         validate_value("user", user)?;
     }
+    for (name, value) in [
+        ("proxy_jump", &request.proxy_jump),
+        ("identity_file", &request.identity_file),
+    ] {
+        if let Some(value) = value {
+            validate_value(name, value)?;
+        }
+    }
     if let Some(password) = &request.password {
         validate_value("password", password)?;
     }
@@ -1951,6 +2105,12 @@ fn host_block(request: &CreateRequest, id: &str, eol: &str) -> String {
     }
     if let Some(port) = request.port {
         lines.push(format!("  Port {port}"));
+    }
+    if let Some(proxy_jump) = &request.proxy_jump {
+        lines.push(format!("  ProxyJump {proxy_jump}"));
+    }
+    if let Some(identity_file) = &request.identity_file {
+        lines.push(format!("  IdentityFile {identity_file}"));
     }
     if let Some(password) = &request.password {
         lines.push(format!("  ##PASSWORD {password}"));
@@ -2403,9 +2563,9 @@ fn display_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        EditPlan, PairJournal, PairJournalWrite, ServiceDeclaration, UpdateRequest, apply_edit,
-        edit_patch, pair_recovery_targets, plan_declare_service, plan_undeclare_service,
-        plan_update, recover_pair_journals,
+        CreateRequest, EditPlan, PairJournal, PairJournalWrite, ServiceDeclaration, UpdateRequest,
+        apply, apply_edit, current_values, edit_patch, pair_recovery_targets, plan_create,
+        plan_declare_service, plan_undeclare_service, plan_update, recover_pair_journals,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -2942,5 +3102,113 @@ mod tests {
         })
         .unwrap();
         assert_eq!(again.added_id, None);
+    }
+
+    #[test]
+    fn update_sets_and_clears_proxy_jump_and_identity_file() {
+        let fixture = ServiceFixture::new(concat!(
+            "##SSHX ID=11111111-1111-4111-8111-111111111111\n",
+            "Host a\n",
+            "  HostName a.example\n",
+            "  IdentityFile ~/.ssh/old\n",
+            "  # keep\n",
+        ));
+        let (id, start, end) = fixture.block_a();
+        let plan = plan_update(&UpdateRequest {
+            proxy_jump: Some("jump".to_string()),
+            clear_identity_file: true,
+            ..super::span_request(&fixture.path, &id, "a", start, end)
+        })
+        .unwrap();
+        apply_edit(&plan).unwrap();
+        assert_eq!(
+            fixture.text(),
+            concat!(
+                "##SSHX ID=11111111-1111-4111-8111-111111111111\n",
+                "Host a\n",
+                "  ProxyJump jump\n",
+                "  HostName a.example\n",
+                "  # keep\n",
+            )
+        );
+        let (id, start, end) = fixture.block_a();
+        let values = current_values(&super::span_request(&fixture.path, &id, "a", start, end))
+            .unwrap();
+        assert_eq!(values.proxy_jump.as_deref(), Some("jump"));
+        assert_eq!(values.identity_file, None);
+    }
+
+    #[test]
+    fn create_writes_proxy_jump_and_identity_file() {
+        let fixture = ServiceFixture::new("Host a\n  HostName a.example\n");
+        let mut request = CreateRequest::new(
+            fixture.path.clone(),
+            fixture.path.clone(),
+            "b".to_string(),
+            "b.example".to_string(),
+            None,
+            None,
+            None,
+        );
+        request.proxy_jump = Some("a".to_string());
+        request.identity_file = Some("~/.ssh/b".to_string());
+        let plan = plan_create(&request).unwrap();
+        apply(&plan).unwrap();
+        assert!(
+            fixture
+                .text()
+                .ends_with("Host b\n  HostName b.example\n  ProxyJump a\n  IdentityFile ~/.ssh/b\n"),
+            "{}",
+            fixture.text()
+        );
+    }
+
+    #[test]
+    fn applied_change_undoes_and_redoes_only_untouched_files() {
+        let fixture = ServiceFixture::new("Host a\n  HostName a.example\n");
+        let original = fixture.text();
+        let plan = fixture.declare(&service(80)).unwrap();
+        let change = plan.change();
+        apply_edit(&plan).unwrap();
+        let written = fixture.text();
+        assert_ne!(written, original);
+
+        change.undo().unwrap();
+        assert_eq!(fixture.text(), original);
+        change.redo().unwrap();
+        assert_eq!(fixture.text(), written);
+
+        fs::write(&fixture.path, format!("{written}# external\n")).unwrap();
+        let refused = change.undo().unwrap_err();
+        assert!(refused.starts_with("UNDO_REFUSED"), "{refused}");
+        assert_eq!(fixture.text(), format!("{written}# external\n"));
+    }
+
+    #[test]
+    fn applied_change_undo_removes_a_created_file_and_its_include_line() {
+        let fixture = ServiceFixture::new("Host a\n  HostName a.example\n");
+        let original = fixture.text();
+        let target = fixture.directory.join("extra");
+        let plan = plan_create(&CreateRequest::new(
+            fixture.path.clone(),
+            target.clone(),
+            "b".to_string(),
+            "b.example".to_string(),
+            None,
+            None,
+            None,
+        ))
+        .unwrap();
+        let change = plan.change();
+        apply(&plan).unwrap();
+        let (root_after, target_after) = (fixture.text(), fs::read(&target).unwrap());
+        assert_ne!(root_after, original);
+
+        change.undo().unwrap();
+        assert_eq!(fixture.text(), original);
+        assert!(!target.exists());
+        change.redo().unwrap();
+        assert_eq!(fixture.text(), root_after);
+        assert_eq!(fs::read(&target).unwrap(), target_after);
     }
 }
