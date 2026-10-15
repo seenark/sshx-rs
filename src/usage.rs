@@ -2,7 +2,7 @@
 //! service forwards, stored in a sidecar file beside each config root.
 
 use crate::discovery::{DiscoveryRoot, HostEntry, absolute_path};
-use crate::session::{self, ForwardSpec, ServiceForward};
+use crate::session::{self, ServiceForward};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, OpenOptions};
@@ -142,8 +142,8 @@ pub fn rekey(root: &Path, old_key: &str, new_key: &str) -> Result<(), String> {
     write_sidecar(&path, &file)
 }
 
-/// Service forwards of a session; custom `-L`/`-R`/`-D` rows are not service
-/// forwards.
+/// Service forwards of a session or tunnel (`--forward`, ports-screen rows); custom
+/// `-L`/`-R`/`-D` rows are not service forwards.
 pub fn used_from_service_forwards(
     entry: &HostEntry,
     forwards: &[ServiceForward],
@@ -163,31 +163,6 @@ pub fn used_from_service_forwards(
                 service.remote_port == forward.remote_port
                     && service.destination_host == forward.destination_host
             }),
-        })
-        .collect()
-}
-
-/// Service forwards of a standalone tunnel: `-L` forwards to a loopback
-/// destination or to a declared service's destination.
-pub fn used_from_specs(entry: &HostEntry, specs: &[ForwardSpec]) -> Vec<UsedForward> {
-    let services = session::declared_services(entry).unwrap_or_default();
-    specs
-        .iter()
-        .filter(|spec| spec.flag() == 'L')
-        .filter_map(|spec| {
-            let (local, remote, host) = (
-                spec.local_port?,
-                spec.remote_port?,
-                spec.remote_host.as_deref()?,
-            );
-            let declared = services
-                .iter()
-                .any(|service| service.remote_port == remote && service.destination_host == host);
-            (declared || matches!(host, "127.0.0.1" | "localhost" | "::1")).then_some(UsedForward {
-                remote,
-                local,
-                declared,
-            })
         })
         .collect()
 }

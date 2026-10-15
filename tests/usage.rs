@@ -289,3 +289,55 @@ fn standalone_tunnel_start_records_service_forward() {
         serde_json::json!([{"remote": 5432, "local": local, "declared": true}])
     );
 }
+
+#[test]
+fn standalone_tunnel_with_a_custom_l_forward_records_no_forwards() {
+    let fixture = fixture();
+    let bin = tunnel_ssh(&fixture);
+    let config = fixture.home.join(".ssh/config");
+    fs::write(
+        &config,
+        "Host direct\n  HostName direct.example\n  ##PORT 5432\n",
+    )
+    .unwrap();
+    let local = free_port();
+    let marker = fixture.root.join("tunnel.started");
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_sshx"))
+            .env("HOME", &fixture.home)
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .env("SSHX_STARTED", &marker)
+            .env("SSHX_LISTEN_PORT", local.to_string())
+            .args(["--config", config.to_str().unwrap()])
+            .args(args)
+            .output()
+            .unwrap()
+    };
+
+    let custom = format!("{local}:127.0.0.1:5432");
+    let started = run(&[
+        "tunnel",
+        "direct",
+        "start",
+        "direct",
+        "-L",
+        &custom,
+        "--no-input",
+        "--format",
+        "json",
+    ]);
+    assert_connected(&started);
+    let id = serde_json::from_slice::<Value>(&started.stdout).unwrap()["tunnels"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let _ = run(&["tunnel", "stop", &id, "--no-input"]);
+
+    let document: Value = serde_json::from_slice(&fs::read(sidecar(&config)).unwrap()).unwrap();
+    let host = &document["hosts"]["direct@config"];
+    assert_eq!(host["count"], 1);
+    assert_eq!(host["forwards"], serde_json::json!([]));
+}

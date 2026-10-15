@@ -453,7 +453,7 @@ fn yy_on_a_pair_copies_the_sshx_form() {
     tui.send("\x1b");
     tui.expect("NORMAL");
     tui.send("yy");
-    tui.expect("✓ copied ssh command");
+    tui.expect("✓ copied sshx command");
     quit(tui);
     assert_eq!(
         fixture.clipboard().unwrap(),
@@ -507,6 +507,59 @@ fn failure_screen_copies_the_verbose_ssh_command() {
     tui.send("\x1b");
     tui.expect("NORMAL");
     quit(tui);
+}
+
+#[test]
+fn failure_screen_copy_keeps_the_forwards_of_the_failed_request() {
+    let local = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let fixture = Fixture::new("Host direct\n  HostName direct.example\n", FAKE_SSH, QUIET);
+    let mut tui = Tui::start(&fixture, &[("SSHX_AUTH_FAIL", "1")]);
+    tui.expect("Search:");
+    tui.send("direct\t");
+    tui.expect("No service forwards");
+    tui.send("o");
+    tui.expect("Add REMOTE");
+    tui.send(&format!("5432={local}\r"));
+    tui.expect(&format!("localhost:{local} → 5432"));
+    tui.send("\r");
+    tui.expect("Password for direct host");
+    tui.send("\n");
+    tui.expect("ssh direct failed");
+    tui.send("y");
+    tui.expect("✓ copied ssh -v command");
+    assert_eq!(
+        fixture.clipboard().unwrap(),
+        format!(
+            "ssh -v -F '{}' 'direct' -L 127.0.0.1:{local}:127.0.0.1:5432",
+            fixture.config.display()
+        )
+    );
+}
+
+#[test]
+fn pair_failure_screen_copy_is_labelled_as_the_sshx_command() {
+    let fixture = Fixture::new(PAIR, FAKE_PAIRED_SSH, QUIET);
+    let mut tui = Tui::start(&fixture, &[("SSHX_PAIRED_FAIL_ROLE", "VM")]);
+    tui.expect("Search:");
+    tui.send("vm");
+    tui.send("\r");
+    tui.expect("Password for VM");
+    tui.send("\n");
+    tui.expect("ssh vm failed");
+    tui.send("y");
+    tui.expect("✓ copied sshx command");
+    assert!(
+        fixture
+            .clipboard()
+            .unwrap()
+            .starts_with("sshx connect 'vm'"),
+        "{:?}",
+        fixture.clipboard()
+    );
 }
 
 #[test]

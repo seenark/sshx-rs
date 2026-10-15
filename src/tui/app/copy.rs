@@ -23,7 +23,7 @@ pub(super) fn copy_many(
 ) -> Result<EffectResult, String> {
     let lines = requests
         .iter()
-        .map(|request| ssh_form(runtime, request, false))
+        .map(|request| ssh_form(runtime, request, false).map(|(text, _)| text))
         .collect::<Result<Vec<_>, _>>();
     finish(lines.and_then(|lines| {
         let plural = if lines.len() == 1 { "" } else { "s" };
@@ -52,9 +52,13 @@ fn finish(result: Result<String, String>) -> Result<EffectResult, String> {
 fn copy_target(runtime: &mut Runtime, request: &CopyRequest) -> Result<String, String> {
     let entry = &request.entry;
     match request.target {
-        CopyTarget::SshCommand => command(ssh_form(runtime, request, false)?, "ssh command"),
-        CopyTarget::VerboseSshCommand => {
-            command(ssh_form(runtime, request, true)?, "ssh -v command")
+        CopyTarget::SshCommand | CopyTarget::VerboseSshCommand => {
+            let (text, what) = ssh_form(
+                runtime,
+                request,
+                request.target == CopyTarget::VerboseSshCommand,
+            )?;
+            command(text, what)
         }
         CopyTarget::SshpassCommand => {
             let root = crate::select_config_root(entry, runtime.cli)?;
@@ -105,8 +109,13 @@ fn command(text: String, what: &str) -> Result<String, String> {
     Ok(what.to_string())
 }
 
-/// Direct HostEntries copy the ssh command; Pairs copy the sshx form that reproduces the route.
-fn ssh_form(runtime: &Runtime, request: &CopyRequest, verbose: bool) -> Result<String, String> {
+/// Direct HostEntries copy the ssh command; Pairs copy the sshx form that reproduces the route,
+/// which has no `-v`, so the label says what was copied.
+fn ssh_form(
+    runtime: &Runtime,
+    request: &CopyRequest,
+    verbose: bool,
+) -> Result<(String, &'static str), String> {
     let (entry, alias) = (&request.entry, request.alias.as_str());
     let entries = &runtime.data.catalog.entries;
     let forwards = forward_pairs(request);
@@ -118,21 +127,31 @@ fn ssh_form(runtime: &Runtime, request: &CopyRequest, verbose: bool) -> Result<S
             let config = root
                 .as_ref()
                 .map(|root| root.path.to_string_lossy().into_owned());
-            Ok(sshx::copy::sshx_command(
-                alias,
-                &entry.id,
-                config.as_deref(),
-                source_needed.then_some((entry.source.path.as_str(), entry.source.line_start)),
-                &forwards,
+            Ok((
+                sshx::copy::sshx_command(
+                    alias,
+                    &entry.id,
+                    config.as_deref(),
+                    source_needed.then_some((entry.source.path.as_str(), entry.source.line_start)),
+                    &forwards,
+                ),
+                "sshx command",
             ))
         }
         None => {
             let root = crate::select_config_root(entry, runtime.cli)?;
             let config = root.path.to_string_lossy();
+            let bind = &runtime.data.prefs.bind;
             Ok(if verbose {
-                sshx::copy::ssh_verbose_command(&config, alias)
+                (
+                    sshx::copy::ssh_verbose_command(&config, alias, bind, &forwards),
+                    "ssh -v command",
+                )
             } else {
-                sshx::copy::ssh_command(&config, alias, &runtime.data.prefs.bind, &forwards)
+                (
+                    sshx::copy::ssh_command(&config, alias, bind, &forwards),
+                    "ssh command",
+                )
             })
         }
     }

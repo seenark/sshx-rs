@@ -115,7 +115,7 @@ impl Screen for Failure {
                     target: CopyTarget::VerboseSshCommand,
                     entry: self.request.entry.clone(),
                     alias: self.request.alias.clone(),
-                    forwards: Vec::new(),
+                    forwards: self.request.forwards.clone(),
                     tunnel_id: None,
                 })))
             }

@@ -681,6 +681,7 @@ fn open(runtime: &Runtime, request: &TunnelStartRequest) -> Result<TunnelView, S
                 &[],
                 &[],
                 false,
+                &sshx::usage::used_from_service_forwards(&request.entry, &forwards),
             )?
         }
     };
