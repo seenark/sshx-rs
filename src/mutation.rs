@@ -1,4 +1,5 @@
 use crate::discovery::{DiscoveryRoot, HostEntry, path_reachable};
+use crate::session::{self, DeclarationLine, declaration_line};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
@@ -108,6 +109,8 @@ pub enum MutationKind {
 pub struct EditPlan {
     pub id: String,
     pub operation: MutationKind,
+    /// The `##SSHX ID` this edit inserted because the HostEntry had none. Callers re-key usage state.
+    pub added_id: Option<String>,
     pub files: Vec<FileChange>,
     lock_path: PathBuf,
     writes: Vec<WriteFile>,
@@ -1021,12 +1024,11 @@ pub fn plan_update(request: &UpdateRequest) -> Result<EditPlan, String> {
             request.clear_password,
         )?);
     }
-    let after = apply_changes(&loaded.before, changes);
-    Ok(make_edit_plan(
-        request.expected_id.clone(),
+    Ok(finish_edit(
+        &request.expected_id,
         MutationKind::Update,
         loaded,
-        after,
+        changes,
     ))
 }
 
@@ -1037,7 +1039,171 @@ pub fn plan_delete(
     byte_start: usize,
     byte_end: usize,
 ) -> Result<EditPlan, String> {
-    let request = UpdateRequest {
+    let request = span_request(path, expected_id, selected_alias, byte_start, byte_end);
+    let loaded = load_block_with_span(&request, byte_start, byte_end)?;
+    let after = delete_block(&loaded);
+    Ok(make_edit_plan(
+        expected_id.to_string(),
+        MutationKind::Delete,
+        loaded,
+        after,
+        None,
+    ))
+}
+
+/// Fields of one declared service. `plan_declare_service` writes them as the canonical
+/// `##SSHX SERVICE <remote> [LOCAL=..] [HOST=..] [NAME=..]` line.
+#[derive(Clone, Debug)]
+pub struct ServiceDeclaration {
+    pub remote_port: u16,
+    pub local_port: Option<u16>,
+    pub host: Option<String>,
+    pub name: Option<String>,
+}
+
+/// Adds or replaces the `##SSHX SERVICE` line for `service.remote_port` inside one HostEntry.
+/// Existing `##PORT` lines are kept: the parser merges them with the SERVICE line.
+pub fn plan_declare_service(
+    path: &Path,
+    expected_id: &str,
+    selected_alias: &str,
+    byte_start: usize,
+    byte_end: usize,
+    service: &ServiceDeclaration,
+) -> Result<EditPlan, String> {
+    let text = canonical_service_line(service)?;
+    let request = span_request(path, expected_id, selected_alias, byte_start, byte_end);
+    let loaded = load_block(&request)?;
+    let body = loaded.host_line + 1..loaded.block_end_line;
+    let declarations = |index: usize| declaration_line(&line_text(&loaded, index));
+    let existing = body
+        .clone()
+        .filter(|index| {
+            matches!(
+                declarations(*index),
+                Some(DeclarationLine::Service(port)) if port == service.remote_port
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut changes = Vec::new();
+    if let Some((first, duplicates)) = existing.split_first() {
+        let line = loaded.lines[*first];
+        changes.push(Change {
+            start: line.start + indent_len(&loaded, line),
+            end: line.content_end,
+            replacement: text.into_bytes(),
+        });
+        changes.extend(duplicates.iter().map(|index| delete_line(&loaded, *index)));
+    } else {
+        let anchor = body
+            .clone()
+            .rev()
+            .find(|index| declarations(*index).is_some())
+            .or_else(|| {
+                body.rev().find(|index| {
+                    let line = line_text(&loaded, *index);
+                    let line = line.trim();
+                    !line.is_empty() && !line.starts_with('#')
+                })
+            })
+            .unwrap_or(loaded.host_line);
+        let line = loaded.lines[anchor];
+        let indent = if anchor == loaded.host_line {
+            b"  ".to_vec()
+        } else {
+            loaded.before[line.start..line.start + indent_len(&loaded, line)].to_vec()
+        };
+        let eol = if line.end > line.content_end {
+            loaded.before[line.content_end..line.end].to_vec()
+        } else {
+            detect_line_ending(&loaded.before)
+                .unwrap_or_else(|| "\n".to_string())
+                .into_bytes()
+        };
+        let mut replacement = Vec::new();
+        if line.end == line.content_end {
+            replacement.extend_from_slice(&eol);
+        }
+        replacement.extend_from_slice(&indent);
+        replacement.extend_from_slice(text.as_bytes());
+        if line.end > line.content_end {
+            replacement.extend_from_slice(&eol);
+        }
+        changes.push(Change {
+            start: line.end,
+            end: line.end,
+            replacement,
+        });
+    }
+    Ok(finish_edit(
+        expected_id,
+        MutationKind::Update,
+        loaded,
+        changes,
+    ))
+}
+
+/// Removes every `##SSHX SERVICE` and `##PORT` line for `remote_port` from one HostEntry.
+pub fn plan_undeclare_service(
+    path: &Path,
+    expected_id: &str,
+    selected_alias: &str,
+    byte_start: usize,
+    byte_end: usize,
+    remote_port: u16,
+) -> Result<EditPlan, String> {
+    let request = span_request(path, expected_id, selected_alias, byte_start, byte_end);
+    let loaded = load_block(&request)?;
+    let changes = (loaded.host_line + 1..loaded.block_end_line)
+        .filter(|index| {
+            matches!(
+                declaration_line(&line_text(&loaded, *index)),
+                Some(DeclarationLine::Port(port) | DeclarationLine::Service(port))
+                    if port == remote_port
+            )
+        })
+        .map(|index| delete_line(&loaded, index))
+        .collect::<Vec<_>>();
+    if changes.is_empty() {
+        return Err(format!(
+            "SERVICE_NOT_DECLARED: remote port {remote_port} has no ##PORT or ##SSHX SERVICE line in the selected HostEntry"
+        ));
+    }
+    Ok(finish_edit(
+        expected_id,
+        MutationKind::Update,
+        loaded,
+        changes,
+    ))
+}
+
+fn canonical_service_line(service: &ServiceDeclaration) -> Result<String, String> {
+    use std::fmt::Write as _;
+    session::validate_port(service.remote_port, "SERVICE_REMOTE")?;
+    let mut line = format!("##SSHX SERVICE {}", service.remote_port);
+    if let Some(port) = service.local_port {
+        session::validate_port(port, "SERVICE_DEFAULT")?;
+        write!(line, " LOCAL={port}").expect("String writes cannot fail");
+    }
+    if let Some(host) = &service.host {
+        session::validate_destination_host(host)?;
+        write!(line, " HOST={host}").expect("String writes cannot fail");
+    }
+    if let Some(name) = &service.name {
+        session::validate_service_name(name)?;
+        write!(line, " NAME={name}").expect("String writes cannot fail");
+    }
+    Ok(line)
+}
+
+fn span_request(
+    path: &Path,
+    expected_id: &str,
+    selected_alias: &str,
+    byte_start: usize,
+    byte_end: usize,
+) -> UpdateRequest {
+    UpdateRequest {
         path: path.to_path_buf(),
         expected_id: expected_id.to_string(),
         selected_alias: selected_alias.to_string(),
@@ -1051,15 +1217,45 @@ pub fn plan_delete(
         clear_user: false,
         clear_port: false,
         clear_password: false,
-    };
-    let loaded = load_block_with_span(&request, byte_start, byte_end)?;
-    let after = delete_block(&loaded);
-    Ok(make_edit_plan(
-        expected_id.to_string(),
-        MutationKind::Delete,
-        loaded,
-        after,
-    ))
+    }
+}
+
+fn line_text<'a>(loaded: &'a LoadedBlock, index: usize) -> std::borrow::Cow<'a, str> {
+    let line = loaded.lines[index];
+    String::from_utf8_lossy(&loaded.before[line.start..line.content_end])
+}
+
+fn indent_len(loaded: &LoadedBlock, line: ByteLine) -> usize {
+    let raw = &loaded.before[line.start..line.content_end];
+    raw.len() - raw.trim_ascii_start().len()
+}
+
+fn delete_line(loaded: &LoadedBlock, index: usize) -> Change {
+    let line = loaded.lines[index];
+    Change {
+        start: line.start,
+        end: line.end,
+        replacement: Vec::new(),
+    }
+}
+
+/// Applies `changes` and, per ADR 0004 decision 3, adds `##SSHX ID` when the block lacks one and
+/// the edit actually changes bytes.
+fn finish_edit(
+    expected_id: &str,
+    operation: MutationKind,
+    loaded: LoadedBlock,
+    mut changes: Vec<Change>,
+) -> EditPlan {
+    let mut after = apply_changes(&loaded.before, changes.clone());
+    let mut added_id = None;
+    if after != loaded.before && loaded.marker_range.is_none() {
+        let id = new_id(&loaded.before, &[]);
+        changes.push(insert_metadata(&loaded, &format!("##SSHX ID={id}")));
+        after = apply_changes(&loaded.before, changes);
+        added_id = Some(id);
+    }
+    make_edit_plan(expected_id.to_string(), operation, loaded, after, added_id)
 }
 
 fn apply_writes(lock_path: &Path, writes: &[WriteFile]) -> Result<(), String> {
@@ -1298,6 +1494,7 @@ fn make_edit_plan(
     operation: MutationKind,
     loaded: LoadedBlock,
     after: Vec<u8>,
+    added_id: Option<String>,
 ) -> EditPlan {
     let LoadedBlock {
         path,
@@ -1333,6 +1530,7 @@ fn make_edit_plan(
     EditPlan {
         id,
         operation,
+        added_id,
         files,
         lock_path: mutation_lock_path(&path),
         writes,
@@ -2205,7 +2403,9 @@ fn display_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        PairJournal, PairJournalWrite, edit_patch, pair_recovery_targets, recover_pair_journals,
+        EditPlan, PairJournal, PairJournalWrite, ServiceDeclaration, UpdateRequest, apply_edit,
+        edit_patch, pair_recovery_targets, plan_declare_service, plan_undeclare_service,
+        plan_update, recover_pair_journals,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -2491,5 +2691,256 @@ mod tests {
         assert!(!before.exists());
         assert!(!after.exists());
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    struct ServiceFixture {
+        directory: PathBuf,
+        path: PathBuf,
+    }
+
+    impl ServiceFixture {
+        fn new(text: &str) -> Self {
+            static FIXTURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let directory = std::env::temp_dir().join(format!(
+                "sshx-service-edit-{}-{}",
+                std::process::id(),
+                FIXTURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&directory).unwrap();
+            let path = directory.join("config");
+            fs::write(&path, text).unwrap();
+            Self { directory, path }
+        }
+
+        fn text(&self) -> String {
+            fs::read_to_string(&self.path).unwrap()
+        }
+
+        /// Span and id of the `Host a` block in the current file bytes.
+        fn block_a(&self) -> (String, usize, usize) {
+            let text = self.text();
+            let start = text.find("Host a").unwrap();
+            let end = text[start + 1..]
+                .find("\nHost ")
+                .map_or(text.len(), |index| start + 2 + index);
+            let id = text[..start]
+                .lines()
+                .last()
+                .and_then(|line| line.strip_prefix("##SSHX ID="))
+                .map_or_else(
+                    || super::synthetic_entry_id(&self.path, start, end),
+                    str::to_string,
+                );
+            (id, start, end)
+        }
+
+        fn declare(&self, service: &ServiceDeclaration) -> Result<EditPlan, String> {
+            let (id, start, end) = self.block_a();
+            plan_declare_service(&self.path, &id, "a", start, end, service)
+        }
+
+        fn undeclare(&self, remote_port: u16) -> Result<EditPlan, String> {
+            let (id, start, end) = self.block_a();
+            plan_undeclare_service(&self.path, &id, "a", start, end, remote_port)
+        }
+    }
+
+    impl Drop for ServiceFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.directory);
+        }
+    }
+
+    fn service(remote_port: u16) -> ServiceDeclaration {
+        ServiceDeclaration {
+            remote_port,
+            local_port: None,
+            host: None,
+            name: None,
+        }
+    }
+
+    #[test]
+    fn declare_appends_canonical_line_and_adds_id_only_once() {
+        let fixture = ServiceFixture::new(concat!(
+            "Host a\n",
+            "  HostName a.example\n",
+            "  # keep\n",
+            "\n",
+            "Host b\n",
+            "  HostName b.example\n",
+        ));
+        let plan = fixture
+            .declare(&ServiceDeclaration {
+                remote_port: 5432,
+                local_port: Some(15432),
+                host: Some("db.internal".to_string()),
+                name: Some("pg".to_string()),
+            })
+            .unwrap();
+        let id = plan.added_id.clone().expect("missing ID should be added");
+        apply_edit(&plan).unwrap();
+        assert_eq!(
+            fixture.text(),
+            format!(
+                concat!(
+                    "##SSHX ID={id}\n",
+                    "Host a\n",
+                    "  HostName a.example\n",
+                    "  ##SSHX SERVICE 5432 LOCAL=15432 HOST=db.internal NAME=pg\n",
+                    "  # keep\n",
+                    "\n",
+                    "Host b\n",
+                    "  HostName b.example\n",
+                ),
+                id = id
+            )
+        );
+
+        let second = fixture.declare(&service(80)).unwrap();
+        assert_eq!(second.added_id, None);
+        apply_edit(&second).unwrap();
+        assert_eq!(
+            fixture.text(),
+            format!(
+                concat!(
+                    "##SSHX ID={id}\n",
+                    "Host a\n",
+                    "  HostName a.example\n",
+                    "  ##SSHX SERVICE 5432 LOCAL=15432 HOST=db.internal NAME=pg\n",
+                    "  ##SSHX SERVICE 80\n",
+                    "  # keep\n",
+                    "\n",
+                    "Host b\n",
+                    "  HostName b.example\n",
+                ),
+                id = id
+            )
+        );
+    }
+
+    #[test]
+    fn declare_replaces_existing_service_line_and_keeps_port_shorthand() {
+        let fixture = ServiceFixture::new(concat!(
+            "##SSHX ID=11111111-1111-4111-8111-111111111111\n",
+            "Host a\r\n",
+            "\t##PORT 5432\r\n",
+            "\t##SSHX SERVICE 5432 LOCAL=1\r\n",
+            "\t##SSHX SERVICE 5432 HOST=old\r\n",
+            "\t##SSHX SERVICE 6379\r\n",
+        ));
+        let plan = fixture
+            .declare(&ServiceDeclaration {
+                remote_port: 5432,
+                local_port: Some(15432),
+                host: None,
+                name: None,
+            })
+            .unwrap();
+        assert_eq!(plan.added_id, None);
+        apply_edit(&plan).unwrap();
+        assert_eq!(
+            fixture.text(),
+            concat!(
+                "##SSHX ID=11111111-1111-4111-8111-111111111111\n",
+                "Host a\r\n",
+                "\t##PORT 5432\r\n",
+                "\t##SSHX SERVICE 5432 LOCAL=15432\r\n",
+                "\t##SSHX SERVICE 6379\r\n",
+            )
+        );
+    }
+
+    #[test]
+    fn declare_inserts_after_unterminated_last_line_with_file_line_ending() {
+        let fixture = ServiceFixture::new("Host a\r\n  HostName a.example");
+        let plan = fixture.declare(&service(80)).unwrap();
+        let id = plan.added_id.clone().unwrap();
+        apply_edit(&plan).unwrap();
+        assert_eq!(
+            fixture.text(),
+            format!("##SSHX ID={id}\r\nHost a\r\n  HostName a.example\r\n  ##SSHX SERVICE 80")
+        );
+    }
+
+    #[test]
+    fn declare_rejects_unsafe_values_before_reading_the_file() {
+        let fixture = ServiceFixture::new("Host a\n  HostName a.example\n");
+        for bad in [
+            ServiceDeclaration {
+                host: Some("0.0.0.0".to_string()),
+                ..service(80)
+            },
+            ServiceDeclaration {
+                name: Some("two words".to_string()),
+                ..service(80)
+            },
+            ServiceDeclaration {
+                local_port: Some(0),
+                ..service(80)
+            },
+            service(0),
+        ] {
+            assert!(fixture.declare(&bad).is_err(), "{bad:?}");
+        }
+        assert_eq!(fixture.text(), "Host a\n  HostName a.example\n");
+    }
+
+    #[test]
+    fn undeclare_removes_port_and_service_lines_for_that_port_only() {
+        let fixture = ServiceFixture::new(concat!(
+            "Host a\n",
+            "  HostName a.example\n",
+            "  ##PORT 5432\n",
+            "  ##PORT 6379\n",
+            "  ##SSHX SERVICE 5432 LOCAL=15432 NAME=pg\n",
+            "\n",
+            "Host b\n",
+            "  ##PORT 5432\n",
+        ));
+        let plan = fixture.undeclare(5432).unwrap();
+        let id = plan.added_id.clone().unwrap();
+        apply_edit(&plan).unwrap();
+        assert_eq!(
+            fixture.text(),
+            format!(
+                concat!(
+                    "##SSHX ID={id}\n",
+                    "Host a\n",
+                    "  HostName a.example\n",
+                    "  ##PORT 6379\n",
+                    "\n",
+                    "Host b\n",
+                    "  ##PORT 5432\n",
+                ),
+                id = id
+            )
+        );
+        let error = fixture.undeclare(5432).unwrap_err();
+        assert!(error.starts_with("SERVICE_NOT_DECLARED"), "{error}");
+    }
+
+    #[test]
+    fn update_adds_missing_id_once() {
+        let fixture = ServiceFixture::new("Host a\n  HostName a.example\n");
+        let (id, start, end) = fixture.block_a();
+        let request = |id: &str, start: usize, end: usize| UpdateRequest {
+            hostname: Some("new.example".to_string()),
+            ..super::span_request(&fixture.path, id, "a", start, end)
+        };
+        let plan = plan_update(&request(&id, start, end)).unwrap();
+        let added = plan.added_id.clone().expect("ID should be added");
+        apply_edit(&plan).unwrap();
+        assert_eq!(
+            fixture.text(),
+            format!("##SSHX ID={added}\nHost a\n  HostName new.example\n")
+        );
+        let (id, start, end) = fixture.block_a();
+        let again = plan_update(&UpdateRequest {
+            hostname: Some("again.example".to_string()),
+            ..request(&id, start, end)
+        })
+        .unwrap();
+        assert_eq!(again.added_id, None);
     }
 }

@@ -8,6 +8,19 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+/// Every sshx edit of a HostEntry without `##SSHX ID` adds one (ADR 0004); strip it to compare the rest.
+fn without_added_id(text: &str) -> String {
+    let (first, rest) = text
+        .split_once('\n')
+        .expect("edited config should have lines");
+    let id = first
+        .strip_prefix("##SSHX ID=")
+        .expect("edit should add an ID marker");
+    assert_eq!(id.len(), 36, "{first}");
+    assert!(!rest.contains("##SSHX ID="), "{text}");
+    rest.to_string()
+}
+
 #[test]
 fn hosts_opens_direct_session_and_restores_selected_alias() {
     let root = std::env::temp_dir().join(format!(
@@ -889,7 +902,7 @@ fn partial_host_update_reviews_prefilled_values_before_apply() {
     terminal.send(b"\r");
     assert_eq!(terminal.finish(), Some(0));
     assert_eq!(
-        fs::read_to_string(&config).unwrap(),
+        without_added_id(&fs::read_to_string(&config).unwrap()),
         "Host prod secondary\n  HostName new.example\n  User alice\n  Port 2222\n"
     );
     fs::remove_dir_all(root).unwrap();
@@ -928,7 +941,7 @@ fn tui_rename_changes_only_selected_secondary_alias_and_keeps_review_edits() {
     terminal.send(b"\r");
     assert_eq!(terminal.finish(), Some(0));
     assert_eq!(
-        fs::read_to_string(&config).unwrap(),
+        without_added_id(&fs::read_to_string(&config).unwrap()),
         "Host prod renamed2\n  HostName old.example\n  User alice\n  Port 2222\n  ##PASSWORD stored-secret\nHost other\n  HostName untouched.example\n"
     );
     fs::remove_dir_all(root).unwrap();
@@ -965,7 +978,7 @@ fn tui_update_keeps_replaces_and_clears_optional_values_without_exposing_passwor
     terminal.send(b"\r");
     assert_eq!(terminal.finish(), Some(0));
     assert_eq!(
-        fs::read_to_string(&config).unwrap(),
+        without_added_id(&fs::read_to_string(&config).unwrap()),
         "Host prod secondary\n  HostName new.example\n"
     );
     fs::write(&config, before).unwrap();
@@ -980,7 +993,7 @@ fn tui_update_keeps_replaces_and_clears_optional_values_without_exposing_passwor
     terminal.send(b"\r");
     assert_eq!(terminal.finish(), Some(0));
     assert_eq!(
-        fs::read_to_string(&config).unwrap(),
+        without_added_id(&fs::read_to_string(&config).unwrap()),
         "Host prod secondary\n  HostName old.example\n  User bob\n  Port 2222\n  ##PASSWORD new-secret\n"
     );
     fs::remove_dir_all(root).unwrap();
@@ -1222,7 +1235,7 @@ fn host_edit_exact_selectors_and_cli_modes_do_not_open_a_workspace() {
     assert_eq!(terminal.finish(), Some(0));
     assert!(!contains_tui_text(&terminal.output, "Edit HostEntry"));
     assert_eq!(
-        fs::read_to_string(&config).unwrap(),
+        without_added_id(&fs::read_to_string(&config).unwrap()),
         "Host prod secondary\n  HostName new.example\nHost production\n  HostName other.example\nHost prod\n  HostName duplicate.example\n"
     );
     fs::remove_dir_all(root).unwrap();
@@ -1290,7 +1303,7 @@ fn hosts_update_and_rename_return_to_persistent_selected_host() {
     terminal.send(b"\x1b");
     assert_eq!(terminal.finish(), Some(0));
     assert_eq!(
-        fs::read_to_string(&config).unwrap(),
+        without_added_id(&fs::read_to_string(&config).unwrap()),
         "Host prod renamed\n  HostName new.example\n  User alice\nHost other\n  HostName other.example\n"
     );
     fs::remove_dir_all(root).unwrap();
@@ -1327,7 +1340,7 @@ fn host_edit_validation_keeps_values_and_focuses_invalid_port() {
     terminal.send(b"\r");
     assert_eq!(terminal.finish(), Some(0));
     assert_eq!(
-        fs::read_to_string(&config).unwrap(),
+        without_added_id(&fs::read_to_string(&config).unwrap()),
         "Host prod secondary\n  HostName new.example\n  User alice\n  Port 22\n"
     );
     fs::remove_dir_all(root).unwrap();
@@ -1350,7 +1363,7 @@ fn missing_host_selector_prefills_clear_flag_and_can_replace_that_field() {
     terminal.send(b"\r");
     assert_eq!(terminal.finish(), Some(0));
     assert_eq!(
-        fs::read_to_string(&config).unwrap(),
+        without_added_id(&fs::read_to_string(&config).unwrap()),
         "Host prod secondary\n  HostName old.example\n  User bob\n  Port 2222\n"
     );
     fs::remove_dir_all(root).unwrap();
@@ -1386,7 +1399,7 @@ fn hosts_rename_ignores_unrelated_root_cli_fields() {
     terminal.send(b"\x1b");
     assert_eq!(terminal.finish(), Some(0));
     assert_eq!(
-        fs::read_to_string(&config).unwrap(),
+        without_added_id(&fs::read_to_string(&config).unwrap()),
         "Host prod renamed\n  HostName old.example\n  User alice\n  Port 2222\n  ##PASSWORD stored-secret\n"
     );
     fs::remove_dir_all(root).unwrap();
@@ -1410,7 +1423,7 @@ fn host_update_prefills_quoted_port_and_preserves_it_when_kept() {
     terminal.send(b"\r");
     assert_eq!(terminal.finish(), Some(0));
     assert_eq!(
-        fs::read_to_string(&config).unwrap(),
+        without_added_id(&fs::read_to_string(&config).unwrap()),
         "Host prod secondary\n  HostName old.example\n  User bob\n  Port \"2222\"\n"
     );
     fs::remove_dir_all(root).unwrap();

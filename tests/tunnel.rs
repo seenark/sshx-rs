@@ -552,21 +552,6 @@ exit 0
     assert_eq!(wrong_route.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&wrong_route.stderr).contains("TUNNEL_ROUTE_MISMATCH"));
 
-    let gateway_only = run(&[
-        "--config",
-        config.to_str().unwrap(),
-        "tunnel",
-        "paired",
-        "start",
-        "vm",
-        "--forward",
-        "2222",
-        "--no-input",
-    ]);
-    assert_eq!(gateway_only.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&gateway_only.stderr).contains("FORWARD_NOT_FOUND"));
-    assert!(!root.join("close.log").exists());
-
     let started = run(&[
         "--config",
         config.to_str().unwrap(),
@@ -810,5 +795,38 @@ exit 0
         fs::read_to_string(root.join("close.log")).unwrap(),
         "VM\nGATEWAY\nVM\nGATEWAY\nVM\nGATEWAY\nVM\nGATEWAY\n"
     );
+
+    fs::remove_file(root.join("fail-vm")).unwrap();
+    let ad_hoc_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let ad_hoc_port = ad_hoc_listener.local_addr().unwrap().port();
+    drop(ad_hoc_listener);
+    let ad_hoc_forward = format!("9090={ad_hoc_port}");
+    let ad_hoc = run(&[
+        "--config",
+        config.to_str().unwrap(),
+        "tunnel",
+        "paired",
+        "start",
+        "vm",
+        "--forward",
+        ad_hoc_forward.as_str(),
+        "--no-input",
+        "--format",
+        "json",
+    ]);
+    assert!(ad_hoc.status.success(), "{ad_hoc:?}");
+    let ad_hoc_document: Value = serde_json::from_slice(&ad_hoc.stdout).unwrap();
+    let ad_hoc_tunnel = &ad_hoc_document["tunnels"][0];
+    assert_eq!(ad_hoc_tunnel["forwards"][0]["remote_port"], 9090);
+    assert_eq!(ad_hoc_tunnel["forwards"][0]["local_port"], ad_hoc_port);
+    let ad_hoc_stop = run(&[
+        "tunnel",
+        "paired",
+        "stop",
+        ad_hoc_tunnel["id"].as_str().unwrap(),
+        "--format",
+        "json",
+    ]);
+    assert!(ad_hoc_stop.status.success(), "{ad_hoc_stop:?}");
     fs::remove_dir_all(root).unwrap();
 }

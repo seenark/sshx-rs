@@ -89,6 +89,7 @@ pub(crate) fn connection_workspace(
                 remote_port: row.remote_port,
                 destination_host: row.destination_host.clone(),
                 default_local_port: row.local_port,
+                name: None,
             })
             .collect();
         forwards = restored.rows.clone();
@@ -777,6 +778,7 @@ fn add_workspace_row(
         remote_port: if kind == 'R' { 1 } else { 0 },
         destination_host: host.clone(),
         default_local_port: port,
+        name: None,
     });
     forwards.push(ServiceForward {
         id,
