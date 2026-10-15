@@ -195,9 +195,7 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
             println!("{}", help::render(&[])?);
             return Ok(());
         }
-        let home = home_dir()?;
-        let roots = registered_roots(&cli)?;
-        return run_hosts(&cli, &home, &roots, None);
+        return tui::run_app(&cli, &home_dir()?, registered_roots(&cli)?, None);
     }
     if cli.action.is_some() && cli.format.is_machine() {
         return Err(
@@ -220,7 +218,7 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
             cli.id = None;
             cli.location = SourceLocation::default();
             cli.command = Command::Hosts { explicit: true };
-            return run_hosts(&cli, &home_dir()?, &roots, Some(status.to_string()));
+            return tui::run_app(&cli, &home_dir()?, roots, Some(status.to_string()));
         }
         return Ok(());
     }
@@ -577,243 +575,6 @@ fn start_direct_tunnel(
     )
 }
 
-fn run_hosts(
-    cli: &Cli,
-    home: &Path,
-    roots: &[RegisteredRoot],
-    initial_status: Option<String>,
-) -> Result<(), String> {
-    let mut roots = roots.to_vec();
-    let mut state = tui::HostsState::default();
-    state.editing_enabled = true;
-    let mut status = initial_status;
-    let mut prefill_selector =
-        cli.id.is_some() || cli.location.source.is_some() || cli.location.line.is_some();
-    loop {
-        let configured = settings::discovery_roots(&roots);
-        let missing_default = cli.config.is_none()
-            && configured.len() == 1
-            && configured[0].path == home.join(".ssh/config")
-            && !configured[0].path.exists();
-        state.active_tunnels = sshx::tunnel::list(home, None)
-            .map(|response| {
-                response
-                    .tunnels
-                    .iter()
-                    .filter(|tunnel| tunnel.state == "active")
-                    .count()
-            })
-            .unwrap_or(0);
-        let mut discovery_error = None;
-        let catalog = if missing_default {
-            None
-        } else {
-            match discover_roots(&configured) {
-                Ok(catalog) => Some(catalog),
-                Err(error) => {
-                    discovery_error = Some(error.to_string());
-                    None
-                }
-            }
-        }
-        .unwrap_or_else(|| Catalog {
-            entries: Vec::new(),
-            diagnostics: Vec::new(),
-        });
-        let discovery_status = discovery_error.map(|error| match status.as_deref() {
-            Some(status) => format!("{status}\n{error}"),
-            None => error,
-        });
-        let filtered = catalog
-            .entries
-            .iter()
-            .filter(|entry| entry_matches_provenance(entry, cli))
-            .collect::<Vec<_>>();
-        if prefill_selector {
-            let selected = if cli.id.is_some() {
-                select_connect_entry(&filtered, None, cli, "Hosts")?
-            } else {
-                let path = source_selector_path(
-                    cli.location.source.as_ref().ok_or_else(|| {
-                        "SELECTOR_INCOMPLETE: --source and --line must be provided together"
-                            .to_string()
-                    })?,
-                    home,
-                );
-                let matches = filtered
-                    .iter()
-                    .copied()
-                    .filter(|entry| {
-                        entry.source.path == path.to_string_lossy()
-                            && Some(entry.source.line_start) == cli.location.line
-                    })
-                    .collect::<Vec<_>>();
-                let entry = match matches.as_slice() {
-                    [entry] => *entry,
-                    [] => {
-                        return Err(
-                            "HOST_NOT_FOUND: source and Host line matched no entries".to_string()
-                        );
-                    }
-                    many => return Err(format_ambiguous("source and Host line", many)),
-                };
-                tui::Selection {
-                    entry,
-                    alias: entry.aliases.first().map_or("", String::as_str),
-                }
-            };
-            state.prefill(selected.entry, selected.alias, "");
-            prefill_selector = false;
-        }
-        let sources = catalog_source_snapshots(&catalog);
-        let selection = match tui::browse_hosts(
-            &filtered,
-            &catalog.entries,
-            &mut state,
-            discovery_status.as_deref().or(status.as_deref()),
-        ) {
-            Ok(selection) => selection,
-            Err(action) if action == "HOST_CREATE" => {
-                let mut create = Cli::parse(vec!["host".into(), "create".into()])?;
-                create.config = cli.config.clone();
-                create.scopes = cli.scopes.clone();
-                create.projects = cli.projects.clone();
-                match run_host_create(&create, &roots) {
-                    Ok(()) => status = Some("HostEntry created.".to_string()),
-                    Err(error) if error == tui::CANCELLED => status = None,
-                    Err(error) => status = Some(error),
-                }
-                continue;
-            }
-            Err(action) if action == "TUNNELS_TAB" => {
-                status = run_tunnels_workspace(cli, home, 0, None).err();
-                continue;
-            }
-            Err(action) if action == "PAIRS_TAB" => {
-                status = run_pairs_workspace(cli, &roots).err();
-                continue;
-            }
-            Err(action) if action == "SETUP_TAB" => {
-                status = match run_setup_workspace(cli, home) {
-                    Ok(()) => {
-                        roots = settings::load(home)?;
-                        Some("Config root registered.".to_string())
-                    }
-                    Err(error) if error == tui::CANCELLED => None,
-                    Err(error) => Some(error),
-                };
-                continue;
-            }
-            Err(action) if action == "DOCTOR_TAB" => {
-                status = run_doctor_workspace(cli, home).err();
-                continue;
-            }
-            Err(error) => return Err(error),
-        };
-        let Some(selection) = selection else {
-            return Ok(());
-        };
-        let entry = selection.entry;
-        let alias = selection.alias;
-        let edit_action = state.edit_action.take();
-        let copy_password = std::mem::take(&mut state.copy_password);
-        let unchanged = entry_sources_unchanged(entry, &sources);
-        if !unchanged {
-            status = Some(format!(
-                "HOST_SOURCE_CHANGED: {} changed; select its current HostEntry again",
-                entry.source.path
-            ));
-            continue;
-        }
-        if copy_password {
-            status = Some(
-                match run_host_action(HostAction::CopyPassword, &selection, &catalog.entries, cli) {
-                    Ok(()) => "Password copied to clipboard.".to_string(),
-                    Err(error) => error,
-                },
-            );
-            continue;
-        }
-        if let Some(operation) = edit_action {
-            let before = sources
-                .get(entry.source.path.as_str())
-                .and_then(Option::as_ref)
-                .ok_or_else(|| {
-                    "HOST_SOURCE_CHANGED: source is unavailable; select again".to_string()
-                })?;
-            let alias_index = entry
-                .aliases
-                .iter()
-                .position(|value| value == alias)
-                .unwrap_or(0);
-            status = match mutation::validate_mutation_roots(&configured).and_then(|()| {
-                if operation == MutationKind::Delete {
-                    run_host_delete_workspace(cli, home, &configured, entry, alias, before)
-                } else {
-                    run_host_edit_workspace(cli, entry, alias, operation, before)
-                }
-            }) {
-                Ok(()) => {
-                    if let Ok(updated) = discover_roots(&configured)
-                        && let Some(updated) = updated.entries.iter().find(|updated| {
-                            updated.source.path == entry.source.path
-                                && updated.source.byte_start == entry.source.byte_start
-                        })
-                        && let Some(alias) = updated.aliases.get(alias_index)
-                    {
-                        state.prefill(updated, alias, "");
-                    }
-                    Some(if cli.preview {
-                        "HostEntry preview complete.".to_string()
-                    } else if operation == MutationKind::Rename {
-                        "HostEntry renamed.".to_string()
-                    } else if operation == MutationKind::Delete {
-                        "HostEntry deleted.".to_string()
-                    } else {
-                        "HostEntry updated.".to_string()
-                    })
-                }
-                Err(error) if error == tui::CANCELLED => {
-                    Some(if operation == MutationKind::Delete {
-                        "HostEntry deletion cancelled.".to_string()
-                    } else {
-                        "HostEntry edit cancelled.".to_string()
-                    })
-                }
-                Err(error) => Some(error),
-            };
-            continue;
-        }
-        if catalog
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.code == "unsupported_match")
-        {
-            status =
-                Some("UNSUPPORTED_MATCH: Match prevents exact runtime configuration".to_string());
-            continue;
-        }
-        let mut standalone_credentials = sshx::connect::StandaloneCredentials::new(None);
-        status = match run_connection_workspace(
-            cli,
-            &catalog,
-            selection,
-            home,
-            tui::ConnectionMode::Session,
-            false,
-            &mut standalone_credentials,
-            &sources,
-            true,
-        ) {
-            Ok(outcome) if outcome.quit => return Ok(()),
-            Ok(outcome) if outcome.completed => outcome.status,
-            Ok(_) => None,
-            Err(error) if error == tui::CANCELLED => None,
-            Err(error) => Some(error),
-        };
-    }
-}
-
 fn run_pairs_workspace(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), String> {
     let configured = settings::discovery_roots(roots);
     let mut status = None;
@@ -1154,10 +915,10 @@ fn run_tui_operation(cli: &Cli) -> Result<(), String> {
     }
     if matches!(cli.command, Command::Setup) {
         run_setup_workspace(cli, &home)?;
-        return run_hosts(
+        return tui::run_app(
             cli,
             &home,
-            &settings::load(&home)?,
+            settings::load(&home)?,
             Some("Config root registered.".to_string()),
         );
     }
@@ -1201,7 +962,7 @@ fn run_tui_operation(cli: &Cli) -> Result<(), String> {
     let roots = registered_roots(cli)?;
     if matches!(cli.command, Command::PairList | Command::PairValidate) {
         run_pairs_workspace(cli, &roots)?;
-        return run_hosts(cli, &home, &roots, None);
+        return tui::run_app(cli, &home, roots, None);
     }
     let mut catalog =
         discover_roots(&settings::discovery_roots(&roots)).map_err(|error| error.to_string())?;
@@ -1492,7 +1253,10 @@ fn catalog_source_snapshots(catalog: &Catalog) -> HashMap<&str, Option<Vec<u8>>>
     sources
 }
 
-fn entry_sources_unchanged(entry: &HostEntry, sources: &HashMap<&str, Option<Vec<u8>>>) -> bool {
+fn entry_sources_unchanged<K: std::borrow::Borrow<str> + std::hash::Hash + Eq>(
+    entry: &HostEntry,
+    sources: &HashMap<K, Option<Vec<u8>>>,
+) -> bool {
     std::iter::once(entry.source.path.as_str())
         .chain(
             entry
@@ -1511,7 +1275,6 @@ fn entry_sources_unchanged(entry: &HostEntry, sources: &HashMap<&str, Option<Vec
 struct ConnectionOutcome {
     completed: bool,
     quit: bool,
-    status: Option<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1563,7 +1326,6 @@ fn run_connection_workspace(
             .map(|()| ConnectionOutcome {
                 completed: false,
                 quit: false,
-                status: None,
             });
     }
     if matches!(cli.command, Command::TunnelPairedStart(_)) && route.is_none() {
@@ -1572,7 +1334,6 @@ fn run_connection_workspace(
             .map(|()| ConnectionOutcome {
                 completed: false,
                 quit: false,
-                status: None,
             });
     }
     let target = route.as_ref().map_or(entry, |route| &route.vm);
@@ -1722,14 +1483,12 @@ fn run_connection_workspace(
                 return Ok(ConnectionOutcome {
                     completed,
                     quit: false,
-                    status,
                 });
             }
             Err(error) if error == tui::CANCELLED => {
                 return Ok(ConnectionOutcome {
                     completed,
                     quit: true,
-                    status,
                 });
             }
             Err(error) => return Err(error),
@@ -1829,7 +1588,6 @@ fn run_connection_workspace(
             return Ok(ConnectionOutcome {
                 completed,
                 quit: false,
-                status,
             });
         }
         restored = Some(choice);

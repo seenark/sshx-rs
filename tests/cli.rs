@@ -65,19 +65,17 @@ fn config_only_tty_opens_default_hosts_workspace() {
     let config = home.join(".ssh/config");
     write(&config, "Host example\n  HostName example.test\n");
     let bin = fake_ssh(&root);
-    let (status, output) = run_with_pty_header(
+    let (status, output) = run_with_pty_interactions(
         &home,
         &["--config", config.to_str().unwrap()],
         &bin,
         &root,
-        b"\x1b",
-        b"sshx Hosts",
+        &[(b"Search:", b"\x1b"), (b"NORMAL", b"q")],
+        None,
+        None,
     );
     assert!(status.success(), "status={status:?} output={output}");
     assert!(output.contains("example"), "output={output}");
-    for action in ["Tunnels", "Setup", "Doctor"] {
-        assert!(output.contains(action), "missing {action}: {output}");
-    }
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -483,10 +481,14 @@ fn bare_command_opens_hosts_tui_without_connecting_on_exit() {
     let bin = fake_ssh(&root);
     let (status, output) = run_with_pty_interactions(
         &home,
-        &[],
+        &["--config", config.to_str().unwrap()],
         &bin,
         &root,
-        &[(b"Search:", b"secondary"), (b"secondary", b"\x1b")],
+        &[
+            (b"Search:", b"secondary"),
+            (b"secondary", b"\x1b"),
+            (b"NORMAL", b"q"),
+        ],
         None,
         None,
     );
@@ -529,7 +531,7 @@ fn explicit_tui_filters_hosts_by_scope() {
         &["tui", "--scope", "work"],
         &bin,
         &root,
-        &[(b"sshx Hosts", b"\x1b")],
+        &[(b"Search:", b"\x1b"), (b"NORMAL", b"q")],
         None,
         None,
     );
@@ -553,11 +555,11 @@ fn tui_adds_custom_local_row_without_dropping_declared_service() {
     let edit_input = format!("{}:db_internal:8080\n", "\x7f".repeat(17));
     let (status, output) = run_with_pty_interactions(
         &home,
-        &["tui"],
+        &["tui", "connect", "prod"],
         &bin,
         &root,
         &[
-            (b"sshx Hosts", b"\n"),
+            (b"Search:", b"\n"),
             (b"5432#1", b" a"),
             (
                 b"[bind:]local:host:remote",
@@ -567,12 +569,16 @@ fn tui_adds_custom_local_row_without_dropping_declared_service() {
             (b"Edit custom row", edit_input.as_bytes()),
             (b"db_internal:8080", b"x"),
             (b"5432#1", b"\x1b"),
-            (b"sshx Hosts", b"\x1b"),
+            (b"Search:", b"\x1b"),
         ],
         None,
         Some((100, 40)),
     );
-    assert!(status.success(), "status={status:?} output={output}");
+    assert_eq!(
+        status.code(),
+        Some(130),
+        "status={status:?} output={output}"
+    );
     assert!(output.contains("5432#1"), "{output}");
     assert!(output.contains("db.internal:8080"), "{output}");
     assert!(output.contains("127.0.0.1:18080"), "{output}");
@@ -596,23 +602,27 @@ fn tui_custom_ipv6_local_row_can_be_reopened() {
     let bin = fake_ssh(&root);
     let (status, output) = run_with_pty_interactions(
         &home,
-        &["tui"],
+        &["tui", "connect", "prod"],
         &bin,
         &root,
         &[
-            (b"sshx Hosts", b"\n"),
+            (b"Search:", b"\n"),
             (b"5432#1", b" a"),
             (b"[bind:]local:host:remote", b"127.0.0.1:18080:[::1]:8080\n"),
             (b"::1:8080", b"e"),
             (b"Edit custom row", b"\n"),
             (b"::1:8080", b"x"),
             (b"5432#1", b"\x1b"),
-            (b"sshx Hosts", b"\x1b"),
+            (b"Search:", b"\x1b"),
         ],
         None,
         Some((100, 40)),
     );
-    assert!(status.success(), "status={status:?} output={output}");
+    assert_eq!(
+        status.code(),
+        Some(130),
+        "status={status:?} output={output}"
+    );
     assert!(output.contains("::1:8080"), "{output}");
     assert!(!output.contains("FORWARD_INVALID"), "{output}");
     assert!(!root.join("runtime-config").exists());
@@ -644,11 +654,11 @@ fn tui_custom_row_ids_survive_remove_add_and_startup_retry() {
     let bin = fake_ssh(&root);
     let (status, output) = run_with_pty_interactions(
         &home,
-        &["tui"],
+        &["tui", "connect", "prod"],
         &bin,
         &root,
         &[
-            (b"sshx Hosts", b"\n"),
+            (b"Search:", b"\n"),
             (b"5432#1", b"a"),
             (b"[bind:]local:host:remote", row1.as_bytes()),
             (b"db1:8001", b"a"),
@@ -661,12 +671,16 @@ fn tui_custom_row_ids_survive_remove_add_and_startup_retry() {
             (b"Connection workspace", b"a"),
             (b"[bind:]", row4.as_bytes()),
             (b"db4:8004", b"\x1b"),
-            (b"sshx Hosts", b"\x1b"),
+            (b"Search:", b"\x1b"),
         ],
         None,
         Some((100, 40)),
     );
-    assert!(status.success(), "status={status:?} output={output}");
+    assert_eq!(
+        status.code(),
+        Some(130),
+        "status={status:?} output={output}"
+    );
     assert!(output.contains("custom 3"), "{output}");
     assert!(output.contains("custom 4"), "{output}");
     assert!(!root.join("fail-once").exists());
@@ -711,11 +725,11 @@ fn tui_restores_unchecked_custom_rows_in_order_after_startup_failure() {
     let bin = fake_ssh(&root);
     let (status, output) = run_with_pty_interactions(
         &home,
-        &["tui"],
+        &["tui", "connect", "prod"],
         &bin,
         &root,
         &[
-            (b"sshx Hosts", b"\n"),
+            (b"Search:", b"\n"),
             (b"5432#1", b"a"),
             (b"[bind:]local:host:remote", row1.as_bytes()),
             (b"db1:8001", b"a"),
@@ -723,12 +737,16 @@ fn tui_restores_unchecked_custom_rows_in_order_after_startup_failure() {
             (b"db2:8002", b"\x1b[A \x1b[B\r"),
             (b"Review", b"\r"),
             (b"Connection workspace", b"\x1b"),
-            (b"sshx Hosts", b"\x1b"),
+            (b"Search:", b"\x1b"),
         ],
         None,
         Some((100, 40)),
     );
-    assert!(status.success(), "status={status:?} output={output}");
+    assert_eq!(
+        status.code(),
+        Some(130),
+        "status={status:?} output={output}"
+    );
     assert!(output.contains("custom 1"), "{output}");
     assert!(output.contains("custom 2"), "{output}");
     assert!(!output.contains("FORWARD_SELECTION_INVALID"), "{output}");
@@ -757,22 +775,26 @@ fn cancelling_custom_row_entry_discards_draft() {
     let bin = fake_ssh(&root);
     let (status, output) = run_with_pty_interactions(
         &home,
-        &["tui"],
+        &["tui", "connect", "prod"],
         &bin,
         &root,
         &[
-            (b"sshx Hosts", b"\n"),
+            (b"Search:", b"\n"),
             (b"Connection workspace", b"a"),
             (b"[bind:]", b"\x1b"),
             (b"No local forwards", b" \r"),
             (b"Review", b"\x1b"),
             (b"Enter review", b"\x1b"),
-            (b"sshx Hosts", b"\x1b"),
+            (b"Search:", b"\x1b"),
         ],
         None,
         Some((100, 40)),
     );
-    assert!(status.success(), "status={status:?} output={output}");
+    assert_eq!(
+        status.code(),
+        Some(130),
+        "status={status:?} output={output}"
+    );
     assert!(!root.join("runtime-config").exists());
     assert!(!root.join("master-started").exists());
     fs::remove_dir_all(root).unwrap();
@@ -1242,12 +1264,12 @@ fn tui_tunnel_returns_id_and_leaves_hosts_available() {
     let bin = fake_tunnel_ssh(&root);
     let (status, output) = run_with_pty_interactions(
         &home,
-        &[],
+        &["tui", "tunnel", "start", "direct"],
         &bin,
         &root,
         &[
             (b"Search:", b"\n"),
-            (b"5432#1", b"m \x1b[B \x1b[B \r"),
+            (b"5432#1", b" \x1b[B \x1b[B \r"),
             (b"Enter confirm", b"\r"),
             (b"dt-", b"\x1b"),
             (b"Search:", b"\x1b"),
@@ -1300,41 +1322,6 @@ fn tui_tunnel_returns_id_and_leaves_hosts_available() {
     for port in ports {
         drop(TcpListener::bind(("127.0.0.1", port)).unwrap());
     }
-    fs::remove_dir_all(root).unwrap();
-}
-
-#[cfg(unix)]
-#[test]
-fn hosts_tui_keeps_t_search_and_opens_tunnels_with_ctrl_t() {
-    let (root, home) = fixture_root();
-    let config = home.join(".ssh/config");
-    write(&config, "Host test\n  HostName test.example\n");
-    let bin = fake_ssh(&root);
-    let (status, output) = run_with_pty_interactions(
-        &home,
-        &[],
-        &bin,
-        &root,
-        &[
-            (b"sshx Hosts", b"test\r"),
-            (b"Connection workspace", b"\x1b"),
-            (b"Search:", b"\x14"),
-            (b"No registered tunnels.", b"\x1b"),
-            (b"Search:", b"\x1b"),
-        ],
-        None,
-        Some((100, 30)),
-    );
-    assert!(status.success(), "status={status:?} output={output}");
-    assert!(
-        contains_tui_text(output.as_bytes(), b"Connection workspace"),
-        "{output}"
-    );
-    assert!(
-        contains_tui_text(output.as_bytes(), b"No registered tunnels."),
-        "{output}"
-    );
-    assert!(!root.join("master-started").exists());
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -1410,14 +1397,15 @@ fn tunnels_tab_stops_active_tunnel_and_refreshes_registry() {
 
     let (status, output) = run_with_pty_interactions(
         &home,
-        &[],
+        &["--config", config.to_str().unwrap()],
         &bin,
         &root,
         &[
-            (b"Search:", b"\x14"),
+            (b"Search:", b"\x1b"),
+            (b"NORMAL", b"gt"),
             (b"Tunnel details", b"s"),
             (b"stopped", b"\x1b"),
-            (b"Search:", b"\x1b"),
+            (b"Search:", b"q"),
         ],
         None,
         Some((100, 30)),
@@ -1428,11 +1416,11 @@ fn tunnels_tab_stops_active_tunnel_and_refreshes_registry() {
         "{output}"
     );
     assert!(
-        contains_tui_text(output.as_bytes(), b"1 active"),
+        contains_tui_text(output.as_bytes(), "⇄ 1".as_bytes()),
         "{output}"
     );
     assert!(
-        contains_tui_text(output.as_bytes(), b"0 active"),
+        contains_tui_text(output.as_bytes(), "⇄ 0".as_bytes()),
         "{output}"
     );
     assert!(!root.join("master-started").exists());
@@ -1447,24 +1435,25 @@ fn tunnels_tab_stops_active_tunnel_and_refreshes_registry() {
 
     let config_changed = b"Host direct\n  HostName direct.changed\n";
     let error_marker = "CONFIG_CHANGED: selected HostEntry changed on disk";
-    let interactions: [(&[u8], &[u8]); 6] = [
-        (b"Search:", b"\x14"),
+    let interactions: [(&[u8], &[u8]); 7] = [
+        (b"Search:", b"\x1b"),
+        (b"NORMAL", b"gt"),
         (b"Tunnel details", b"\x1b[B"),
         (second_id.as_bytes(), b"r"),
         (error_marker.as_bytes(), b"\r"),
         (b"ID:", b"\x1b"),
-        (b"Search:", b"\x1b"),
+        (b"Search:", b"q"),
     ];
     let (status, output) = run_with_pty_interactions_with_hook(
         &home,
-        &[],
+        &["--config", config.to_str().unwrap()],
         &bin,
         &root,
         &interactions,
         None,
         Some((100, 30)),
         |index| {
-            if index == 1 {
+            if index == 2 {
                 fs::write(&config, config_changed).unwrap();
             }
         },
@@ -1530,10 +1519,11 @@ fn tunnels_tui_restarts_stopped_tunnel_from_explicit_config() {
         &bin,
         &root,
         &[
-            (b"sshx Hosts", b"\x14"),
+            (b"Search:", b"\x1b"),
+            (b"NORMAL", b"gt"),
             (b"Tunnel details", b"r"),
             (b"active", b"\x1b"),
-            (b"Search:", b"\x1b"),
+            (b"Search:", b"q"),
         ],
         None,
         Some((100, 30)),
@@ -1602,13 +1592,21 @@ fn tunnels_workspace_scrolls_details_on_compact_terminal() {
 
     let mut page_downs = "\x1b[6~".repeat(24).into_bytes();
     page_downs.push(0x1b);
-    let interactions: [(&[u8], &[u8]); 3] = [
-        (b"Search:", b"\x14"),
-        (b"Tunnel details", &page_downs),
+    let interactions: [(&[u8], &[u8]); 4] = [
         (b"Search:", b"\x1b"),
+        (b"NORMAL", b"gt"),
+        (b"Tunnel details", &page_downs),
+        (b"Search:", b"q"),
     ];
-    let (status, output) =
-        run_with_pty_interactions(&home, &[], &bin, &root, &interactions, None, Some((52, 12)));
+    let (status, output) = run_with_pty_interactions(
+        &home,
+        &["--config", config.to_str().unwrap()],
+        &bin,
+        &root,
+        &interactions,
+        None,
+        Some((52, 12)),
+    );
     assert!(status.success(), "status={status:?} output={output}");
     for visible_detail in ["ID:", "Mappings:", "Application health: not measured"] {
         assert!(
@@ -1889,7 +1887,7 @@ fn interactive_tunnel_startup_failure_cancellation_exits_130_without_listener() 
 
 #[cfg(unix)]
 #[test]
-fn paired_nonzero_session_exit_returns_to_hosts() {
+fn paired_nonzero_session_exit_ends_sshx_with_the_exit_code() {
     let (root, home) = fixture_root();
     let config = home.join(".ssh/config");
     write(
@@ -1917,33 +1915,13 @@ fn paired_nonzero_session_exit_returns_to_hosts() {
         &["--config", config.to_str().unwrap()],
         &bin,
         &root,
-        &[
-            (b"Search:", b"vm\r"),
-            (b"VM: vm", b"\r"),
-            (b"Enter confirm", b"\r"),
-            (b"Search:", b"\t\t\x1b[6~"),
-            (b"22222222-2222-4222-8222-222222222222", b"\x1b"),
-        ],
+        &[(b"Search:", b"vm\r")],
         None,
         Some((80, 24)),
     );
-    assert!(status.success(), "status={status:?} output={output}");
+    assert_eq!(status.code(), Some(7), "status={status:?} output={output}");
     assert!(
-        contains_tui_text(output.as_bytes(), b"Session ended (exit 7)"),
-        "{output}"
-    );
-    let returned_hosts = output
-        .rfind("Search:")
-        .expect("Session exit should restore Hosts");
-    assert!(
-        contains_tui_text(
-            &output.as_bytes()[returned_hosts..],
-            b"22222222-2222-4222-8222-222222222222",
-        ),
-        "Hosts should preserve the exact VM identity: {output}"
-    );
-    assert!(
-        contains_tui_text(&output.as_bytes()[returned_hosts..], b"vm.internal"),
+        !contains_tui_text(output.as_bytes(), b"Session ended"),
         "{output}"
     );
     assert!(root.join("master-closed").exists());
@@ -2854,7 +2832,7 @@ fn workspace_restores_edited_rows_after_startup_failure() {
     let page_down = "\x1b[6~".repeat(9);
     let (status, output) = run_with_pty_interactions_with_hook(
         &home,
-        &[],
+        &["tui", "connect", "direct"],
         &bin,
         &root,
         &[
@@ -2886,7 +2864,11 @@ fn workspace_restores_edited_rows_after_startup_failure() {
             }
         },
     );
-    assert!(status.success(), "status={status:?} output={output}");
+    assert_eq!(
+        status.code(),
+        Some(130),
+        "status={status:?} output={output}"
+    );
     assert!(output.contains("SERVICE_BIND_FAILED:"), "{output}");
     let error_position = output
         .find("SERVICE_BIND_FAILED:")
@@ -2992,7 +2974,7 @@ fn explicit_tui_unknown_id_errors_before_hosts_ui() {
 
 #[cfg(unix)]
 #[test]
-fn hosts_tui_opens_exact_duplicate_and_restores_selection_after_session() {
+fn hosts_tui_connects_the_exact_duplicate_selected_with_arrows() {
     let (root, home) = fixture_root();
     let ssh = home.join(".ssh");
     write(&ssh.join("config"), "Include one.conf two.conf\n");
@@ -3010,31 +2992,15 @@ fn hosts_tui_opens_exact_duplicate_and_restores_selection_after_session() {
     let bin = fake_ssh(&root);
     let (status, output) = run_with_pty_interactions(
         &home,
-        &[],
+        &["--config", ssh.join("config").to_str().unwrap()],
         &bin,
         &root,
-        &[
-            (b"sshx Hosts", b"secondary\t\t\x1b[6~\x1b[B\r"),
-            (b"Connection workspace", b"\r"),
-            (b"Enter confirm", b"\r"),
-            (b"Search:", b"\t\t\x1b[6~"),
-            (b"22222222-2222-4222-8222-222222222222", b"\x1b"),
-        ],
+        &[(b"Search:", b"secondary\x1b[B\r")],
         None,
-        Some((48, 18)),
+        Some((120, 24)),
     );
     assert!(status.success(), "status={status:?} output={output}");
-    let session_status = output
-        .rfind("Session ended.")
-        .or_else(|| output.rfind("Sessionended."))
-        .expect("Hosts should show Session completion status");
-    assert!(
-        contains_tui_text(
-            &output.as_bytes()[session_status..],
-            b"22222222-2222-4222-8222-222222222222",
-        ),
-        "Hosts should restore the exact selected ID: {output}"
-    );
+    assert!(output.contains("direct-shell"), "{output}");
     let runtime = fs::read_to_string(root.join("runtime-config")).unwrap();
     assert!(
         runtime.lines().any(|line| line == "Host secondary"),
@@ -3064,15 +3030,10 @@ fn hosts_tui_session_output_uses_terminal_when_stdout_is_redirected() {
     let bin = fake_ssh(&root);
     let (status, output) = run_with_pty_interactions(
         &home,
-        &[],
+        &["--config", home.join(".ssh/config").to_str().unwrap()],
         &bin,
         &root,
-        &[
-            (b"Search:", b"\r"),
-            (b"Connection workspace", b"\r"),
-            (b"Enter confirm", b"\r"),
-            (b"Search:", b"\x1b"),
-        ],
+        &[(b"Search:", b"\r")],
         None,
         None,
     );
@@ -3093,15 +3054,10 @@ fn hosts_tui_session_output_uses_terminal_when_stdout_is_closed() {
     let bin = fake_ssh(&root);
     let (status, output) = run_with_pty_interactions(
         &home,
-        &[],
+        &["--config", home.join(".ssh/config").to_str().unwrap()],
         &bin,
         &root,
-        &[
-            (b"Search:", b"\r"),
-            (b"Connection workspace", b"\r"),
-            (b"Enter confirm", b"\r"),
-            (b"Search:", b"\x1b"),
-        ],
+        &[(b"Search:", b"\r")],
         None,
         None,
     );
@@ -3124,10 +3080,14 @@ fn hosts_tui_refreshes_changed_source_before_session() {
     let bin = fake_ssh(&root);
     let (status, output) = run_with_pty_interactions_with_hook(
         &home,
-        &[],
+        &["--config", config.to_str().unwrap()],
         &bin,
         &root,
-        &[(b"sshx Hosts", b"\r"), (b"HOST_SOURCE_CHANGED", b"\x1b")],
+        &[
+            (b"Search:", b"\r"),
+            (b"HOST_SOURCE_CHANGED", b"\x1b"),
+            (b"NORMAL", b"q"),
+        ],
         None,
         None,
         |index| {
@@ -3152,6 +3112,16 @@ fn hosts_tui_keeps_running_when_config_root_disappears() {
     let (root, home) = fixture_root();
     let config = home.join(".ssh/config");
     write(&config, "Host direct\n  HostName direct.example\n");
+    let registered = run(
+        &home,
+        &[
+            "setup",
+            "--personal",
+            config.to_str().unwrap(),
+            "--no-input",
+        ],
+    );
+    assert!(registered.status.success(), "{registered:?}");
     let bin = fake_ssh(&root);
     let (status, output) = run_with_pty_interactions_with_hook(
         &home,
@@ -3160,11 +3130,8 @@ fn hosts_tui_keeps_running_when_config_root_disappears() {
         &root,
         &[
             (b"Search:", b"\r"),
-            (b"No HostEntries", b"\x13"),
-            (b"SSH config file path:", b"\x1b"),
-            (b"No HostEntries", b"\x04"),
-            (b"Evidence and guidance", b"\x1b"),
-            (b"No HostEntries", b"\x1b"),
+            (b"No matching HostEntry aliases.", b"\x1b"),
+            (b"NORMAL", b"q"),
         ],
         None,
         Some((100, 36)),
@@ -3178,7 +3145,6 @@ fn hosts_tui_keeps_running_when_config_root_disappears() {
     assert!(!root.join("master-started").exists());
     assert!(!root.join("runtime-config").exists());
     assert!(!config.exists());
-    assert!(!home.join(".config/sshx/config.json").exists());
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -3196,10 +3162,14 @@ fn hosts_tui_refreshes_changed_include_before_session() {
     let changed = "Include two.conf\n";
     let (status, output) = run_with_pty_interactions_with_hook(
         &home,
-        &[],
+        &["--config", config.to_str().unwrap()],
         &bin,
         &root,
-        &[(b"Search:", b"\r"), (b"HOST_SOURCE_CHANGED", b"\x1b")],
+        &[
+            (b"Search:", b"\r"),
+            (b"HOST_SOURCE_CHANGED", b"\x1b"),
+            (b"NORMAL", b"q"),
+        ],
         None,
         None,
         |index| {
@@ -3250,10 +3220,14 @@ fn hosts_tui_refreshes_changed_pair_gateway_before_session() {
     let bin = fake_ssh(&root);
     let (status, output) = run_with_pty_interactions_with_hook(
         &home,
-        &[],
+        &["--config", config.to_str().unwrap()],
         &bin,
         &root,
-        &[(b"Search:", b"\x1b[B\r"), (b"HOST_SOURCE_CHANGED", b"\x1b")],
+        &[
+            (b"Search:", b"\x1b[B\r"),
+            (b"HOST_SOURCE_CHANGED", b"\x1b"),
+            (b"NORMAL", b"q"),
+        ],
         None,
         None,
         |index| {
@@ -3287,10 +3261,14 @@ fn hosts_tui_rejects_unsupported_match_before_session() {
     let bin = fake_ssh(&root);
     let (status, output) = run_with_pty_interactions(
         &home,
-        &[],
+        &["--config", config.to_str().unwrap()],
         &bin,
         &root,
-        &[(b"Search:", b"direct\r"), (b"UNSUPPORTED_MATCH", b"\x1b")],
+        &[
+            (b"Search:", b"direct\r"),
+            (b"UNSUPPORTED_MATCH", b"\x1b"),
+            (b"NORMAL", b"q"),
+        ],
         None,
         None,
     );
@@ -3301,74 +3279,6 @@ fn hosts_tui_rejects_unsupported_match_before_session() {
     fs::remove_dir_all(root).unwrap();
 }
 
-#[cfg(unix)]
-#[test]
-fn hosts_tui_small_terminal_keeps_identity_and_controls_visible() {
-    let (root, home) = fixture_root();
-    let config = home.join(".ssh/config");
-    write(&config, "Host direct\n  HostName direct.example\n");
-    let bin = fake_ssh(&root);
-    let (status, output) = run_with_pty_interactions(
-        &home,
-        &[],
-        &bin,
-        &root,
-        &[(b"Search:", b"\t"), (b"ID:", b"\t\x1b")],
-        None,
-        Some((30, 12)),
-    );
-    assert!(status.success(), "status={status:?} output={output}");
-    assert!(output.contains("direct"), "output={output}");
-    assert!(output.contains("Route:"), "output={output}");
-    assert!(output.contains("Direct"), "output={output}");
-    assert!(output.contains(".ssh/config"), "output={output}");
-    assert!(output.contains("ID:"), "output={output}");
-    assert!(output.contains("#0-38"), "output={output}");
-    assert!(output.contains("Enter"), "output={output}");
-    assert!(output.contains("Esc"), "output={output}");
-    assert!(!root.join("master-started").exists());
-    fs::remove_dir_all(root).unwrap();
-}
-#[cfg(unix)]
-#[test]
-fn hosts_tui_scrolls_full_source_identity_on_compact_terminal() {
-    let (root, home) = fixture_root();
-    let common = format!("{}/{}", "common".repeat(8), "prefix".repeat(8));
-    let first = format!("{common}/alpha/hosts.conf");
-    let second = format!("{common}/beta/hosts.conf");
-    write(
-        &home.join(".ssh/config"),
-        &format!("Include {first}\nInclude {second}\n"),
-    );
-    write(
-        &home.join(".ssh").join(&first),
-        "##SSHX ID=11111111-1111-4111-8111-111111111111\nHost duplicate\n  HostName same.example\n",
-    );
-    write(
-        &home.join(".ssh").join(&second),
-        "##SSHX ID=22222222-2222-4222-8222-222222222222\nHost duplicate\n  HostName same.example\n",
-    );
-    let bin = fake_ssh(&root);
-    let (status, output) = run_with_pty_interactions(
-        &home,
-        &[],
-        &bin,
-        &root,
-        &[
-            (b"Search:", b"\x1b[B\t"),
-            (b"ID:", b"\t\x1b[6~\x1b[6~\x1b[6~\x1b[6~\x1b"),
-        ],
-        None,
-        Some((18, 12)),
-    );
-    assert!(status.success(), "status={status:?} output={output}");
-    assert!(
-        contains_tui_text(output.as_bytes(), b"beta/hosts.conf"),
-        "output={output}"
-    );
-    assert!(!root.join("master-started").exists());
-    fs::remove_dir_all(root).unwrap();
-}
 #[cfg(unix)]
 #[test]
 fn connect_picker_scrolls_full_source_identity_on_compact_terminal() {
@@ -3474,129 +3384,6 @@ fn workspace_edit_scroll_reveals_local_listener_on_eighteen_by_twelve_terminal()
 
 #[cfg(unix)]
 #[test]
-fn populated_hosts_sections_open_from_keyboard_and_return() {
-    let (root, home) = fixture_root();
-    let config = home.join(".ssh/config");
-    write(&config, "Host direct\n  HostName direct.example\n");
-    let original = fs::read(&config).unwrap();
-    let bin = fake_ssh(&root);
-    let (status, output) = run_with_pty_interactions(
-        &home,
-        &["--config", config.to_str().unwrap(), "tui"],
-        &bin,
-        &root,
-        &[
-            (b"Search:", b"\x14"),
-            (b"No registered tunnels.", b"\x1b"),
-            (b"Search:", b"\x10"),
-            (b"No valid Pair relationships.", b"\x1b"),
-            (b"Search:", b"\x13"),
-            (b"SSH config file path", b"\x1b"),
-            (b"Search:", b"\x04"),
-            (b"Evidence and guidance", b"\x1b"),
-            (b"Search:", b"\x1b"),
-        ],
-        None,
-        None,
-    );
-    assert!(status.success(), "status={status:?} output={output}");
-    assert!(!root.join("master-started").exists());
-    assert_eq!(fs::read(&config).unwrap(), original);
-    assert!(!home.join(".config/sshx/config.json").exists());
-    fs::remove_dir_all(root).unwrap();
-}
-
-#[cfg(unix)]
-#[test]
-fn empty_hosts_setup_registers_selected_config() {
-    let (root, home) = fixture_root();
-    write(&home.join(".ssh/config"), "# no HostEntries\n");
-    let config = home.join("configs/ssh_config");
-    write(&config, "Host registered\n  HostName registered.example\n");
-    let bin = fake_ssh(&root);
-    let original = fs::read(&config).unwrap();
-    let mut setup_input = b"\x15".to_vec();
-    setup_input.extend_from_slice(config.to_string_lossy().as_bytes());
-    let (status, output) = run_with_pty_interactions_with_hook(
-        &home,
-        &[],
-        &bin,
-        &root,
-        &[
-            (b"No HostEntries", b"\x13"),
-            (b"SSH config file path:", &setup_input),
-            (b"_config", b"\x13"),
-            (b"Config root registered.", b"\x1b"),
-        ],
-        None,
-        Some((100, 36)),
-        |stage| {
-            if stage == 1 || stage == 2 {
-                assert!(!home.join(".config/sshx/config.json").exists());
-                assert_eq!(fs::read(&config).unwrap(), original);
-            }
-        },
-    );
-    assert!(status.success(), "status={status:?} output={output}");
-    assert_eq!(fs::read(&config).unwrap(), original);
-    let hosts = run(&home, &["host", "list", "--format", "json"]);
-    assert!(hosts.status.success(), "{hosts:?}");
-    let hosts: serde_json::Value = serde_json::from_slice(&hosts.stdout).unwrap();
-    assert_eq!(hosts["entries"][0]["aliases"][0], "registered");
-    let settings = fs::read_to_string(home.join(".config/sshx/config.json")).unwrap();
-    assert!(
-        settings.contains(config.to_str().unwrap()),
-        "settings={settings}"
-    );
-    assert!(!root.join("master-started").exists());
-    fs::remove_dir_all(root).unwrap();
-}
-
-#[cfg(unix)]
-#[test]
-fn setup_under_explicit_config_preserves_other_registered_roots() {
-    let (root, home) = fixture_root();
-    let root_a = home.join("configs/a");
-    let root_b = home.join("configs/b");
-    let root_c = home.join("configs/c");
-    write(&root_a, "# no HostEntries\n");
-    write(&root_b, "# registered root B\n");
-    write(&root_c, "# saved root C\n");
-    fs::create_dir_all(home.join(".config/sshx")).unwrap();
-    write(
-        &home.join(".config/sshx/config.json"),
-        &format!(
-            "{{\"version\":1,\"roots\":[{{\"scope\":\"personal\",\"path\":\"{}\",\"project\":null}}]}}",
-            root_c.display()
-        ),
-    );
-    let bin = fake_ssh(&root);
-    let mut input = b"\x1b[B\x1b[B\x15".to_vec();
-    input.extend_from_slice(root_b.to_string_lossy().as_bytes());
-    input.extend_from_slice(b"\x13");
-    let (status, output) = run_with_pty_interactions(
-        &home,
-        &["--config", root_a.to_str().unwrap()],
-        &bin,
-        &root,
-        &[
-            (b"No HostEntries", b"\x13"),
-            (b"SSH config file path:", &input),
-            (b"Config root registered.", b"\x1b"),
-        ],
-        None,
-        Some((100, 36)),
-    );
-    assert!(status.success(), "status={status:?} output={output}");
-    let settings = fs::read_to_string(home.join(".config/sshx/config.json")).unwrap();
-    assert!(settings.contains(root_c.to_str().unwrap()), "{settings}");
-    assert!(settings.contains(root_b.to_str().unwrap()), "{settings}");
-    assert!(!settings.contains(root_a.to_str().unwrap()), "{settings}");
-    fs::remove_dir_all(root).unwrap();
-}
-
-#[cfg(unix)]
-#[test]
 fn setup_workspace_keeps_invalid_path_unregistered_until_explicit_register() {
     let (root, home) = fixture_root();
     let bin = fake_ssh(&root);
@@ -3644,6 +3431,7 @@ fn partial_setup_prefills_scope_and_project_before_registering() {
         &[
             (b"SSH config file path:", &setup_input),
             (b"Config root registered.", b"\x1b"),
+            (b"NORMAL", b"q"),
         ],
         None,
         Some((100, 36)),
@@ -3678,7 +3466,11 @@ fn explicit_tui_setup_prefills_config_path() {
         ],
         &bin,
         &root,
-        &[(b"SSH config file path:", b"\x13"), (b"work-host", b"\x1b")],
+        &[
+            (b"SSH config file path:", b"\x13"),
+            (b"work-host", b"\x1b"),
+            (b"NORMAL", b"q"),
+        ],
         None,
         Some((100, 36)),
     );
@@ -3688,31 +3480,6 @@ fn explicit_tui_setup_prefills_config_path() {
     assert_eq!(document["roots"][0]["scope"], "work");
     assert_eq!(document["roots"][0]["project"], "demo");
     assert_eq!(document["roots"][0]["path"], config.to_str().unwrap());
-    fs::remove_dir_all(root).unwrap();
-}
-
-#[cfg(unix)]
-#[test]
-fn empty_hosts_doctor_report_stays_visible_until_acknowledged() {
-    let (root, home) = fixture_root();
-    write(&root.join("redirect-stdout"), "");
-    let bin = fake_ssh(&root);
-    let (status, output) = run_with_pty_interactions(
-        &home,
-        &[],
-        &bin,
-        &root,
-        &[
-            (b"No HostEntries", b"\x04"),
-            (b"Evidence and guidance", b"\x1b"),
-            (b"No HostEntries", b"\x1b"),
-        ],
-        None,
-        None,
-    );
-    assert!(status.success(), "status={status:?} output={output}");
-    assert!(!home.join(".config/sshx/config.json").exists());
-    assert!(!root.join("master-started").exists());
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -3740,6 +3507,7 @@ fn setup_registration_stays_open_when_saved_root_is_missing() {
         &[
             (b"SSH config file path:", b"\x13"),
             (b"Config root registered.", b"\x1b"),
+            (b"NORMAL", b"q"),
         ],
         None,
         Some((100, 36)),
@@ -3816,15 +3584,10 @@ fn hosts_tui_searches_unicode_aliases() {
     let bin = fake_ssh(&root);
     let (status, output) = run_with_pty_interactions(
         &home,
-        &[],
+        &["--config", config.to_str().unwrap()],
         &bin,
         &root,
-        &[
-            (b"sshx Hosts", b"caf\xc3\xa9\r"),
-            (b"Connection workspace", b"\r"),
-            (b"Enter confirm", b"\r"),
-            (b"Search:", b"\x1b"),
-        ],
+        &[(b"Search:", b"caf\xc3\xa9\r")],
         None,
         None,
     );
@@ -3904,14 +3667,18 @@ fn hosts_tui_ctrl_c_exits_without_connecting() {
     let bin = fake_ssh(&root);
     let (status, output) = run_with_pty_interactions(
         &home,
-        &[],
+        &["--config", config.to_str().unwrap()],
         &bin,
         &root,
         &[(b"Search:", b"\x03")],
         None,
         None,
     );
-    assert!(status.success(), "status={status:?} output={output}");
+    assert_eq!(
+        status.code(),
+        Some(130),
+        "status={status:?} output={output}"
+    );
     assert!(!root.join("master-started").exists());
     assert!(!home.join(".config/sshx/config.json").exists());
     assert_eq!(
@@ -3920,31 +3687,6 @@ fn hosts_tui_ctrl_c_exits_without_connecting() {
     );
     fs::remove_dir_all(root).unwrap();
 }
-#[cfg(unix)]
-#[test]
-fn hosts_tui_escape_followed_by_character_exits_without_waiting() {
-    let (root, home) = fixture_root();
-    let config = home.join(".ssh/config");
-    write(&config, "Host direct\n  HostName direct.example\n");
-    let bin = fake_ssh(&root);
-    let (status, output) = run_with_pty_interactions(
-        &home,
-        &[],
-        &bin,
-        &root,
-        &[(b"Search:", b"\x1bc")],
-        None,
-        None,
-    );
-    assert!(status.success(), "status={status:?} output={output}");
-    assert!(!root.join("master-started").exists());
-    assert_eq!(
-        fs::read_to_string(&config).unwrap(),
-        "Host direct\n  HostName direct.example\n"
-    );
-    fs::remove_dir_all(root).unwrap();
-}
-
 #[cfg(unix)]
 #[test]
 fn hosts_tui_shows_pair_route_before_session() {
@@ -3973,17 +3715,18 @@ fn hosts_tui_shows_pair_route_before_session() {
     let bin = fake_ssh(&root);
     let (status, output) = run_with_pty_interactions(
         &home,
-        &[],
+        &["--config", config.to_str().unwrap()],
         &bin,
         &root,
-        &[(b"Pair", b"\x1b")],
+        &[(b"Search:", b"\x1b"), (b"NORMAL", b"q")],
         None,
-        Some((48, 18)),
+        Some((100, 24)),
     );
     assert!(status.success(), "status={status:?} output={output}");
-    assert!(output.contains("route:"), "output={output}");
-    assert!(output.contains("Pair"), "output={output}");
-    assert!(output.contains("z-gateway"), "output={output}");
+    assert!(
+        contains_tui_text(output.as_bytes(), "Route z-gateway → a-vm".as_bytes()),
+        "output={output}"
+    );
     assert!(!root.join("master-started").exists());
     fs::remove_dir_all(root).unwrap();
 }
@@ -8242,25 +7985,6 @@ fn doctor_workspace_shows_repair_plan_before_confirmation() {
     let bin = fake_ssh(&root);
     let (status, output) = run_with_pty_interactions_with_hook(
         &home,
-        &["--config", config.to_str().unwrap(), "tui"],
-        &bin,
-        &root,
-        &[
-            (b"Search:", b"\x04"),
-            (b"report only", b"yr"),
-            (b"0644 -> 0600", b"\rn\x03"),
-            (b"Search:", b"\x1b"),
-        ],
-        None,
-        Some((100, 36)),
-        |_| assert_eq!(mode_of(&config), 0o644),
-    );
-    assert!(status.success(), "status={status:?} output={output}");
-    assert_eq!(mode_of(&config), 0o644);
-    assert!(!output.contains("stored-secret"), "output={output}");
-
-    let (status, output) = run_with_pty_interactions_with_hook(
-        &home,
         &["--config", config.to_str().unwrap(), "tui", "doctor"],
         &bin,
         &root,
@@ -8530,45 +8254,6 @@ fn host_rename_picker_preserves_selected_alias_and_identity() {
     );
     fs::remove_dir_all(root).unwrap();
 }
-#[cfg(unix)]
-#[test]
-fn hosts_tui_keeps_mutations_available_for_pair_gateway() {
-    let (root, home) = fixture_root();
-    let config = home.join(".ssh/config");
-    let original = concat!(
-        "##SSHX ID=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\n",
-        "##SSHX VM=bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb\n",
-        "Host gateway\n",
-        "  HostName gateway.example\n",
-        "  LocalForward 2200 vm.internal:22\n",
-        "##SSHX ID=bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb\n",
-        "##SSHX GATEWAY=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\n",
-        "##SSHX TRANSIT=vm.internal:22\n",
-        "Host vm\n",
-        "  HostName vm.internal\n",
-        "  Port 22\n",
-    );
-    write(&config, original);
-    let bin = root.join("bin");
-    fs::create_dir(&bin).unwrap();
-    let (status, output) = run_with_pty_interactions(
-        &home,
-        &["--config", config.to_str().unwrap(), "tui"],
-        &bin,
-        &root,
-        &[
-            (b"Search:", b"gateway\x15"),
-            (b"Alias [keep]: gateway", b"\x1b"),
-            (b"HostEntry edit cancelled.", b"\x1b"),
-        ],
-        None,
-        Some((100, 40)),
-    );
-    assert!(status.success(), "status={status:?} output={output}");
-    assert_eq!(fs::read_to_string(&config).unwrap(), original);
-    fs::remove_dir_all(root).unwrap();
-}
-
 #[test]
 fn copy_ssh_without_clipboard_prints_quoted_command() {
     let (root, home) = fixture_root();
@@ -9692,137 +9377,6 @@ fn selectorless_password_action_confirms_without_exposing_secret() {
     fs::remove_dir_all(root).unwrap();
 }
 
-#[cfg(all(unix, any(target_os = "macos", target_os = "linux")))]
-#[test]
-fn hosts_copy_password_shortcut_confirms_and_preserves_selection() {
-    for operation in [&[][..], &["tui"][..], &["tui", "host", "show", "decoy"][..]] {
-        let (root, home) = fixture_root();
-        let config = home.join(".ssh/config");
-        write(
-            &config,
-            "Host decoy\n  HostName decoy.example\n  ##PASSWORD decoy-secret\n\
-             Host group-first\n  HostName first.example\n  ##PASSWORD first-secret\n\
-             Host group-second\n  HostName second.example\n  ##PASSWORD second-secret\n",
-        );
-        fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
-        let bin = fake_ssh(&root);
-        fake_clipboard(&bin, &root);
-        write_preferences(&home, CONFIRMING_PREFERENCES);
-        let mut args = vec!["--config", config.to_str().unwrap()];
-        args.extend_from_slice(operation);
-
-        let (status, output) = run_with_pty_interactions_with_hook(
-            &home,
-            &args,
-            &bin,
-            &root,
-            &[
-                (b"Search:", b"group\x1b[B\x19"),
-                (b"Copy stored password now?", b"y\n"),
-                (b"Password copied to clipboard.", b"\x19"),
-                (b"Copy stored password now?", b"y\n"),
-                (b"Password copied to clipboard.", b"\x1b[A\x1b[A\x19"),
-                (b"Copy stored password now?", b"y\n"),
-                (b"Password copied to clipboard.", b"\x03"),
-            ],
-            None,
-            Some((100, 40)),
-            |stage| {
-                if matches!(stage, 1 | 3 | 5) {
-                    for file in ["clipboard-content", "clipboard-args", "clipboard-env"] {
-                        assert!(
-                            !root.join(file).exists(),
-                            "clipboard ran before confirmation"
-                        );
-                    }
-                }
-                if matches!(stage, 2 | 4 | 6) {
-                    let expected = if stage == 6 {
-                        "first-secret"
-                    } else {
-                        "second-secret"
-                    };
-                    assert_eq!(
-                        fs::read_to_string(root.join("clipboard-content")).unwrap(),
-                        expected,
-                        "operation={operation:?} stage={stage}"
-                    );
-                    assert!(
-                        fs::read_to_string(root.join("clipboard-args"))
-                            .unwrap()
-                            .is_empty()
-                    );
-                    let environment = fs::read_to_string(root.join("clipboard-env")).unwrap();
-                    for secret in ["decoy-secret", "first-secret", "second-secret"] {
-                        assert!(!environment.contains(secret));
-                    }
-                    if stage != 6 {
-                        for file in ["clipboard-content", "clipboard-args", "clipboard-env"] {
-                            fs::remove_file(root.join(file)).unwrap();
-                        }
-                    }
-                }
-            },
-        );
-        assert!(
-            status.success(),
-            "operation={operation:?} status={status:?} output={output}"
-        );
-        for secret in ["decoy-secret", "first-secret", "second-secret"] {
-            assert!(
-                !output.contains(secret),
-                "operation={operation:?} output={output}"
-            );
-        }
-        assert!(!root.join("master-started").exists());
-        assert!(!root.join("runtime-config").exists());
-        fs::remove_dir_all(root).unwrap();
-    }
-}
-
-#[cfg(all(unix, any(target_os = "macos", target_os = "linux")))]
-#[test]
-fn hosts_copy_password_shortcut_decline_and_unavailable_do_not_copy() {
-    let (root, home) = fixture_root();
-    let config = home.join(".ssh/config");
-    write(
-        &config,
-        "Host direct\n  HostName direct.example\n  ##PASSWORD declined-secret\n\
-         Host other\n  HostName other.example\n",
-    );
-    fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
-    let bin = fake_ssh(&root);
-    fake_clipboard(&bin, &root);
-    write_preferences(&home, CONFIRMING_PREFERENCES);
-
-    let (status, output) = run_with_pty_interactions(
-        &home,
-        &["--config", config.to_str().unwrap(), "tui"],
-        &bin,
-        &root,
-        &[
-            (b"Search:", b"\t\t\x1b[6~\x1b[6~\x1b[6~\x1b[6~\x19"),
-            (b"Copy stored password now?", b"n\n"),
-            (
-                b"PASSWORD_COPY_DECLINED",
-                b"missing\x19\x7f\x7f\x7f\x7f\x7f\x7f\x7fother\x19",
-            ),
-            (b"PASSWORD_UNAVAILABLE", b"\x1b"),
-        ],
-        None,
-        Some((100, 40)),
-    );
-    assert!(status.success(), "status={status:?} output={output}");
-    assert!(!output.contains("declined-secret"), "output={output}");
-    for file in ["clipboard-content", "clipboard-args", "clipboard-env"] {
-        assert!(!root.join(file).exists());
-    }
-    assert!(!root.join("master-started").exists());
-    assert!(!root.join("runtime-config").exists());
-    assert_eq!(mode_of(&config), 0o600);
-    fs::remove_dir_all(root).unwrap();
-}
-
 #[cfg(unix)]
 #[test]
 fn selectorless_password_action_cancel_does_not_repair_permissions() {
@@ -10256,43 +9810,6 @@ fn host_create_rejects_explicit_scope_conflict_before_opening_workspace() {
     assert!(output.contains("SCOPE_ROOT_CONFLICT"), "{output}");
     assert_eq!(fs::read(&config).unwrap(), original);
     assert!(!home.join(".config/sshx/config.json").exists());
-    fs::remove_dir_all(root).unwrap();
-}
-
-#[cfg(unix)]
-#[test]
-fn empty_hosts_setup_cancel_keeps_explicit_config_available_for_create() {
-    let (root, home) = fixture_root();
-    let config = root.join("unregistered.conf");
-    write(&config, "");
-    let bin = root.join("bin");
-    fs::create_dir(&bin).unwrap();
-    let (status, output) = run_with_pty_interactions(
-        &home,
-        &["--config", config.to_str().unwrap(), "tui"],
-        &bin,
-        &root,
-        &[
-            (b"No HostEntries", b"\x13"),
-            (b"Setup", b"\x1b"),
-            (b"No HostEntries", b"\x0e"),
-            (
-                b"Destination file:",
-                b"unregistered.conf\tsaved\tendpoint.example\x13",
-            ),
-            (b"Review HostEntry changes", b"\n"),
-            (b"Search:", b"\x1b"),
-        ],
-        None,
-        Some((100, 40)),
-    );
-    assert!(status.success(), "status={status:?} output={output}");
-    assert!(
-        fs::read_to_string(&config)
-            .unwrap()
-            .contains("Host saved\n  HostName endpoint.example\n"),
-        "{output}"
-    );
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -11157,14 +10674,18 @@ fn continuation_bare_tui_selectors_prefill_without_locking_browse_scope() {
         &["--id", first][..],
         &["--source", config.to_str().unwrap(), "--line", &line][..],
     ] {
-        let mut args = vec!["tui"];
+        let mut args = vec!["--config", config.to_str().unwrap(), "tui"];
         args.extend_from_slice(selectors);
         let (status, output) = run_with_pty_interactions(
             &home,
             &args,
             &bin,
             &root,
-            &[(b"Search:", b"other"), (b"other.example", b"\x1b")],
+            &[
+                (b"Search:", b"other"),
+                (b"other", b"\x1b"),
+                (b"NORMAL", b"q"),
+            ],
             None,
             Some((100, 30)),
         );
@@ -11173,7 +10694,6 @@ fn continuation_bare_tui_selectors_prefill_without_locking_browse_scope() {
             contains_tui_text(output.as_bytes(), b"> selected"),
             "{output}"
         );
-        assert!(contains_tui_text(output.as_bytes(), b"> other"), "{output}");
     }
     for selectors in [
         &["--id", "missing"][..],
@@ -11379,5 +10899,455 @@ fn copy_password_defaults_skip_confirmation_and_warn_once() {
     let second = copy_password_command(&home, &config, &bin);
     assert!(second.status.success(), "{second:?}");
     assert!(!String::from_utf8_lossy(&second.stderr).contains("Warning:"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+fn two_host_config(home: &Path) -> PathBuf {
+    let config = home.join(".ssh/config");
+    write(
+        &config,
+        "Host db\n  HostName db.example\nHost web\n  HostName web.example\n",
+    );
+    config
+}
+
+#[cfg(unix)]
+#[test]
+fn typing_a_search_then_enter_opens_a_plain_session_without_prompts() {
+    let (root, home) = fixture_root();
+    let config = two_host_config(&home);
+    let bin = fake_ssh(&root);
+    let (status, output) = run_with_pty_interactions(
+        &home,
+        &["--config", config.to_str().unwrap()],
+        &bin,
+        &root,
+        &[(b"Search:", b"db\r")],
+        None,
+        None,
+    );
+    assert!(status.success(), "status={status:?} output={output}");
+    assert!(output.contains("direct-shell"), "{output}");
+    assert!(
+        contains_tui_text(output.as_bytes(), "INSERT│all│1/2│⇄ 0".as_bytes()),
+        "status line should show input mode, filter, position and tunnels: {output}"
+    );
+    let runtime = fs::read_to_string(root.join("runtime-config")).unwrap();
+    assert!(runtime.contains("Host db"), "{runtime}");
+    for forward in ["LocalForward", "RemoteForward", "DynamicForward"] {
+        assert!(!runtime.contains(forward), "{runtime}");
+    }
+    for step in ["Connection workspace", "Review", "Enter confirm"] {
+        assert!(!output.contains(step), "unexpected {step}: {output}");
+    }
+    assert!(root.join("master-closed").exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn escape_enters_normal_mode_and_q_quits_without_connecting() {
+    let (root, home) = fixture_root();
+    let config = two_host_config(&home);
+    let bin = fake_ssh(&root);
+    let (status, output) = run_with_pty_interactions(
+        &home,
+        &["--config", config.to_str().unwrap()],
+        &bin,
+        &root,
+        &[(b"Search:", b"\x1b"), (b"NORMAL", b"q")],
+        None,
+        None,
+    );
+    assert!(status.success(), "status={status:?} output={output}");
+    assert!(!root.join("master-started").exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn ctrl_c_quits_from_insert_and_normal_mode_with_cancel_status() {
+    for escape_first in [false, true] {
+        let (root, home) = fixture_root();
+        let config = two_host_config(&home);
+        let bin = fake_ssh(&root);
+        let interactions: &[(&[u8], &[u8])] = if escape_first {
+            &[(b"Search:", b"\x1b"), (b"NORMAL", b"\x03")]
+        } else {
+            &[(b"Search:", b"\x03")]
+        };
+        let (status, output) = run_with_pty_interactions(
+            &home,
+            &["--config", config.to_str().unwrap()],
+            &bin,
+            &root,
+            interactions,
+            None,
+            None,
+        );
+        assert_eq!(
+            status.code(),
+            Some(130),
+            "status={status:?} output={output}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn space_opens_which_key_box_and_escape_closes_it() {
+    let (root, home) = fixture_root();
+    let config = two_host_config(&home);
+    let bin = fake_ssh(&root);
+    let (status, output) = run_with_pty_interactions(
+        &home,
+        &["--config", config.to_str().unwrap()],
+        &bin,
+        &root,
+        &[
+            (b"Search:", b"\x1b"),
+            (b"NORMAL", b" "),
+            (b"Space", b"t"),
+            (b"Tunnel", b"\x03"),
+        ],
+        None,
+        None,
+    );
+    assert_eq!(
+        status.code(),
+        Some(130),
+        "status={status:?} output={output}"
+    );
+    for entry in ["Filter…", "Tunnel…"] {
+        assert!(
+            contains_tui_text(output.as_bytes(), entry.as_bytes()),
+            "{output}"
+        );
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn question_mark_and_f1_open_help_grouped_by_section() {
+    for (keys, normal_first) in [(b"?".as_slice(), true), (b"\x1bOP".as_slice(), false)] {
+        let (root, home) = fixture_root();
+        let config = two_host_config(&home);
+        let bin = fake_ssh(&root);
+        let interactions: Vec<(&[u8], &[u8])> = if normal_first {
+            vec![(b"Search:", b"\x1b"), (b"NORMAL", keys), (b"Help", b"\x03")]
+        } else {
+            vec![(b"Search:", keys), (b"Help", b"\x03")]
+        };
+        let (status, output) = run_with_pty_interactions(
+            &home,
+            &["--config", config.to_str().unwrap()],
+            &bin,
+            &root,
+            &interactions,
+            None,
+            Some((100, 40)),
+        );
+        assert_eq!(
+            status.code(),
+            Some(130),
+            "status={status:?} output={output}"
+        );
+        for section in ["CONNECT", "COPY", "HOSTS"] {
+            assert!(
+                contains_tui_text(output.as_bytes(), section.as_bytes()),
+                "missing {section}: {output}"
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn question_mark_in_insert_mode_types_unless_the_query_is_empty() {
+    let (root, home) = fixture_root();
+    let config = two_host_config(&home);
+    let bin = fake_ssh(&root);
+    let (status, output) = run_with_pty_interactions(
+        &home,
+        &["--config", config.to_str().unwrap()],
+        &bin,
+        &root,
+        &[
+            (b"Search:", b"d?"),
+            (b"No matching HostEntry aliases.", b"\x03"),
+        ],
+        None,
+        None,
+    );
+    assert_eq!(
+        status.code(),
+        Some(130),
+        "status={status:?} output={output}"
+    );
+    assert!(!contains_tui_text(output.as_bytes(), b"Help"), "{output}");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn command_line_q_quits_with_status_zero() {
+    let (root, home) = fixture_root();
+    let config = two_host_config(&home);
+    let bin = fake_ssh(&root);
+    let (status, output) = run_with_pty_interactions(
+        &home,
+        &["--config", config.to_str().unwrap()],
+        &bin,
+        &root,
+        &[(b"Search:", b"\x1b"), (b"NORMAL", b":"), (b":help", b"q\r")],
+        None,
+        None,
+    );
+    assert!(status.success(), "status={status:?} output={output}");
+    assert!(!root.join("master-started").exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn command_line_ssh_connects_to_the_named_host_with_forwards() {
+    let (root, home) = fixture_root();
+    let config = two_host_config(&home);
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let command = format!("ssh web 8080={port}\r");
+    let bin = fake_ssh(&root);
+    let ssh = bin.join("ssh");
+    let script = fs::read_to_string(&ssh).unwrap();
+    let needle = "    [ -n \"$SSHX_STARTED\" ] && : > \"$SSHX_STARTED\"\n";
+    assert!(script.contains(needle));
+    let listener = concat!(
+        "    port=$(sed -n 's/^ *LocalForward 127.0.0.1:\\([0-9]*\\) .*/\\1/p' \"$config\" | head -n 1)\n",
+        "    [ -n \"$port\" ] && python3 -c 'import socket,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind((\"127.0.0.1\",int(__import__(\"sys\").argv[1]))); s.listen(); time.sleep(4)' \"$port\" >/dev/null 2>&1 &\n",
+    );
+    fs::write(
+        &ssh,
+        script.replacen(needle, &format!("{listener}{needle}"), 1),
+    )
+    .unwrap();
+    let (status, output) = run_with_pty_interactions(
+        &home,
+        &["--config", config.to_str().unwrap()],
+        &bin,
+        &root,
+        &[
+            (b"Search:", b"\x1b"),
+            (b"NORMAL", b":"),
+            (b":help", command.as_bytes()),
+        ],
+        None,
+        None,
+    );
+    assert!(status.success(), "status={status:?} output={output}");
+    assert!(output.contains("direct-shell"), "{output}");
+    let runtime = fs::read_to_string(root.join("runtime-config")).unwrap();
+    assert!(runtime.contains("Host web"), "{runtime}");
+    assert!(
+        runtime.contains(&format!("LocalForward 127.0.0.1:{port} 127.0.0.1:8080")),
+        "{runtime}"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn set_autoinfo_false_persists_and_hides_which_key_but_not_pending_keys() {
+    let (root, home) = fixture_root();
+    let config = two_host_config(&home);
+    let bin = fake_ssh(&root);
+    let (status, output) = run_with_pty_interactions(
+        &home,
+        &["--config", config.to_str().unwrap()],
+        &bin,
+        &root,
+        &[
+            (b"Search:", b"\x1b"),
+            (b"NORMAL", b":"),
+            (b":help", b"set autoinfo=false\r"),
+            (b"autoinfo=false", b" "),
+            (b"space", b"\x03"),
+        ],
+        None,
+        None,
+    );
+    assert_eq!(
+        status.code(),
+        Some(130),
+        "status={status:?} output={output}"
+    );
+    assert!(
+        !contains_tui_text(output.as_bytes(), "Filter…".as_bytes()),
+        "which-key box should stay hidden: {output}"
+    );
+    let settings: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(home.join(".config/sshx/config.json")).unwrap())
+            .unwrap();
+    assert_eq!(settings["preferences"]["autoinfo"], false, "{settings}");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn set_startmode_normal_persists_for_the_next_launch() {
+    let (root, home) = fixture_root();
+    let config = two_host_config(&home);
+    let bin = fake_ssh(&root);
+    let (status, output) = run_with_pty_interactions(
+        &home,
+        &["--config", config.to_str().unwrap()],
+        &bin,
+        &root,
+        &[
+            (b"Search:", b"\x1b"),
+            (b"NORMAL", b":"),
+            (b":help", b"set startmode=normal\r"),
+            (b"startmode=normal", b"\x03"),
+        ],
+        None,
+        None,
+    );
+    assert_eq!(
+        status.code(),
+        Some(130),
+        "status={status:?} output={output}"
+    );
+    let (status, output) = run_with_pty_interactions(
+        &home,
+        &["--config", config.to_str().unwrap()],
+        &bin,
+        &root,
+        &[(b"NORMAL", b"q")],
+        None,
+        None,
+    );
+    assert!(status.success(), "status={status:?} output={output}");
+    assert!(!contains_tui_text(output.as_bytes(), b"INSERT"), "{output}");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn set_rejects_non_loopback_bind_without_saving() {
+    let (root, home) = fixture_root();
+    let config = two_host_config(&home);
+    let bin = fake_ssh(&root);
+    let (status, output) = run_with_pty_interactions(
+        &home,
+        &["--config", config.to_str().unwrap()],
+        &bin,
+        &root,
+        &[
+            (b"Search:", b"\x1b"),
+            (b"NORMAL", b":"),
+            (b":help", b"set bind=0.0.0.0\r"),
+            (b"FORWARD_BIND_INVALID", b"\x03"),
+        ],
+        None,
+        None,
+    );
+    assert_eq!(
+        status.code(),
+        Some(130),
+        "status={status:?} output={output}"
+    );
+    assert!(!home.join(".config/sshx/config.json").exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn goto_tunnels_opens_the_tunnels_workspace_and_returns_to_the_finder() {
+    let (root, home) = fixture_root();
+    let config = two_host_config(&home);
+    let bin = fake_ssh(&root);
+    let (status, output) = run_with_pty_interactions(
+        &home,
+        &["--config", config.to_str().unwrap()],
+        &bin,
+        &root,
+        &[
+            (b"Search:", b"\x1b"),
+            (b"NORMAL", b"gt"),
+            (b"No registered tunnels.", b"\x1b"),
+            (b"Search:", b"q"),
+        ],
+        None,
+        None,
+    );
+    assert!(status.success(), "status={status:?} output={output}");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn first_run_lists_detected_configs_and_registers_the_ticked_root_before_the_finder() {
+    let (root, home) = fixture_root();
+    let config = two_host_config(&home);
+    write(
+        &home.join(".ssh/config.d/extra.conf"),
+        "Host extra\n  HostName extra.example\n",
+    );
+    let bin = fake_ssh(&root);
+    let (status, output) = run_with_pty_interactions(
+        &home,
+        &[],
+        &bin,
+        &root,
+        &[(b"Welcome to sshx", b"w\r"), (b"Search:", b"\x03")],
+        None,
+        Some((200, 30)),
+    );
+    assert_eq!(
+        status.code(),
+        Some(130),
+        "status={status:?} output={output}"
+    );
+    for candidate in [config.to_str().unwrap(), "config.d/extra.conf"] {
+        assert!(
+            contains_tui_text(output.as_bytes(), candidate.as_bytes()),
+            "{output}"
+        );
+    }
+    let settings: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(home.join(".config/sshx/config.json")).unwrap())
+            .unwrap();
+    let roots = settings["roots"].as_array().unwrap();
+    assert_eq!(roots.len(), 1, "{settings}");
+    assert_eq!(roots[0]["scope"], "work");
+    assert_eq!(roots[0]["path"], config.to_str().unwrap());
+    assert!(
+        contains_tui_text(output.as_bytes(), b"db"),
+        "the finder should list the registered root's hosts: {output}"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn first_run_refuses_to_save_without_a_ticked_config() {
+    let (root, home) = fixture_root();
+    two_host_config(&home);
+    let bin = fake_ssh(&root);
+    let (status, output) = run_with_pty_interactions(
+        &home,
+        &[],
+        &bin,
+        &root,
+        &[(b"Welcome to sshx", b"x\r"), (b"tick at least one", b"q")],
+        None,
+        None,
+    );
+    assert!(status.success(), "status={status:?} output={output}");
+    assert!(!home.join(".config/sshx/config.json").exists());
     fs::remove_dir_all(root).unwrap();
 }

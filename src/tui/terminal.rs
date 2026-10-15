@@ -117,6 +117,12 @@ pub(super) fn read_key(input: &mut File, prefix: &str) -> Result<KeyEvent, Strin
             let Some(prefix_byte) = read_escape_byte(input, prefix)? else {
                 return Ok(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
             };
+            if prefix_byte == b'O' {
+                return Ok(match read_escape_byte(input, prefix)? {
+                    Some(b'P') => KeyEvent::new(KeyCode::F(1), KeyModifiers::empty()),
+                    _ => KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
+                });
+            }
             if prefix_byte != b'[' {
                 return Ok(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
             }
@@ -131,6 +137,11 @@ pub(super) fn read_key(input: &mut File, prefix: &str) -> Result<KeyEvent, Strin
                 b'Z' => KeyCode::BackTab,
                 b'5' if read_escape_byte(input, prefix)? == Some(b'~') => KeyCode::PageUp,
                 b'6' if read_escape_byte(input, prefix)? == Some(b'~') => KeyCode::PageDown,
+                b'1' if read_escape_byte(input, prefix)? == Some(b'1')
+                    && read_escape_byte(input, prefix)? == Some(b'~') =>
+                {
+                    KeyCode::F(1)
+                }
                 _ => KeyCode::Esc,
             }
         }
@@ -178,26 +189,35 @@ fn read_escape_byte(input: &mut File, prefix: &str) -> Result<Option<u8>, String
 #[cfg(test)]
 mod tests {
     use super::read_key;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-    #[test]
-    fn read_key_decodes_ctrl_p() {
+    fn decode(bytes: &[u8]) -> KeyEvent {
         let path = std::env::temp_dir().join(format!(
-            "sshx-picker-ctrl-p-{}-{}",
+            "sshx-picker-key-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         ));
-        std::fs::write(&path, [0x10]).unwrap();
+        std::fs::write(&path, bytes).unwrap();
         let event = read_key(&mut std::fs::File::open(&path).unwrap(), "TEST").unwrap();
         std::fs::remove_file(path).unwrap();
+        event
+    }
+
+    #[test]
+    fn read_key_decodes_ctrl_p() {
         assert_eq!(
-            event,
-            crossterm::event::KeyEvent::new(
-                crossterm::event::KeyCode::Char('p'),
-                crossterm::event::KeyModifiers::CONTROL,
-            )
+            decode(&[0x10]),
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL)
         );
+    }
+
+    #[test]
+    fn read_key_decodes_both_f1_encodings() {
+        let f1 = KeyEvent::new(KeyCode::F(1), KeyModifiers::empty());
+        assert_eq!(decode(b"\x1bOP"), f1);
+        assert_eq!(decode(b"\x1b[11~"), f1);
     }
 }
