@@ -16,7 +16,10 @@ Use these terms in code, documentation, tests, and issue answers. A term describ
 | **Session mode** | User-facing mode that opens an interactive SSH session through a session-bound master. It may have zero service forwards. |
 | **standalone tunnel** | A detached OpenSSH master and listener owned by one persisted tunnel request. It can be queried or stopped by tunnel ID from another process. |
 | **Tunnel mode** | User-facing mode that creates a standalone tunnel and requires at least one forwarding. |
-| **service forward** | One declared remote service mapped to one local port. |
+| **input mode** | The TUI keyboard state: Insert (typed characters go to the search query), Normal (letters are commands), or Select (rows are multi-selected). It is unrelated to Session mode and Tunnel mode. |
+| **service forward** | One remote port on the route's last hop mapped to one local port. It may be declared or used ad hoc. |
+| **declared service** | A service forward saved in a HostEntry's metadata, with optional default local port, destination host, and name. |
+| **usage state** | Per-HostEntry record of last use, use count, and last selected service forwards. It is not a host database; losing it loses only ordering and preselection. |
 | **tunnel ownership** | A request owns its control socket, runtime configuration, master process, listeners, and Pair dependencies. Ownership is proved from the locked registry and control socket, never from a PID alone. |
 | **fixture/local validation** | Evidence from temporary config trees, fake commands, local OpenSSH, and CI runners. It does not prove access to a user's server. |
 | **user-server validation** | Separate manual evidence from an authorized real server. It is never implied by fixture/local validation. |
@@ -28,5 +31,6 @@ Use these terms in code, documentation, tests, and issue answers. A term describ
 - Say **filesystem source of truth**, not “cached inventory”.
 - Say **Pair**, **gateway**, and **VM**, not “proxy chain”.
 - Say **session-bound master** or **standalone tunnel** when ownership differs.
+- Say **input mode** for Insert, Normal, and Select. A bare “mode” means Session mode or Tunnel mode.
 - Say **listener ready** or **master responsive** only when that evidence exists. Do not call either state application health.
 - Say **fixture/local validation** and **user-server validation** as separate evidence classes.
