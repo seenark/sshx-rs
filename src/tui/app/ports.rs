@@ -530,12 +530,20 @@ pub(super) fn save_service(
     };
     let root = usage::entry_root(entry);
     let old_key = root.as_ref().map(|root| usage::host_key(root, entry));
+    let change = plan.change();
     if let Err(error) = mutation::apply_edit(&plan) {
         return toast(error);
     }
     if let (Some(root), Some(old_key), Some(new_key)) = (&root, &old_key, &plan.added_id) {
         let _ = usage::rekey(root, old_key, new_key);
     }
+    let label = match &edit.change {
+        ServiceChange::Declare(declaration) => {
+            format!("declare service {}", declaration.remote_port)
+        }
+        ServiceChange::Undeclare(remote) => format!("remove service {remote}"),
+    };
+    runtime.undo.push(label, change);
     let discovery_error = runtime.data.refresh(runtime.cli);
     if runtime
         .stack
