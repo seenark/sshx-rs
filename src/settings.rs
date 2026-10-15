@@ -4,7 +4,9 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const SETTINGS_VERSION: u8 = 1;
+const SETTINGS_VERSION: u8 = 2;
+/// Version 1 files have no `preferences`; they load with defaults and are rewritten as version 2.
+const LEGACY_SETTINGS_VERSION: u8 = 1;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RegisteredRoot {
@@ -67,7 +69,7 @@ fn load_file(home: &Path) -> Result<Option<SettingsFile>, String> {
         fs::read(&path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     let settings: SettingsFile = serde_json::from_slice(&bytes)
         .map_err(|error| format!("cannot parse {}: {error}", path.display()))?;
-    if settings.version != SETTINGS_VERSION {
+    if settings.version != SETTINGS_VERSION && settings.version != LEGACY_SETTINGS_VERSION {
         return Err(format!(
             "unsupported sshx settings version {} in {}",
             settings.version,

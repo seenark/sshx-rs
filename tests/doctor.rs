@@ -690,7 +690,7 @@ fn settings_save_creates_private_modes_regardless_of_umask() {
 }
 
 #[test]
-fn root_save_keeps_preferences_and_v1_files_load_defaults() {
+fn v1_settings_migrate_to_v2_and_root_saves_keep_preferences() {
     let (root, home) = fixture();
     let path = settings::settings_path(&home);
     fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -713,6 +713,10 @@ fn root_save_keeps_preferences_and_v1_files_load_defaults() {
     settings::save(&home, &roots).unwrap();
     assert_eq!(settings::load(&home).unwrap(), roots);
     assert_eq!(settings::load_preferences(&home).unwrap(), preferences);
+    let written: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(written["version"], 2);
+    fs::write(&path, r#"{"version":3,"roots":[]}"#).unwrap();
+    assert!(settings::load(&home).is_err());
     fs::remove_dir_all(root).unwrap();
 }
 

@@ -245,8 +245,8 @@ A modal TUI in the style of Helix and Neovim:
 
 ### Settings
 
-- Settings keep schema version 1. New optional fields with defaults: `startmode` (insert), `autoinfo` (true), `bind` (127.0.0.1), `clipboard_clear` (30), `password_confirm` (false), plus the password-warning acknowledgment.
-- No migration code. An older binary that saves roots drops the new fields, and the user accepts that.
+- Settings move to schema version 2. New optional fields with defaults: `startmode` (insert), `autoinfo` (true), `bind` (127.0.0.1), `clipboard_clear` (30), `password_confirm` (false), plus the password-warning acknowledgment.
+- Version 1 files load with default preferences and are rewritten as version 2 on the next save. Older sshx binaries refuse version 2 files; the owner accepted this.
 
 ### First run
 
@@ -306,7 +306,7 @@ A modal TUI in the style of Helix and Neovim:
 - Creating Pairs from the host form. Pair setup keeps its existing flow.
 - Undo for Pair mutations, and undo across sshx processes.
 - Returning to the finder after a session ends.
-- Settings schema version bump and migration.
+- Settings downgrade support for older sshx binaries.
 - Any change to CLI flags other than `--forward` accepting undeclared ports.
 
 ## Further Notes
@@ -319,6 +319,6 @@ A modal TUI in the style of Helix and Neovim:
   - `cargo test` passes.
   - No ADR is silently overridden.
 - That ad-hoc service forwards are safe on Pair routes is an inference: the VM runtime config already receives declared services in the same shape. The forward-model work must prove it with a paired fake-OpenSSH scenario before the ports screen depends on it.
-- The settings decision (stay on version 1, add fields with defaults) was inferred from the owner's "single user, go ahead". Switch to a version bump if the owner says otherwise.
+- The owner chose the settings version bump to 2 after implementation started on version 1.
 - The sidecar is synced through the owner's private git. Simultaneous use on two machines can produce merge conflicts in that file, and the only loss is ordering. ADR 0004 records this.
 - Tickets are not split yet. When they are, they go under this directory's `issues/` per the issue-tracker conventions.
