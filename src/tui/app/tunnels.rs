@@ -1,6 +1,7 @@
 use super::{
     ConnectRequest, Ctx, Effect, EffectResult, Outcome, Runtime, Screen, ScreenStatus,
-    cmdline::CommandLine, finder::relative_time, tunnel_progress::TunnelProgress, yesno::YesNo,
+    cmdline::CommandLine, finder::relative_time, ports::endpoint, tunnel_progress::TunnelProgress,
+    yesno::YesNo,
 };
 use crate::tui::widgets::block;
 use ratatui::{
@@ -58,12 +59,13 @@ impl Tunnels {
 
 fn forward_line(forward: &ForwardSpec) -> String {
     match (forward.flag(), forward.local_port, forward.remote_port) {
-        ('L', Some(local), Some(remote)) => match forward.remote_host.as_deref() {
-            Some("127.0.0.1" | "localhost" | "::1") | None => {
-                format!("localhost:{local} → {remote}")
+        ('L', Some(local), Some(remote)) => {
+            let listener = endpoint(&forward.bind_address, local);
+            match forward.remote_host.as_deref() {
+                Some("127.0.0.1" | "localhost" | "::1") | None => format!("{listener} → {remote}"),
+                Some(host) => format!("{listener} → {host}:{remote}"),
             }
-            Some(host) => format!("localhost:{local} → {host}:{remote}"),
-        },
+        }
         ('D', Some(local), _) => format!("socks :{local}"),
         ('R', _, _) => format!("remote {}", forward.effective),
         _ => forward.effective.clone(),
@@ -163,6 +165,12 @@ impl Screen for Tunnels {
                     alias: tunnel.selected_alias.clone(),
                     forwards: Vec::new(),
                 })));
+            }
+            Action::Copy(keymap::CopyTarget::TunnelId) => {
+                let Some(tunnel) = self.current(ctx) else {
+                    return Outcome::Stay;
+                };
+                return Outcome::Effect(Effect::CopyTunnelId(tunnel.id.clone()));
             }
             Action::Goto(keymap::GotoTarget::Tunnels) => {}
             Action::Goto(_) => return Outcome::Pop,

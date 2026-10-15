@@ -27,6 +27,10 @@ pub(super) fn execute(runtime: &mut Runtime, effect: Effect) -> Result<EffectRes
         Effect::TunnelStop(ids) => super::tunnels::stop(runtime, &ids),
         Effect::TunnelRestart(id) => super::tunnels::restart(runtime, &id),
         Effect::SaveService(edit) => super::ports::save_service(runtime, &edit),
+        Effect::CopyMany(requests) => copy::copy_many(runtime, &requests),
+        Effect::CopyTunnelId(id) => copy::copy_tunnel_id(&id),
+        Effect::DeleteHosts(requests) => delete::delete_many(runtime, &requests),
+        Effect::TunnelStartMany(batch) => super::tunnel_progress::start_many(runtime, &batch),
     }
 }
 
@@ -84,12 +88,7 @@ fn start_session(runtime: &Runtime, request: &ConnectRequest) -> Result<EffectRe
         )));
     }
     let target = route.as_ref().map_or(&request.entry, |route| &route.vm);
-    let specifications = request
-        .forwards
-        .iter()
-        .map(|forward| format!("{}={}", forward.remote, forward.local))
-        .collect::<Vec<_>>();
-    let forwards = match sshx::session::resolve_forwards(target, &specifications) {
+    let forwards = match super::resolve_forwards(&data.prefs, target, &request.forwards) {
         Ok(forwards) => forwards,
         Err(error) => return Ok(toast(error)),
     };

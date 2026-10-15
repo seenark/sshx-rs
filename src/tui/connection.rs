@@ -46,6 +46,7 @@ pub(crate) fn connection_workspace(
             remote_port: service.remote_port,
             destination_host: service.destination_host.clone(),
             local_port: service.default_local_port,
+            bind_address: sshx::session::LOOPBACK.to_string(),
         })
         .collect::<Vec<_>>();
     let mut next_custom_id = restored.map_or(1, |selection| selection.next_custom_id);
@@ -250,6 +251,7 @@ pub(crate) fn connection_workspace(
                                     remote_port: services[index].remote_port,
                                     destination_host: services[index].destination_host.clone(),
                                     local_port: services[index].default_local_port,
+                                    bind_address: sshx::session::LOOPBACK.to_string(),
                                 };
                                 checked[index] = true;
                                 editing = None;
@@ -785,6 +787,7 @@ fn add_workspace_row(
         remote_port: if kind == 'R' { 1 } else { 0 },
         destination_host: host,
         local_port: port,
+        bind_address: sshx::session::LOOPBACK.to_string(),
     });
     checked.push(false);
     row_errors.push(Vec::new());
@@ -868,6 +871,7 @@ mod tests {
             remote_port: 0,
             destination_host: String::new(),
             local_port: 1080,
+            bind_address: sshx::session::LOOPBACK.to_string(),
         }
     }
 

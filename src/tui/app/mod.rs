@@ -23,6 +23,7 @@ use ratatui::{
 };
 use sshx::discovery::{Catalog, HostEntry, discover_roots};
 use sshx::keymap::{self, Action, Availability, InputMode, Key, Keymap, MenuEntry, Step};
+use sshx::session::ServiceForward;
 use sshx::settings::{self, Preferences, RegisteredRoot, StartMode};
 use sshx::tunnel::TunnelView;
 use sshx::usage::UsageIndex;
@@ -35,6 +36,35 @@ use super::terminal::{AppTerminal, read_key, with_terminal};
 pub(crate) struct ForwardRequest {
     pub remote: u16,
     pub local: u16,
+}
+
+/// Service forwards listen on `Preferences.bind`. `:set` refuses non-loopback values; a
+/// hand-edited settings file is refused the same way.
+pub(crate) fn service_bind(prefs: &Preferences) -> Result<String, String> {
+    let bind = cmdline::validate_bind(&prefs.bind)?;
+    Ok(if bind == "localhost" {
+        sshx::session::LOOPBACK.to_string()
+    } else {
+        bind
+    })
+}
+
+/// `REMOTE=LOCAL` requests resolved against the route's last hop, listening on the configured bind.
+pub(crate) fn resolve_forwards(
+    prefs: &Preferences,
+    target: &HostEntry,
+    requests: &[ForwardRequest],
+) -> Result<Vec<ServiceForward>, String> {
+    let bind = service_bind(prefs)?;
+    let specifications = requests
+        .iter()
+        .map(|forward| format!("{}={}", forward.remote, forward.local))
+        .collect::<Vec<_>>();
+    let mut forwards = sshx::session::resolve_forwards(target, &specifications)?;
+    for forward in &mut forwards {
+        forward.bind_address.clone_from(&bind);
+    }
+    Ok(forwards)
 }
 
 #[derive(Clone)]
@@ -70,6 +100,10 @@ pub(crate) enum Effect {
     TunnelStop(Vec<String>),
     TunnelRestart(String),
     SaveService(Box<ports::ServiceEdit>),
+    CopyMany(Vec<copy::CopyRequest>),
+    CopyTunnelId(String),
+    DeleteHosts(Vec<delete::DeleteRequest>),
+    TunnelStartMany(Box<tunnel_progress::TunnelBatch>),
 }
 
 #[derive(Default)]
@@ -122,6 +156,8 @@ pub(crate) trait Screen {
     fn dismiss_on_outcome(&self) -> bool {
         false
     }
+    /// Called on every screen of the stack after discovery re-read the config files.
+    fn on_refresh(&mut self, _ctx: &Ctx) {}
 }
 
 pub(crate) struct Ctx<'a> {
@@ -360,6 +396,12 @@ impl<'a> Runtime<'a> {
                 self.data.refresh_tunnels();
                 None
             };
+            if result.refresh {
+                let ctx = self.data.ctx(None);
+                for screen in &mut self.stack {
+                    screen.on_refresh(&ctx);
+                }
+            }
             if error.is_some() {
                 self.toast = error;
             }

@@ -1,7 +1,7 @@
 use super::{
     ConnectRequest, Ctx, Effect, EffectResult, ForwardRequest, Outcome, Runtime, Screen,
-    ScreenStatus, cmdline::CommandLine, finder::relative_time, tunnel_progress, tunnels,
-    yesno::YesNo,
+    ScreenStatus, cmdline::CommandLine, copy::CopyRequest, finder::relative_time, service_bind,
+    tunnel_progress, tunnels, undo::Rekey, yesno::YesNo,
 };
 use crate::tui::widgets::block;
 use ratatui::{
@@ -72,6 +72,14 @@ fn requests(rows: &[PortRow]) -> Vec<ForwardRequest> {
             local: row.local,
         })
         .collect()
+}
+
+/// `localhost:<local>` for the default bind, else `<bind>:<local>`.
+pub(super) fn endpoint(bind: &str, local: u16) -> String {
+    match bind {
+        sshx::session::LOOPBACK | "localhost" => format!("localhost:{local}"),
+        bind => format!("{}:{local}", sshx::session::bracketed(bind)),
+    }
 }
 
 fn find_entry<'a>(
@@ -157,7 +165,7 @@ impl Ports {
             .find(|service| service.remote_port == remote)
     }
 
-    fn issues(&self) -> Vec<(usize, String)> {
+    fn issues(&self, ctx: &Ctx) -> Vec<(usize, String)> {
         let checked = self
             .rows
             .iter()
@@ -171,7 +179,7 @@ impl Ports {
                 local: row.local,
             })
             .collect::<Vec<_>>();
-        tunnel_progress::issues(&forwards)
+        tunnel_progress::issues(&forwards, ctx.prefs)
             .into_iter()
             .map(|(position, message)| (checked[position].0, message))
             .collect()
@@ -282,7 +290,7 @@ impl Ports {
         let Some(entry) = self.entry(ctx) else {
             return Outcome::Toast(self.missing());
         };
-        if let Some((_, message)) = self.issues().into_iter().next() {
+        if let Some((_, message)) = self.issues(ctx).into_iter().next() {
             return Outcome::Toast(message);
         }
         Outcome::Effect(Effect::Connect(Box::new(ConnectRequest {
@@ -347,7 +355,7 @@ impl Screen for Ports {
                 let Some(entry) = self.entry(ctx) else {
                     return Outcome::Toast(self.missing());
                 };
-                return tunnel_progress::begin(entry, &self.alias, requests(&self.rows));
+                return tunnel_progress::begin(ctx, entry, &self.alias, requests(&self.rows));
             }
             Action::TunnelList => return Outcome::Effect(Effect::Tunnels),
             Action::TunnelStopAll => return tunnels::stop_all(ctx),
@@ -358,11 +366,52 @@ impl Screen for Ports {
                 }
                 return Outcome::Push(Box::new(line));
             }
+            Action::Copy(target) => {
+                let Some(entry) = self.entry(ctx) else {
+                    return Outcome::Toast(self.missing());
+                };
+                return Outcome::Effect(Effect::Copy(Box::new(CopyRequest {
+                    target,
+                    entry: entry.clone(),
+                    alias: self.alias.clone(),
+                    forwards: requests(&self.rows),
+                    tunnel_id: None,
+                })));
+            }
+            Action::Undo => return Outcome::Effect(Effect::Undo),
+            Action::Redo => return Outcome::Effect(Effect::Redo),
             Action::Back => return Outcome::Pop,
             Action::Quit => return Outcome::Effect(Effect::Quit { cancelled: false }),
             _ => {}
         }
         Outcome::Stay
+    }
+
+    /// Declarations changed on disk (undo, redo, an edit elsewhere): keep the rows and follow
+    /// the HostEntry, listing declared services that appeared.
+    fn on_refresh(&mut self, ctx: &Ctx) {
+        let Some(entry) = self.entry(ctx) else {
+            return;
+        };
+        let Ok(declared) = sshx::session::declared_services(entry) else {
+            return;
+        };
+        self.id.clone_from(&entry.id);
+        for service in &declared {
+            if !self
+                .rows
+                .iter()
+                .any(|row| row.remote == service.remote_port)
+            {
+                self.rows.push(PortRow {
+                    remote: service.remote_port,
+                    local: service.default_local_port,
+                    checked: false,
+                    used: None,
+                });
+            }
+        }
+        self.declared = declared;
     }
 
     fn on_key(&mut self, key: Key, _ctx: &Ctx) -> Outcome {
@@ -413,7 +462,9 @@ impl Screen for Ports {
                 rows_area,
             );
         } else {
-            let issues = self.issues();
+            let issues = self.issues(ctx);
+            let bind =
+                service_bind(ctx.prefs).unwrap_or_else(|_| sshx::session::LOOPBACK.to_string());
             let items = self
                 .rows
                 .iter()
@@ -426,7 +477,7 @@ impl Screen for Ports {
                     };
                     let mut spans = vec![
                         Span::raw(if row.checked { "[x] " } else { "[ ] " }),
-                        Span::raw(format!("localhost:{} → {target}", row.local)),
+                        Span::raw(format!("{} → {target}", endpoint(&bind, row.local))),
                     ];
                     if let Some(name) = declared.and_then(|service| service.name.as_deref()) {
                         spans.push(Span::styled(
@@ -534,16 +585,24 @@ pub(super) fn save_service(
     if let Err(error) = mutation::apply_edit(&plan) {
         return toast(error);
     }
-    if let (Some(root), Some(old_key), Some(new_key)) = (&root, &old_key, &plan.added_id) {
-        let _ = usage::rekey(root, old_key, new_key);
-    }
+    let rekey = match (root, old_key, &plan.added_id) {
+        (Some(root), Some(old), Some(new)) => {
+            let _ = usage::rekey(&root, &old, new);
+            Some(Rekey {
+                root,
+                old,
+                new: new.clone(),
+            })
+        }
+        _ => None,
+    };
     let label = match &edit.change {
         ServiceChange::Declare(declaration) => {
             format!("declare service {}", declaration.remote_port)
         }
         ServiceChange::Undeclare(remote) => format!("remove service {remote}"),
     };
-    runtime.undo.push(label, change);
+    runtime.undo.push(label, change, rekey);
     let discovery_error = runtime.data.refresh(runtime.cli);
     if runtime
         .stack

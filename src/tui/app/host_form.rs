@@ -1,4 +1,4 @@
-use super::{Ctx, Effect, EffectResult, Outcome, Runtime, Screen, help::Help};
+use super::{Ctx, Effect, EffectResult, Outcome, Runtime, Screen, help::Help, undo::Rekey};
 use crate::tui::matcher::matching_rows;
 use crate::tui::widgets::{block, password_backspace, password_insert};
 use ratatui::{
@@ -762,6 +762,7 @@ pub(super) fn save(runtime: &mut Runtime, request: &SaveRequest) -> Result<Effec
 /// Applies the write, records it for undo and keeps usage state attached to a HostEntry that
 /// just received its `##SSHX ID`. Returns the ID of the written HostEntry.
 fn apply(runtime: &mut Runtime, write: &HostWrite, alias: &str) -> Result<String, String> {
+    let mut rekey = None;
     let (change, id, label) = match write {
         HostWrite::Create(request) => {
             let plan = mutation::plan_create(request)?;
@@ -781,13 +782,19 @@ fn apply(runtime: &mut Runtime, write: &HostWrite, alias: &str) -> Result<String
             let change = plan.change();
             mutation::apply_edit(&plan)?;
             if let (Some(added), Some(root)) = (&plan.added_id, usage::entry_root(entry)) {
-                let _ = usage::rekey(&root, &usage::host_key(&root, entry), added);
+                let old = usage::host_key(&root, entry);
+                let _ = usage::rekey(&root, &old, added);
+                rekey = Some(Rekey {
+                    root,
+                    old,
+                    new: added.clone(),
+                });
             }
             let id = plan.added_id.clone().unwrap_or_else(|| entry.id.clone());
             (change, id, format!("edit {alias}"))
         }
     };
-    runtime.undo.push(label, change);
+    runtime.undo.push(label, change, rekey);
     Ok(id)
 }
 

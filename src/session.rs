@@ -18,6 +18,7 @@ pub struct ServiceForward {
     pub remote_port: u16,
     pub destination_host: String,
     pub local_port: u16,
+    pub bind_address: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -60,20 +61,28 @@ pub(crate) fn warn_remote_exposure(forwards: &[ForwardSpec]) {
     }
 }
 
+pub const LOOPBACK: &str = "127.0.0.1";
+
+/// IPv6 literals need brackets inside `-L` and `LocalForward` values.
+pub fn bracketed(host: &str) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    }
+}
+
 pub fn write_local_forward_spec(output: &mut String, forward: &ServiceForward) {
     use std::fmt::Write as _;
-    output.push_str("127.0.0.1:");
-    write!(output, "{}:", forward.local_port).expect("String writes cannot fail");
-    let bracket_host =
-        forward.destination_host.contains(':') && !forward.destination_host.starts_with('[');
-    if bracket_host {
-        output.push('[');
-    }
-    output.push_str(&forward.destination_host);
-    if bracket_host {
-        output.push(']');
-    }
-    write!(output, ":{}", forward.remote_port).expect("String writes cannot fail");
+    write!(
+        output,
+        "{}:{}:{}:{}",
+        bracketed(&forward.bind_address),
+        forward.local_port,
+        bracketed(&forward.destination_host),
+        forward.remote_port
+    )
+    .expect("String writes cannot fail");
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -158,6 +167,7 @@ pub fn resolve_custom_local_forwards(
             remote_port,
             destination_host,
             local_port,
+            bind_address: LOOPBACK.to_string(),
         });
     }
     Ok(forwards)
@@ -284,6 +294,7 @@ pub fn resolve_forwards(
             remote_port,
             destination_host,
             local_port,
+            bind_address: LOOPBACK.to_string(),
         });
     }
     Ok(forwards)
@@ -330,7 +341,7 @@ pub fn preflight_issues(forwards: &[ServiceForward]) -> Vec<ForwardIssue> {
         } else if port != 0
             && let Some(forward) = forwards.get(indexes[0])
         {
-            match TcpListener::bind(("127.0.0.1", port)) {
+            match TcpListener::bind((forward.bind_address.as_str(), port)) {
                 Ok(listener) => listeners.push(listener),
                 Err(error) => issues.push(ForwardIssue {
                     service_id: forward.id.clone(),
@@ -392,6 +403,7 @@ pub fn interactive_forwards(entry: &HostEntry) -> Result<Vec<ServiceForward>, St
             remote_port: services[index].remote_port,
             destination_host: services[index].destination_host.clone(),
             local_port: services[index].default_local_port,
+            bind_address: LOOPBACK.to_string(),
         })
         .collect::<Vec<_>>();
     loop {
@@ -692,7 +704,7 @@ fn prompt_line(prompt: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ServiceForward, declared_services, preflight, preflight_issues,
+        LOOPBACK, ServiceForward, declared_services, preflight, preflight_issues,
         resolve_custom_local_forwards, resolve_forwards, validate_service_name,
     };
     use crate::discovery::{HostEntry, Provenance, SourceIdentity};
@@ -789,12 +801,14 @@ mod tests {
                 remote_port: 5432,
                 destination_host: "127.0.0.1".to_string(),
                 local_port: busy_port,
+                bind_address: LOOPBACK.to_string(),
             },
             ServiceForward {
                 id: "6379#1".to_string(),
                 remote_port: 6379,
                 destination_host: "127.0.0.1".to_string(),
                 local_port: busy_port,
+                bind_address: LOOPBACK.to_string(),
             },
         ]);
         assert_eq!(
@@ -827,12 +841,14 @@ mod tests {
                 remote_port: 5432,
                 destination_host: "127.0.0.1".to_string(),
                 local_port: 15432,
+                bind_address: LOOPBACK.to_string(),
             },
             ServiceForward {
                 id: "two".to_string(),
                 remote_port: 5433,
                 destination_host: "127.0.0.1".to_string(),
                 local_port: 15432,
+                bind_address: LOOPBACK.to_string(),
             },
         ];
         assert!(preflight(&duplicate).is_err());
@@ -847,6 +863,7 @@ mod tests {
             remote_port: 5432,
             destination_host: "127.0.0.1".to_string(),
             local_port,
+            bind_address: LOOPBACK.to_string(),
         };
         let issues = preflight_issues(std::slice::from_ref(&forward));
         assert_eq!(issues[0].service_id, "5432#1");

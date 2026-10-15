@@ -546,10 +546,18 @@ fn preflight_direct_listeners(
 ) -> Result<(), String> {
     let mut addresses = Vec::with_capacity(forwards.len() + direct_forwards.len());
     for forward in forwards {
-        addresses.push(std::net::SocketAddr::from((
-            [127, 0, 0, 1],
-            forward.local_port,
-        )));
+        let ip = if forward.bind_address == "localhost" {
+            Ok(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+        } else {
+            forward.bind_address.parse()
+        }
+        .map_err(|_| {
+            format!(
+                "FORWARD_BIND_INVALID: cannot parse bind address {}",
+                forward.bind_address
+            )
+        })?;
+        addresses.push(std::net::SocketAddr::new(ip, forward.local_port));
     }
     let mut listeners = Vec::new();
     for forward in direct_forwards
@@ -1034,7 +1042,7 @@ fn launch_paired_standalone_session(
         .runtime
         .forwards
         .iter()
-        .map(|forward| ("127.0.0.1".to_string(), forward.local_port))
+        .map(|forward| (forward.bind_address.clone(), forward.local_port))
         .collect::<Vec<_>>();
     let gateway_attempt = match launch_detached_master(
         &runtime.gateway,
@@ -1261,25 +1269,27 @@ fn wait_for_standalone_ready(
     }
 }
 
+fn listener_ready(host: &str, port: u16) -> bool {
+    let address = if host == "localhost" {
+        Some(std::net::SocketAddr::from((
+            std::net::Ipv4Addr::LOCALHOST,
+            port,
+        )))
+    } else {
+        host.parse::<std::net::IpAddr>()
+            .map(|address| std::net::SocketAddr::new(address, port))
+            .or_else(|_| format!("{host}:{port}").parse())
+            .ok()
+    };
+    address
+        .and_then(|address| TcpStream::connect_timeout(&address, Duration::from_millis(100)).ok())
+        .is_some()
+}
+
 fn local_listeners_ready(listeners: &[(String, u16)]) -> bool {
-    listeners.iter().all(|(host, port)| {
-        let address = if host == "localhost" {
-            Some(std::net::SocketAddr::from((
-                std::net::Ipv4Addr::LOCALHOST,
-                *port,
-            )))
-        } else {
-            host.parse::<std::net::IpAddr>()
-                .map(|address| std::net::SocketAddr::new(address, *port))
-                .or_else(|_| format!("{host}:{port}").parse())
-                .ok()
-        };
-        address
-            .and_then(|address| {
-                TcpStream::connect_timeout(&address, Duration::from_millis(100)).ok()
-            })
-            .is_some()
-    })
+    listeners
+        .iter()
+        .all(|(host, port)| listener_ready(host, *port))
 }
 fn remote_forward_argument(forward: &session::ForwardSpec) -> Result<String, String> {
     let fields = split_forward_fields(&forward.effective);
@@ -1745,13 +1755,11 @@ fn wait_for_master(
 }
 
 fn service_forwards_ready(runtime: &Runtime) -> bool {
-    runtime.forwards.iter().all(|forward| {
-        TcpStream::connect_timeout(
-            &std::net::SocketAddr::from(([127, 0, 0, 1], forward.local_port)),
-            Duration::from_millis(100),
-        )
-        .is_ok()
-    }) && local_listeners_ready(&runtime.extra_listeners)
+    runtime
+        .forwards
+        .iter()
+        .all(|forward| listener_ready(&forward.bind_address, forward.local_port))
+        && local_listeners_ready(&runtime.extra_listeners)
 }
 
 fn wait_for_shell(shell: &mut Child) -> Result<ExitStatus, String> {
@@ -2329,7 +2337,9 @@ fn compile_vm_config(
 
 fn append_service_forwards(output: &mut String, forwards: &[ServiceForward]) {
     for forward in forwards {
-        output.push_str("  LocalForward 127.0.0.1:");
+        output.push_str("  LocalForward ");
+        output.push_str(&session::bracketed(&forward.bind_address));
+        output.push(':');
         output.push_str(&forward.local_port.to_string());
         output.push(' ');
         if forward.destination_host.contains(':') && !forward.destination_host.starts_with('[') {
@@ -3067,6 +3077,7 @@ mod tests {
             remote_port: 5432,
             destination_host: "db.internal".to_string(),
             local_port: 15432,
+            bind_address: "127.0.0.1".to_string(),
         }];
         let compiled = compile_config_with_forwards(&selected, "exact", &forwards)
             .expect("service config should compile");
@@ -3125,6 +3136,7 @@ mod tests {
                 remote_port: 5432,
                 destination_host: "127.0.0.1".to_string(),
                 local_port: port,
+                bind_address: "127.0.0.1".to_string(),
             }],
             extra_listeners: Vec::new(),
             preserve_dir: false,
@@ -3205,6 +3217,7 @@ mod tests {
             remote_port: 5432,
             destination_host: "db.internal".to_string(),
             local_port: port,
+            bind_address: "127.0.0.1".to_string(),
         };
         let local = crate::session::ForwardSpec {
             kind: "L".to_string(),

@@ -1,9 +1,20 @@
 use super::{EffectResult, Runtime};
 use sshx::mutation::AppliedChange;
+use sshx::usage;
+use std::path::PathBuf;
+
+/// Usage state that moved to a new key when a write gave the HostEntry an `##SSHX ID`;
+/// undo moves it back and redo forward again.
+pub(crate) struct Rekey {
+    pub root: PathBuf,
+    pub old: String,
+    pub new: String,
+}
 
 struct Entry {
     label: String,
     change: AppliedChange,
+    rekey: Option<Rekey>,
 }
 
 /// Applied writes of this process, in memory only (spec: no extra copies of config files on
@@ -16,7 +27,12 @@ pub(crate) struct UndoStack {
 
 impl UndoStack {
     /// Records a change that was just applied; anything undone before it can no longer be redone.
-    pub(crate) fn push(&mut self, label: impl Into<String>, change: AppliedChange) {
+    pub(crate) fn push(
+        &mut self,
+        label: impl Into<String>,
+        change: AppliedChange,
+        rekey: Option<Rekey>,
+    ) {
         if change.is_empty() {
             return;
         }
@@ -24,6 +40,7 @@ impl UndoStack {
         self.done.push(Entry {
             label: label.into(),
             change,
+            rekey,
         });
     }
 
@@ -36,6 +53,9 @@ impl UndoStack {
         if let Err(error) = entry.change.undo() {
             self.done.push(entry);
             return Err(error);
+        }
+        if let Some(rekey) = &entry.rekey {
+            let _ = usage::rekey(&rekey.root, &rekey.new, &rekey.old);
         }
         let label = entry.label.clone();
         self.undone.push(entry);
@@ -51,6 +71,9 @@ impl UndoStack {
         if let Err(error) = entry.change.redo() {
             self.undone.push(entry);
             return Err(error);
+        }
+        if let Some(rekey) = &entry.rekey {
+            let _ = usage::rekey(&rekey.root, &rekey.old, &rekey.new);
         }
         let label = entry.label.clone();
         self.done.push(entry);
@@ -82,8 +105,9 @@ pub(super) fn redo(runtime: &mut Runtime) -> Result<EffectResult, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::UndoStack;
+    use super::{Rekey, UndoStack};
     use sshx::mutation::{self, CreateRequest};
+    use sshx::usage;
     use std::fs;
     use std::path::PathBuf;
 
@@ -115,7 +139,7 @@ mod tests {
             .unwrap();
             let change = plan.change();
             mutation::apply(&plan).unwrap();
-            stack.push(format!("create {alias}"), change);
+            stack.push(format!("create {alias}"), change, None);
         }
 
         fn text(&self) -> String {
@@ -175,5 +199,50 @@ mod tests {
 
         fs::write(&fixture.config, &written).unwrap();
         assert_eq!(stack.undo().unwrap(), "create b");
+    }
+
+    #[test]
+    fn undo_and_redo_move_usage_between_keys() {
+        let fixture = Fixture::new("rekey");
+        let sidecar = usage::sidecar_path(&fixture.config);
+        let keys = || {
+            let text = fs::read_to_string(&sidecar).unwrap();
+            let file: serde_json::Value = serde_json::from_str(&text).unwrap();
+            file["hosts"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        fs::write(
+            &sidecar,
+            r#"{"version":1,"hosts":{"id-1":{"last_used":5,"count":2,"forwards":[]}}}"#,
+        )
+        .unwrap();
+        let mut stack = UndoStack::default();
+        let plan = mutation::plan_create(&CreateRequest::new(
+            fixture.config.clone(),
+            fixture.config.clone(),
+            "b".to_string(),
+            "b.example".to_string(),
+            None,
+            None,
+            None,
+        ))
+        .unwrap();
+        let change = plan.change();
+        mutation::apply(&plan).unwrap();
+        let rekey = Rekey {
+            root: fixture.config.clone(),
+            old: "a@config".to_string(),
+            new: "id-1".to_string(),
+        };
+        stack.push("edit a", change, Some(rekey));
+
+        stack.undo().unwrap();
+        assert_eq!(keys(), ["a@config"]);
+        stack.redo().unwrap();
+        assert_eq!(keys(), ["id-1"]);
     }
 }

@@ -2,7 +2,7 @@ use super::{
     ConnectRequest, Ctx, Effect, Outcome, Screen, ScreenStatus,
     cmdline::CommandLine,
     copy::CopyRequest,
-    delete::DeleteConfirm,
+    delete::{self, DeleteConfirm},
     host_form::{EditorRequest, HostForm, open},
     ports::Ports,
     tunnel_progress, tunnels,
@@ -17,7 +17,9 @@ use ratatui::{
     widgets::{List, ListItem, ListState, Paragraph, Wrap},
 };
 use sshx::discovery::HostEntry;
-use sshx::keymap::{self, Action, Availability, FilterTarget, GotoTarget, InputMode, Key};
+use sshx::keymap::{
+    self, Action, Availability, CopyTarget, FilterTarget, GotoTarget, InputMode, Key,
+};
 use std::cell::Cell;
 use std::collections::BTreeMap;
 
@@ -197,6 +199,8 @@ pub(super) struct Finder {
     selected: usize,
     filter: RootFilter,
     viewport: Cell<usize>,
+    /// Where Select input mode started; the marked rows run from here to `selected`.
+    anchor: Option<usize>,
 }
 
 impl Finder {
@@ -207,7 +211,40 @@ impl Finder {
             selected: 0,
             filter: RootFilter::All,
             viewport: Cell::new(10),
+            anchor: None,
         }
+    }
+
+    fn leave_select(&mut self, mode: InputMode) {
+        self.mode = mode;
+        self.anchor = None;
+    }
+
+    /// Rows from the Select anchor to the highlighted row, one per HostEntry alias.
+    fn marked<'r, 'a>(&self, rows: &[&'r FinderRow<'a>]) -> Vec<&'r FinderRow<'a>> {
+        let Some(anchor) = self.anchor.filter(|_| self.mode == InputMode::Select) else {
+            return Vec::new();
+        };
+        let last = rows.len().saturating_sub(1);
+        let (from, to) = (anchor.min(self.selected), anchor.max(self.selected));
+        let (from, to) = (from.min(last), to.min(last));
+        let mut chosen: Vec<&FinderRow> = Vec::new();
+        for row in rows.iter().skip(from).take(to + 1 - from) {
+            let known = |other: &&FinderRow| {
+                other.row.entry.id == row.row.entry.id && other.row.alias == row.row.alias
+            };
+            if !chosen.iter().any(known) {
+                chosen.push(row);
+            }
+        }
+        chosen
+    }
+
+    fn marked_pairs<'r>(&self, rows: &[&'r FinderRow<'_>]) -> Vec<(&'r HostEntry, &'r str)> {
+        self.marked(rows)
+            .into_iter()
+            .map(|row| (row.row.entry, row.row.alias))
+            .collect()
     }
 
     pub(super) fn select_entry(&mut self, ctx: &Ctx, id: &str, alias: &str) {
@@ -338,10 +375,39 @@ impl Screen for Finder {
             Action::Bottom => self.selected = last,
             Action::HalfPageDown => self.selected = (self.selected + count * step).min(last),
             Action::HalfPageUp => self.selected = self.selected.saturating_sub(count * step),
-            Action::EnterInsert => self.mode = InputMode::Insert,
-            Action::EnterNormal => self.mode = InputMode::Normal,
+            Action::EnterInsert => {
+                self.mode = InputMode::Insert;
+                self.anchor = None;
+            }
+            Action::EnterNormal => self.leave_select(InputMode::Normal),
             Action::EnterSelect => {
-                return Outcome::Toast("Select input mode is not available yet".to_string());
+                self.mode = InputMode::Select;
+                self.anchor = Some(self.selected.min(last));
+            }
+            Action::Copy(_) if self.mode == InputMode::Select => {
+                let requests = self
+                    .marked(&rows)
+                    .iter()
+                    .map(|row| CopyRequest {
+                        target: CopyTarget::SshCommand,
+                        entry: row.row.entry.clone(),
+                        alias: row.row.alias.to_string(),
+                        forwards: Vec::new(),
+                        tunnel_id: None,
+                    })
+                    .collect();
+                self.leave_select(InputMode::Normal);
+                return Outcome::Effect(Effect::CopyMany(requests));
+            }
+            Action::DeleteHost if self.mode == InputMode::Select => {
+                let outcome = delete::begin_many(ctx, &self.marked_pairs(&rows));
+                self.leave_select(InputMode::Normal);
+                return outcome;
+            }
+            Action::TunnelStart if self.mode == InputMode::Select => {
+                let outcome = tunnel_progress::begin_many(ctx, &self.marked_pairs(&rows));
+                self.leave_select(InputMode::Normal);
+                return outcome;
             }
             Action::Connect => {
                 let Some(row) = rows.get(self.selected.min(last)) else {
@@ -406,6 +472,7 @@ impl Screen for Finder {
                 };
                 let entry = row.row.entry;
                 return tunnel_progress::begin(
+                    ctx,
                     entry,
                     row.row.alias,
                     tunnel_progress::remembered_forwards(ctx, entry),
@@ -454,9 +521,7 @@ impl Screen for Finder {
                 self.selected = 0;
                 return Outcome::Toast(format!("filter: {}", self.filter.label()));
             }
-            other => {
-                return Outcome::Toast(format!("{other:?} is not available in this build yet"));
-            }
+            _ => {}
         }
         Outcome::Stay
     }
@@ -480,9 +545,14 @@ impl Screen for Finder {
 
     fn status(&self, ctx: &Ctx) -> ScreenStatus {
         let lines = self.lines(ctx);
-        let total = hosts(&lines).len();
+        let rows = hosts(&lines);
+        let total = rows.len();
+        let mut filter = self.filter.label().to_string();
+        if self.mode == InputMode::Select {
+            filter = format!("{filter} · {} selected", self.marked(&rows).len());
+        }
         ScreenStatus {
-            filter: Some(self.filter.label().to_string()),
+            filter: Some(filter),
             position: Some((
                 if total == 0 {
                     0
@@ -534,6 +604,10 @@ impl Screen for Finder {
             );
         } else {
             let width = usize::from(rows_area.width).saturating_sub(2);
+            let marked = self
+                .anchor
+                .filter(|_| self.mode == InputMode::Select)
+                .map(|anchor| (anchor.min(selected), anchor.max(selected)));
             let mut host_index = 0;
             let mut highlighted = 0;
             let items = lines
@@ -553,6 +627,11 @@ impl Screen for Finder {
                         if host_index == selected {
                             highlighted = position;
                         }
+                        let marker = match marked {
+                            Some((from, to)) if (from..=to).contains(&host_index) => "● ",
+                            Some(_) => "  ",
+                            None => "",
+                        };
                         host_index += 1;
                         let count = ctx.service_count(row.row.entry);
                         let badge = if count > 0 {
@@ -561,9 +640,11 @@ impl Screen for Finder {
                             String::new()
                         };
                         let label = row.label.clone();
-                        let used = label.chars().count() + badge.chars().count();
+                        let used =
+                            marker.chars().count() + label.chars().count() + badge.chars().count();
                         let pad = width.saturating_sub(used).max(1);
                         ListItem::new(TextLine::from(vec![
+                            Span::styled(marker, Style::default().fg(Color::Yellow)),
                             Span::raw(label),
                             Span::raw(" ".repeat(pad)),
                             Span::styled(badge, Style::default().fg(Color::Cyan)),

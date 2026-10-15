@@ -13,7 +13,33 @@ pub(crate) struct CopyRequest {
 /// Runs outside raw mode, so the first-copy warning and the y/N confirmation can prompt on
 /// the cooked terminal. Failures become toasts; the TUI never exits over a copy.
 pub(super) fn copy(runtime: &mut Runtime, request: &CopyRequest) -> Result<EffectResult, String> {
-    let toast = match copy_target(runtime, request) {
+    finish(copy_target(runtime, request))
+}
+
+/// Select input mode: one ssh command per selected row, published in a single clipboard write.
+pub(super) fn copy_many(
+    runtime: &Runtime,
+    requests: &[CopyRequest],
+) -> Result<EffectResult, String> {
+    let lines = requests
+        .iter()
+        .map(|request| ssh_form(runtime, request, false))
+        .collect::<Result<Vec<_>, _>>();
+    finish(lines.and_then(|lines| {
+        let plural = if lines.len() == 1 { "" } else { "s" };
+        command(
+            lines.join("\n"),
+            &format!("{} ssh command{plural}", lines.len()),
+        )
+    }))
+}
+
+pub(super) fn copy_tunnel_id(id: &str) -> Result<EffectResult, String> {
+    finish(command(id.to_string(), "tunnel ID"))
+}
+
+fn finish(result: Result<String, String>) -> Result<EffectResult, String> {
+    let toast = match result {
         Ok(copied) => format!("✓ copied {copied}"),
         Err(error) => error,
     };
