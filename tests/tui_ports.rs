@@ -81,24 +81,42 @@ esac
     bin
 }
 
-/// Detached `-N` master that listens on every `-L` local port and exits on `-O exit`.
+/// Binds every `-L` listener spec (`[bind:]port:host:port`) and holds them for a minute.
+const LISTEN: &str = r#"import socket, sys, time
+sockets = []
+for spec in sys.argv[1:]:
+    if spec.startswith("["):
+        bind, rest = spec[1:].split("]:", 1)
+    else:
+        parts = spec.split(":")
+        bind, rest = (parts[0], ":".join(parts[1:])) if len(parts) == 4 else ("127.0.0.1", spec)
+    s = socket.socket(socket.AF_INET6 if ":" in bind else socket.AF_INET)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind((bind, int(rest.split(":")[0])))
+    s.listen()
+    sockets.append(s)
+time.sleep(60)
+"#;
+
+/// Detached `-N` master that listens on every `-L` spec (bind address included) and exits on
+/// `-O exit`. Every invocation is logged to `SSHX_ARGS_LOG`.
 fn tunnel_ssh(fixture: &Fixture) -> PathBuf {
     let bin = fixture.root.join("tunnel-bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(bin.join("listen.py"), LISTEN).unwrap();
     script(
         &bin.join("ssh"),
         r#"#!/bin/sh
+[ -n "$SSHX_ARGS_LOG" ] && printf '%s\n' "$*" >> "$SSHX_ARGS_LOG"
 socket=
 previous=
-local_ports=
+local_specs=
 for argument in "$@"; do
   if [ "$previous" = "-S" ]; then socket="$argument"; fi
-  if [ "$previous" = "-L" ]; then
-    local_port=${argument#*:}
-    local_port=${local_port%%:*}
-    local_ports="$local_ports $local_port"
-  fi
+  if [ "$previous" = "-L" ]; then local_specs="$local_specs $argument"; fi
   previous="$argument"
 done
+listen="$(dirname "$0")/listen.py"
 marker="$socket.started"
 pid_file="$socket.pid"
 case " $* " in
@@ -113,20 +131,21 @@ case " $* " in
     exit 0
     ;;
   *" -N "*)
-    python3 - "$marker" "$local_ports" <<'PY' >/dev/null 2>&1 &
+    python3 - "$marker" "$local_specs" "$listen" <<'PY' >/dev/null 2>&1 &
 import os,sys
 os.setsid()
 with open(os.devnull) as stdin:
     os.dup2(stdin.fileno(), 0)
 os.execl("/bin/sh", "sh", "-c", r'''
 marker=$1
-local_ports=$2
+local_specs=$2
+listen=$3
 : > "$marker"
-python3 -c 'import socket,sys,time; ss=[socket.socket() for _ in sys.argv[1:]]; [s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1) for s in ss]; [s.bind(("127.0.0.1",int(p))) for s,p in zip(ss,sys.argv[1:])]; [s.listen() for s in ss]; time.sleep(60)' $local_ports >/dev/null 2>&1 &
+python3 "$listen" $local_specs >/dev/null 2>&1 &
 listener=$!
 trap 'kill "$listener" 2>/dev/null || :; wait "$listener" 2>/dev/null || :; rm -f "$marker"; exit 0' INT HUP TERM
 while :; do sleep 0.01; done
-''', "sshx-fixture-master", sys.argv[1], sys.argv[2])
+''', "sshx-fixture-master", sys.argv[1], sys.argv[2], sys.argv[3])
 PY
     printf '%s' "$!" > "$pid_file"
     exit 0
@@ -161,6 +180,7 @@ fn command(fixture: &Fixture, bin: &Path) -> Command {
         .env("SSHX_CAPTURE", fixture.root.join("runtime-config"))
         .env("SSHX_STARTED", fixture.root.join("master-started"))
         .env("SSHX_CLOSED", fixture.root.join("master-closed"))
+        .env("SSHX_ARGS_LOG", fixture.root.join("ssh-args"))
         .args(["--config", fixture.config.to_str().unwrap()]);
     command
 }
@@ -391,6 +411,11 @@ fn clipboard(fixture: &Fixture) -> Option<String> {
 fn set_bind(fixture: &Fixture, bind: &str) {
     let settings = fixture.home.join(".config/sshx/config.json");
     fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    fs::set_permissions(
+        settings.parent().unwrap(),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
     fs::write(
         settings,
         json!({ "version": 1, "roots": [], "preferences": { "bind": bind } }).to_string(),
@@ -751,6 +776,8 @@ fn starting_a_tunnel_whose_exact_request_is_active_shows_the_existing_tunnel() {
     let id = listed["tunnels"][0]["id"].as_str().unwrap().to_string();
     tui.send("\x1b");
     tui.expect("x toggle");
+    tui.expect(&format!("already active (tunnel {id})"));
+    assert!(!tui.saw("port in use"));
     tui.send(" tt");
     tui.expect(&format!("already active as tunnel {id}"));
     tui.expect(&format!(":{local} listener ready"));
@@ -875,4 +902,145 @@ fn u_after_s_moves_usage_back_to_the_old_key() {
     .unwrap();
     let hosts = usage["hosts"].as_object().unwrap();
     assert_eq!(hosts.keys().collect::<Vec<_>>(), ["db@config"], "{usage}");
+}
+
+fn ssh_calls(fixture: &Fixture) -> Vec<String> {
+    fs::read_to_string(fixture.root.join("ssh-args"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+fn start_db_tunnel(fixture: &Fixture, bin: &Path, local: u16) -> (String, String) {
+    let selector = format!("5432={local}");
+    let started = cli_json(
+        fixture,
+        bin,
+        &[
+            "tunnel",
+            "direct",
+            "start",
+            "db",
+            "--forward",
+            &selector,
+            "--no-input",
+            "--format",
+            "json",
+        ],
+    );
+    let id = started["tunnels"][0]["id"].as_str().unwrap().to_string();
+    let registry: Value = serde_json::from_slice(
+        &fs::read(fixture.home.join(".config/sshx/tunnels/registry.json")).unwrap(),
+    )
+    .unwrap();
+    let socket = registry["tunnels"][0]["control_socket"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    (id, socket)
+}
+
+#[test]
+fn enter_on_a_tunnel_opens_ssh_through_its_control_socket_without_a_new_master() {
+    let local = free_port();
+    let fixture = fixture(DB_WITH_SERVICE);
+    let bin = tunnel_ssh(&fixture);
+    let (id, socket) = start_db_tunnel(&fixture, &bin, local);
+    let masters_before = ssh_calls(&fixture)
+        .iter()
+        .filter(|call| call.contains(" -N "))
+        .count();
+    assert_eq!(masters_before, 1);
+    let mut tui = Tui::start(&fixture, &bin);
+    tui.expect("Search:");
+    tui.send("\x1b");
+    tui.expect("NORMAL");
+    tui.send("gt");
+    tui.expect(&id);
+    tui.send("\r");
+    let (status, output) = tui.finish();
+    assert!(status.success(), "{status:?} {output}");
+    assert!(output.contains("direct-shell"), "{output}");
+    let calls = ssh_calls(&fixture);
+    let session = calls
+        .iter()
+        .filter(|call| !call.contains(" -O ") && !call.contains(" -N "))
+        .collect::<Vec<_>>();
+    assert_eq!(session.len(), 1, "{calls:?}");
+    assert!(session[0].contains(&format!("-S {socket}")), "{session:?}");
+    assert!(session[0].contains("ControlMaster=no"), "{session:?}");
+    assert!(session[0].ends_with(" db"), "{session:?}");
+    assert_eq!(
+        calls.iter().filter(|call| call.contains(" -N ")).count(),
+        masters_before,
+        "{calls:?}"
+    );
+    stop_tunnels(&fixture, &bin);
+}
+
+#[test]
+fn enter_on_a_tunnel_whose_master_does_not_answer_refuses_and_runs_no_ssh() {
+    let local = free_port();
+    let fixture = fixture(DB_WITH_SERVICE);
+    let bin = tunnel_ssh(&fixture);
+    let (id, socket) = start_db_tunnel(&fixture, &bin, local);
+    fs::remove_file(format!("{socket}.started")).unwrap();
+    let mut tui = Tui::start(&fixture, &bin);
+    tui.expect("Search:");
+    tui.send("\x1b");
+    tui.expect("NORMAL");
+    tui.send("gt");
+    tui.expect(&id);
+    let before = ssh_calls(&fixture).len();
+    tui.send("\r");
+    tui.expect("TUNNEL_DOWN");
+    assert!(!tui.saw("direct-shell"));
+    let calls = ssh_calls(&fixture);
+    assert!(
+        calls[before..]
+            .iter()
+            .all(|call| call.contains(" -O check ")),
+        "{calls:?}"
+    );
+    tui.send("q");
+    let (status, output) = tui.finish();
+    assert!(status.success(), "{status:?} {output}");
+    stop_tunnels(&fixture, &bin);
+}
+
+#[test]
+fn tunnel_mode_listens_on_the_configured_loopback_bind() {
+    let Some(bind) = other_loopback() else {
+        eprintln!("skipped: this host binds neither 127.0.0.2 nor ::1");
+        return;
+    };
+    let local = free_port();
+    let fixture = fixture(DB_WITH_SERVICE);
+    set_bind(&fixture, bind);
+    write_usage(
+        &fixture,
+        "db-id",
+        json!([{"remote": 5432, "local": local, "declared": true}]),
+    );
+    let bin = tunnel_ssh(&fixture);
+    let shown = if bind.contains(':') {
+        format!("[{bind}]")
+    } else {
+        bind.to_string()
+    };
+    let mut tui = Tui::start(&fixture, &bin);
+    tui.expect("Search:");
+    tui.send("db\t");
+    tui.expect(&format!("{shown}:{local} → 5432"));
+    tui.send(" tt");
+    tui.expect(&format!(":{local} listener ready"));
+    tui.send("q");
+    let (status, output) = tui.finish();
+    assert!(status.success(), "{status:?} {output}");
+    let listed = cli_json(&fixture, &bin, &["tunnel", "list", "--format", "json"]);
+    let tunnel = &listed["tunnels"][0];
+    assert_eq!(tunnel["forwards"][0]["bind_address"], bind, "{listed}");
+    assert_eq!(tunnel["listener_status"], "bound", "{listed}");
+    stop_tunnels(&fixture, &bin);
 }

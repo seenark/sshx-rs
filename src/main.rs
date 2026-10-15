@@ -564,6 +564,7 @@ fn start_direct_tunnel(
         &cli.remote_forwards,
         &cli.dynamic_forwards,
         cli.allow_bind,
+        &sshx::usage::used_from_service_forwards(entry, &declared),
     )
 }
 

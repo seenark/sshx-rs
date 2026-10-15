@@ -82,6 +82,8 @@ pub(super) fn endpoint(bind: &str, local: u16) -> String {
     }
 }
 
+/// The HostEntry a ports screen was opened on: the exact ID in that file and alias first, else
+/// the file's only entry with that alias. Never a different entry among several candidates.
 pub(super) fn find_entry<'a>(
     entries: &'a [HostEntry],
     id: &str,
@@ -94,7 +96,29 @@ pub(super) fn find_entry<'a>(
     entries
         .iter()
         .find(|entry| entry.id == id && here(entry))
-        .or_else(|| entries.iter().find(here))
+        .or_else(|| {
+            let mut candidates = entries.iter().filter(here);
+            let only = candidates.next()?;
+            candidates.next().is_none().then_some(only)
+        })
+}
+
+/// The active standalone tunnel of `entry` that already forwards `row`.
+fn holder<'a>(ctx: &Ctx<'a>, entry: &HostEntry, row: &PortRow) -> Option<&'a str> {
+    ctx.tunnels
+        .iter()
+        .filter(|tunnel| {
+            tunnel.state == "active"
+                && tunnel.entry_id == entry.id
+                && tunnel.source_path == entry.source.path
+                && tunnel.source_line == entry.source.line_start
+        })
+        .find(|tunnel| {
+            tunnel.forwards.iter().any(|forward| {
+                forward.local_port == Some(row.local) && forward.remote_port == Some(row.remote)
+            })
+        })
+        .map(|tunnel| tunnel.id.as_str())
 }
 
 pub(crate) enum ServiceChange {
@@ -121,6 +145,8 @@ pub(super) struct Ports {
     mode: InputMode,
     draft: String,
     error: Option<String>,
+    /// The HostEntry is gone or ambiguous after a refresh: the next toast closes the screen.
+    lost: bool,
 }
 
 impl Ports {
@@ -157,6 +183,7 @@ impl Ports {
             mode: InputMode::Normal,
             draft: String::new(),
             error: None,
+            lost: false,
         }
     }
 
@@ -170,7 +197,9 @@ impl Ports {
             .find(|service| service.remote_port == remote)
     }
 
-    fn issues(&self, ctx: &Ctx) -> Vec<(usize, String)> {
+    /// `(row index, message, held)`; `held` marks a row the HostEntry's own active standalone
+    /// tunnel already forwards, which is not a conflict to fix.
+    fn issues(&self, ctx: &Ctx) -> Vec<(usize, String, bool)> {
         let checked = self
             .rows
             .iter()
@@ -184,9 +213,16 @@ impl Ports {
                 local: row.local,
             })
             .collect::<Vec<_>>();
+        let entry = self.entry(ctx);
         tunnel_progress::issues(&forwards, ctx.prefs)
             .into_iter()
-            .map(|(position, message)| (checked[position].0, message))
+            .map(|(position, message)| {
+                let (index, row) = checked[position];
+                match entry.and_then(|entry| holder(ctx, entry, row)) {
+                    Some(id) => (index, format!("already active (tunnel {id})"), true),
+                    None => (index, message, false),
+                }
+            })
             .collect()
     }
 
@@ -298,7 +334,7 @@ impl Ports {
         if matches!(ctx.intent.pick, Pick::Tunnel) {
             return tunnel_progress::begin(ctx, entry, &self.alias, requests(&self.rows));
         }
-        if let Some((_, message)) = self.issues(ctx).into_iter().next() {
+        if let Some((_, message, _)) = self.issues(ctx).into_iter().next() {
             return Outcome::Toast(message);
         }
         Outcome::Effect(Effect::Connect(Box::new(ConnectRequest {
@@ -396,9 +432,11 @@ impl Screen for Ports {
     }
 
     /// Declarations changed on disk (undo, redo, an edit elsewhere): keep the rows and follow
-    /// the HostEntry, listing declared services that appeared.
+    /// the HostEntry, listing declared services that appeared. A HostEntry that vanished or
+    /// became ambiguous is never rebound.
     fn on_refresh(&mut self, ctx: &Ctx) {
         let Some(entry) = self.entry(ctx) else {
+            self.lost = true;
             return;
         };
         let Ok(declared) = sshx::session::declared_services(entry) else {
@@ -420,6 +458,10 @@ impl Screen for Ports {
             }
         }
         self.declared = declared;
+    }
+
+    fn dismiss_on_outcome(&self) -> bool {
+        self.lost
     }
 
     fn on_key(&mut self, key: Key, _ctx: &Ctx) -> Outcome {
@@ -503,12 +545,16 @@ impl Screen for Ports {
                     lines.extend(
                         issues
                             .iter()
-                            .filter(|(position, _)| *position == index)
-                            .map(|(_, message)| {
-                                Line::from(Span::styled(
-                                    format!("    ✗ {message}"),
-                                    Style::default().fg(Color::Red),
-                                ))
+                            .filter(|(position, ..)| *position == index)
+                            .map(|(_, message, held)| {
+                                Line::from(if *held {
+                                    Span::styled(format!("    {message}"), dim)
+                                } else {
+                                    Span::styled(
+                                        format!("    ✗ {message}"),
+                                        Style::default().fg(Color::Red),
+                                    )
+                                })
                             }),
                     );
                     ListItem::new(lines)
@@ -634,21 +680,17 @@ pub(super) fn save_service(
         }
     };
     let ctx = runtime.data.ctx(None);
-    let reopened = find_entry(ctx.entries, &entry.id, &entry.source.path, &edit.alias)
-        .or_else(|| {
-            let added = plan.added_id.as_deref()?;
-            find_entry(ctx.entries, added, &entry.source.path, &edit.alias)
-        })
-        .and_then(|entry| {
-            let declared = sshx::session::declared_services(entry).ok()?;
-            Some(Ports::with_rows(
-                entry,
-                &edit.alias,
-                declared,
-                rows,
-                edit.selected,
-            ))
-        });
+    let id = plan.added_id.as_deref().unwrap_or(&entry.id);
+    let reopened = find_entry(ctx.entries, id, &entry.source.path, &edit.alias).and_then(|entry| {
+        let declared = sshx::session::declared_services(entry).ok()?;
+        Some(Ports::with_rows(
+            entry,
+            &edit.alias,
+            declared,
+            rows,
+            edit.selected,
+        ))
+    });
     Ok(EffectResult {
         toast: Some(discovery_error.unwrap_or(described)),
         push: reopened.map(|screen| Box::new(screen) as Box<dyn Screen>),
@@ -658,7 +700,8 @@ pub(super) fn save_service(
 
 #[cfg(test)]
 mod tests {
-    use super::{PortRow, merge_rows};
+    use super::{PortRow, find_entry, merge_rows};
+    use sshx::discovery::{HostEntry, SourceIdentity};
     use sshx::session::DeclaredService;
     use sshx::usage::UsedForward;
 
@@ -723,6 +766,39 @@ mod tests {
             ),
             [row(5432, 5432, true, None), row(6379, 6379, true, Some(99))]
         );
+    }
+
+    fn host(id: &str, path: &str, alias: &str, line: usize) -> HostEntry {
+        HostEntry {
+            id: id.into(),
+            aliases: vec![alias.into()],
+            source: SourceIdentity {
+                path: path.into(),
+                byte_start: 0,
+                byte_end: 1,
+                line_start: line,
+                line_end: line,
+            },
+            destination: None,
+            provenance: Vec::new(),
+            scopes: Vec::new(),
+            projects: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn find_entry_never_rebinds_to_another_entry_with_a_duplicate_alias() {
+        let entries = [host("a", "/c", "db", 1), host("b", "/c", "db", 5)];
+        assert_eq!(find_entry(&entries, "b", "/c", "db").unwrap().id, "b");
+        assert_eq!(find_entry(&entries, "a", "/c", "db").unwrap().id, "a");
+        assert!(find_entry(&entries, "gone", "/c", "db").is_none());
+    }
+
+    #[test]
+    fn find_entry_follows_a_changed_id_only_when_one_entry_has_the_alias() {
+        let renamed = [host("new", "/c", "db", 1), host("x", "/c", "cache", 5)];
+        assert_eq!(find_entry(&renamed, "old", "/c", "db").unwrap().id, "new");
+        assert!(find_entry(&renamed, "old", "/other", "db").is_none());
     }
 
     #[test]

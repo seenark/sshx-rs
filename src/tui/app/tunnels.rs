@@ -1,7 +1,6 @@
 use super::{
-    ConnectRequest, Ctx, Effect, EffectResult, Outcome, Runtime, Screen, ScreenStatus,
-    cmdline::CommandLine, finder::relative_time, ports::endpoint, tunnel_progress::TunnelProgress,
-    yesno::YesNo,
+    Ctx, Effect, EffectResult, Outcome, Runtime, Screen, ScreenStatus, cmdline::CommandLine,
+    finder::relative_time, ports::endpoint, tunnel_progress::TunnelProgress, yesno::YesNo,
 };
 use crate::tui::widgets::block;
 use ratatui::{
@@ -161,17 +160,7 @@ impl Screen for Tunnels {
                 let Some(tunnel) = self.current(ctx) else {
                     return Outcome::Stay;
                 };
-                let Some(entry) = sshx::tunnel::find_entry(ctx.entries, tunnel) else {
-                    return Outcome::Toast(format!(
-                        "CONFIG_CHANGED: the HostEntry of tunnel {} is unavailable",
-                        tunnel.id
-                    ));
-                };
-                return Outcome::Effect(Effect::Connect(Box::new(ConnectRequest {
-                    entry: entry.clone(),
-                    alias: tunnel.selected_alias.clone(),
-                    forwards: Vec::new(),
-                })));
+                return Outcome::Effect(Effect::TunnelOpen(tunnel.id.clone()));
             }
             Action::Copy(keymap::CopyTarget::TunnelId) => {
                 let Some(tunnel) = self.current(ctx) else {
@@ -364,4 +353,19 @@ pub(super) fn restart(runtime: &Runtime, id: &str) -> Result<EffectResult, Strin
             ..EffectResult::default()
         }),
     }
+}
+
+/// Enter on a tunnel: ssh through its master after the registry proves it is live. A finished
+/// session ends sshx like Session mode; a refusal is a toast and the list stays.
+pub(super) fn open(runtime: &Runtime, id: &str) -> Result<EffectResult, String> {
+    Ok(match sshx::tunnel::open_shell(&runtime.data.home, id) {
+        Ok(code) => EffectResult {
+            exit: Some(code),
+            ..EffectResult::default()
+        },
+        Err(error) => EffectResult {
+            toast: Some(error),
+            ..EffectResult::default()
+        },
+    })
 }

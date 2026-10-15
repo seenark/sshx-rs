@@ -26,6 +26,7 @@ pub(super) fn execute(runtime: &mut Runtime, effect: Effect) -> Result<EffectRes
         Effect::TunnelStart(request) => super::tunnel_progress::start(runtime, &request),
         Effect::TunnelStop(ids) => super::tunnels::stop(runtime, &ids),
         Effect::TunnelRestart(id) => super::tunnels::restart(runtime, &id),
+        Effect::TunnelOpen(id) => super::tunnels::open(runtime, &id),
         Effect::SaveService(edit) => super::ports::save_service(runtime, &edit),
         Effect::CopyMany(requests) => copy::copy_many(runtime, &requests),
         Effect::CopyTunnelId(id) => copy::copy_tunnel_id(&id),

@@ -103,15 +103,34 @@ fn local_forward(bind: &str, remote: u16, local: u16) -> String {
 
 /// `forwards` holds `(remote, local)` pairs; `bind` is `Preferences.bind`.
 pub fn ssh_command(config: &str, alias: &str, bind: &str, forwards: &[(u16, u16)]) -> String {
-    let mut command = format!("ssh -F {} {}", shell_quote(config), shell_quote(alias));
+    ssh_line("ssh", config, alias, bind, forwards)
+}
+
+pub fn ssh_verbose_command(
+    config: &str,
+    alias: &str,
+    bind: &str,
+    forwards: &[(u16, u16)],
+) -> String {
+    ssh_line("ssh -v", config, alias, bind, forwards)
+}
+
+fn ssh_line(
+    program: &str,
+    config: &str,
+    alias: &str,
+    bind: &str,
+    forwards: &[(u16, u16)],
+) -> String {
+    let mut command = format!(
+        "{program} -F {} {}",
+        shell_quote(config),
+        shell_quote(alias)
+    );
     for &(remote, local) in forwards {
         command.push_str(&local_forward(bind, remote, local));
     }
     command
-}
-
-pub fn ssh_verbose_command(config: &str, alias: &str) -> String {
-    format!("ssh -v -F {} {}", shell_quote(config), shell_quote(alias))
 }
 
 /// The Pair-capable form; `forwards` holds `(remote, local)` pairs.
@@ -342,10 +361,14 @@ mod tests {
     }
 
     #[test]
-    fn verbose_command_adds_v_before_config() {
+    fn verbose_command_adds_v_before_config_and_keeps_forwards() {
         assert_eq!(
-            ssh_verbose_command("/c/it's", "web"),
+            ssh_verbose_command("/c/it's", "web", "127.0.0.1", &[]),
             "ssh -v -F '/c/it'\\''s' 'web'"
+        );
+        assert_eq!(
+            ssh_verbose_command("/c", "web", "127.0.0.1", &[(5432, 15432)]),
+            "ssh -v -F '/c' 'web' -L 127.0.0.1:15432:127.0.0.1:5432"
         );
     }
 

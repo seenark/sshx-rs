@@ -95,6 +95,10 @@ struct RegistryEntry {
     control_socket: String,
     runtime_config: String,
     forwards: Vec<ForwardSpec>,
+    /// The service forwards among `forwards`, as usage state records them; kept so a restart
+    /// records the same ones.
+    #[serde(default)]
+    used: Vec<usage::UsedForward>,
     #[serde(default)]
     pair: Option<PairedRegistry>,
     error: Option<String>,
@@ -180,6 +184,7 @@ pub fn start(
     remote: &[String],
     dynamic: &[String],
     allow_bind: bool,
+    service_forwards: &[usage::UsedForward],
 ) -> Result<TunnelResponse, String> {
     if local.is_empty() && remote.is_empty() && dynamic.is_empty() {
         return Err(
@@ -239,6 +244,7 @@ pub fn start(
         control_socket: runtime.control_socket().to_string_lossy().into_owned(),
         runtime_config: runtime.runtime_config().to_string_lossy().into_owned(),
         forwards,
+        used: service_forwards.to_vec(),
         pair: None,
         error: None,
     };
@@ -281,11 +287,7 @@ pub fn start(
         drop(runtime);
         return Err(error);
     }
-    let _ = usage::record(
-        entry,
-        &usage::used_from_specs(entry, &registry.tunnels[index].forwards),
-        usage::now(),
-    );
+    let _ = usage::record(entry, service_forwards, usage::now());
     let response_record = registry.tunnels[index].clone();
     let response = TunnelResponse {
         operation: "start".to_string(),
@@ -414,6 +416,7 @@ pub fn start_paired(
         control_socket: pair.vm_control_socket.clone(),
         runtime_config: pair.vm_runtime_config.clone(),
         forwards: specs,
+        used: Vec::new(),
         pair: Some(pair),
         error: None,
     });
@@ -585,6 +588,71 @@ pub fn stop(home: &Path, id: &str, route: Option<TunnelRoute>) -> Result<TunnelR
     })
 }
 
+/// Interactive ssh through the master of an active tunnel (a Pair's VM master). The registry
+/// record and `ssh -O check` on its control socket prove the tunnel is live and ours under the
+/// registry lock; the lock is released before the session. A stale or unproved record is an
+/// error: sshx never adopts a socket by path or PID alone.
+pub fn open_shell(home: &Path, id: &str) -> Result<i32, String> {
+    let root = registry_root(home);
+    ensure_private_tree(&root)?;
+    let (config, socket, alias) = {
+        let _lock = RegistryLock::acquire(&root)?;
+        let registry = read_registry(&root)?;
+        let record = registry
+            .tunnels
+            .iter()
+            .find(|record| record.id == id)
+            .ok_or_else(|| format!("TUNNEL_NOT_FOUND: tunnel `{id}` does not exist"))?;
+        if record.state != "active" {
+            return Err(format!(
+                "TUNNEL_DOWN: tunnel `{id}` is {}, not active; restart it first",
+                record.state
+            ));
+        }
+        let down = || {
+            format!(
+                "TUNNEL_DOWN: the master of tunnel `{id}` does not answer on its control socket; restart it"
+            )
+        };
+        match record.pair.as_ref().filter(|_| record.kind == "paired") {
+            Some(pair) => {
+                validate_pair_control_reference(&root, record)?;
+                for (socket, alias) in [
+                    (&pair.gateway_control_socket, &pair.gateway_alias),
+                    (&pair.vm_control_socket, &pair.vm_alias),
+                ] {
+                    if !connect::standalone_master_ready_at(Path::new(socket), alias) {
+                        return Err(down());
+                    }
+                }
+                (
+                    PathBuf::from(&pair.vm_runtime_config),
+                    PathBuf::from(&pair.vm_control_socket),
+                    pair.vm_alias.clone(),
+                )
+            }
+            None if record.kind == "paired" => {
+                return Err("REGISTRY_INVALID: paired tunnel has no pair metadata".to_string());
+            }
+            None => {
+                validate_control_reference(&root, record)?;
+                if !connect::standalone_master_ready_at(
+                    Path::new(&record.control_socket),
+                    &record.selected_alias,
+                ) {
+                    return Err(down());
+                }
+                (
+                    PathBuf::from(&record.runtime_config),
+                    PathBuf::from(&record.control_socket),
+                    record.selected_alias.clone(),
+                )
+            }
+        }
+    };
+    connect::shell_through_master(&config, &socket, &alias)
+}
+
 pub fn restart(
     entries: &[HostEntry],
     home: &Path,
@@ -687,6 +755,7 @@ pub fn restart(
         &remote,
         &dynamic,
         true,
+        &record.used,
     )
     .map(|mut response| {
         response.operation = "restart".to_string();
@@ -1762,6 +1831,7 @@ mod tests {
             control_socket: String::new(),
             runtime_config: String::new(),
             forwards: Vec::new(),
+            used: Vec::new(),
             pair: None,
             error: None,
         };

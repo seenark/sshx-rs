@@ -198,7 +198,14 @@ mod tests {
         assert_eq!(fixture.text(), format!("{written}# external\n"));
 
         fs::write(&fixture.config, &written).unwrap();
-        assert_eq!(stack.undo().unwrap(), "create b");
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&fixture.config)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60))
+            .unwrap();
+        let error = stack.undo().unwrap_err();
+        assert!(error.starts_with("UNDO_REFUSED"), "{error}");
     }
 
     #[test]

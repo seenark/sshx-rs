@@ -168,6 +168,7 @@ pub(crate) enum Effect {
     TunnelStart(Box<tunnel_progress::TunnelStartRequest>),
     TunnelStop(Vec<String>),
     TunnelRestart(String),
+    TunnelOpen(String),
     SaveService(Box<ports::ServiceEdit>),
     CopyMany(Vec<copy::CopyRequest>),
     CopyTunnelId(String),

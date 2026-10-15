@@ -1420,6 +1420,27 @@ pub(crate) fn stop_standalone_checked_at(socket: &Path, alias: &str) -> Result<(
     Ok(())
 }
 
+/// Interactive ssh through an existing master's control socket; never starts a master of
+/// its own. The caller has proved the socket belongs to a live tunnel. The TUI uses stderr as
+/// its terminal even when stdout is redirected, so stdout follows it.
+pub(crate) fn shell_through_master(
+    config: &Path,
+    socket: &Path,
+    alias: &str,
+) -> Result<i32, String> {
+    let status = Command::new("ssh")
+        .args(["-F", config.to_string_lossy().as_ref()])
+        .args(["-S", socket.to_string_lossy().as_ref()])
+        .args(["-o", "ControlMaster=no", "-o", "ControlPersist=no"])
+        .arg(alias)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::from(io::stderr()))
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(|error| format!("SESSION_FAILED: cannot start shell: {error}"))?;
+    Ok(status.code().unwrap_or(1))
+}
+
 fn spawn_shell(runtime: &Runtime, no_input: bool, terminal: bool) -> Result<Child, String> {
     let mut command = ssh_command(runtime, no_input, true);
     command.args(["-o", "ControlMaster=no"]);

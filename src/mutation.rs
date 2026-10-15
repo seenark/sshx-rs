@@ -1,11 +1,12 @@
 use crate::discovery::{DiscoveryRoot, HostEntry, path_reachable};
 use crate::session::{self, DeclarationLine, declaration_line};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
@@ -234,6 +235,22 @@ struct Fingerprint {
     modified: Option<(u64, u32)>,
 }
 
+/// Every file as sshx last left it: its writes, undos and redos. An undo or redo refuses
+/// unless the file still matches, so a same-bytes rewrite or a chmod since sshx's own write
+/// is caught as well as changed bytes. Process-wide because undoing one change moves the file
+/// under every other change on the stack.
+static LEFT: LazyLock<Mutex<HashMap<PathBuf, Fingerprint>>> = LazyLock::new(Mutex::default);
+
+fn remember(writes: &[WriteFile]) {
+    let mut left = LEFT.lock().unwrap_or_else(|error| error.into_inner());
+    for write in writes {
+        match fingerprint(&write.path) {
+            Ok(state) => left.insert(write.path.clone(), state),
+            Err(_) => left.remove(&write.path),
+        };
+    }
+}
+
 struct WriterLock {
     _file: File,
     #[cfg(not(unix))]
@@ -427,13 +444,13 @@ impl AppliedChange {
         self.writes.is_empty()
     }
 
-    /// Puts every file back to its bytes before the plan, refusing unless each one still
-    /// holds exactly what the plan wrote.
+    /// Puts every file back to its bytes before the plan, refusing unless each one is exactly
+    /// as sshx left it: bytes, length, mtime and mode.
     pub fn undo(&self) -> Result<(), String> {
         self.shift(false)
     }
 
-    /// Applies the plan again, refusing unless each file still holds its bytes before the plan.
+    /// Applies the plan again, refusing unless each file is exactly as the undo left it.
     pub fn redo(&self) -> Result<(), String> {
         self.shift(true)
     }
@@ -447,7 +464,13 @@ impl AppliedChange {
         for write in &order {
             let (expected, exists) = write_state(write, !forward);
             let current = fingerprint(&write.path)?;
-            if current.exists != exists
+            let left = LEFT
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .get(&write.path)
+                .cloned();
+            if left.as_ref() != Some(&current)
+                || current.exists != exists
                 || (exists
                     && (current.length != expected.len() as u64
                         || current.digest != digest(expected)))
@@ -459,6 +482,7 @@ impl AppliedChange {
             }
         }
         let mut done = Vec::new();
+        let mut failure = None;
         for write in order {
             if let Err(error) = rewrite(
                 write,
@@ -472,11 +496,13 @@ impl AppliedChange {
                         write_state(earlier, !forward),
                     );
                 }
-                return Err(error);
+                failure = Some(error);
+                break;
             }
             done.push(write);
         }
-        Ok(())
+        remember(&self.writes);
+        failure.map_or(Ok(()), Err)
     }
 }
 
@@ -1424,7 +1450,7 @@ fn apply_writes(lock_path: &Path, writes: &[WriteFile]) -> Result<(), String> {
         }
         applied.push(write);
     }
-
+    remember(writes);
     Ok(())
 }
 
@@ -2572,6 +2598,8 @@ mod tests {
         plan_declare_service, plan_undeclare_service, plan_update, recover_pair_journals,
     };
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
 
     #[test]
@@ -3186,6 +3214,53 @@ mod tests {
         let refused = change.undo().unwrap_err();
         assert!(refused.starts_with("UNDO_REFUSED"), "{refused}");
         assert_eq!(fixture.text(), format!("{written}# external\n"));
+    }
+
+    #[test]
+    fn applied_change_refuses_after_a_same_bytes_rewrite() {
+        let fixture = ServiceFixture::new("Host a\n  HostName a.example\n");
+        let plan = fixture.declare(&service(80)).unwrap();
+        let change = plan.change();
+        apply_edit(&plan).unwrap();
+        let written = fs::read(&fixture.path).unwrap();
+
+        fs::write(&fixture.path, &written).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&fixture.path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60))
+            .unwrap();
+        let refused = change.undo().unwrap_err();
+        assert!(refused.starts_with("UNDO_REFUSED"), "{refused}");
+        assert_eq!(fs::read(&fixture.path).unwrap(), written);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn applied_change_refuses_undo_and_redo_after_a_chmod() {
+        let fixture = ServiceFixture::new("Host a\n  HostName a.example\n");
+        let original = fixture.text();
+        let plan = fixture.declare(&service(80)).unwrap();
+        let change = plan.change();
+        apply_edit(&plan).unwrap();
+        let written = fixture.text();
+        let mode = fs::metadata(&fixture.path).unwrap().permissions().mode();
+        let chmod = |mode| fs::set_permissions(&fixture.path, fs::Permissions::from_mode(mode));
+
+        chmod(0o640).unwrap();
+        let refused = change.undo().unwrap_err();
+        assert!(refused.starts_with("UNDO_REFUSED"), "{refused}");
+        assert_eq!(fixture.text(), written);
+
+        chmod(mode).unwrap();
+        change.undo().unwrap();
+        assert_eq!(fixture.text(), original);
+
+        chmod(0o640).unwrap();
+        let refused = change.redo().unwrap_err();
+        assert!(refused.starts_with("UNDO_REFUSED"), "{refused}");
+        assert_eq!(fixture.text(), original);
     }
 
     #[test]
