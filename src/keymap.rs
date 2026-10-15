@@ -424,6 +424,7 @@ static PREFIX_TITLES: &[(&str, &str)] = &[
     ("space", "Space"),
     ("space f", "Filter"),
     ("space t", "Tunnel"),
+    ("space h", "Hosts"),
     ("g", "Goto"),
     ("y", "Yank"),
     ("d", "Delete"),
@@ -489,6 +490,13 @@ static BINDINGS: &[Binding] = &[
     bind("d", SELECT, FINDER, A::DeleteHost, S::Hosts, "Delete selected hosts").req(Row),
     bind("u", NORMAL, FINDER_PORTS, A::Undo, S::Hosts, "Undo"),
     bind("^r", NORMAL, FINDER_PORTS, A::Redo, S::Hosts, "Redo"),
+    bind("space p", NORMAL, FINDER, A::OpenPorts, S::Connect, "Ports screen").req(Row),
+    bind("space h n", NORMAL, FINDER, A::NewHost, S::Hosts, "New host (form)"),
+    bind("space h e", NORMAL, FINDER, A::EditHostForm, S::Hosts, "Edit host (form)").req(Row),
+    bind("space h d", NORMAL, FINDER, A::DeleteHost, S::Hosts, "Delete host").req(Row),
+    bind("space h u", NORMAL, FINDER, A::Undo, S::Hosts, "Undo"),
+    bind("space /", NORMAL, FINDER, A::CommandLine, S::General, "Command line"),
+    bind("space ?", NORMAL, FINDER, A::Help, S::General, "Show help"),
 
     // Tunnels (standalone)
     bind("space t t", NORMAL_SELECT, FINDER_PORTS, A::TunnelStart, S::Tunnels, "Start standalone tunnel (per selected row in Select)").req(Row).cmd("tunnel start"),
@@ -1219,9 +1227,10 @@ mod tests {
             panic!("space should be pending");
         };
         assert_eq!(title, "Space");
-        assert_eq!(labels(&entries), ["f", "t"]);
-        assert!(entries.iter().all(|e| e.is_submenu));
-        assert_eq!(entries[1].description, "Tunnel…");
+        assert_eq!(labels(&entries), ["f", "p", "h", "/", "?", "t"]);
+        let submenus: Vec<_> = entries.iter().map(|e| e.is_submenu).collect();
+        assert_eq!(submenus, [true, false, true, false, false, true]);
+        assert_eq!(entries[5].description, "Tunnel…");
         assert_eq!(km.pending_keys(), "space");
 
         let Step::Pending { title, entries } = km.feed(Key::Char('t'), n, f, &ROW) else {
