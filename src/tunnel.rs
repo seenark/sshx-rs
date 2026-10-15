@@ -1327,6 +1327,13 @@ fn registry_root(home: &Path) -> PathBuf {
     home.join(".config/sshx/tunnels")
 }
 
+/// Unix seconds when the tunnel's control directory was created; `None` once it is cleaned up.
+pub fn started_at(home: &Path, id: &str) -> Option<u64> {
+    let metadata = fs::metadata(registry_root(home).join(id)).ok()?;
+    let time = metadata.created().or_else(|_| metadata.modified()).ok()?;
+    Some(time.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs())
+}
+
 fn ensure_private_tree(root: &Path) -> Result<(), String> {
     let config_dir = root
         .parent()

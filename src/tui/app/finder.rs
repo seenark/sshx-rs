@@ -1,9 +1,14 @@
 use super::{
+<<<<<<< HEAD
     ConnectRequest, Ctx, Effect, Outcome, Screen, ScreenStatus,
     cmdline::CommandLine,
     copy::CopyRequest,
     delete::DeleteConfirm,
     host_form::{EditorRequest, HostForm, open},
+=======
+    ConnectRequest, Ctx, Effect, Outcome, Screen, ScreenStatus, cmdline::CommandLine, ports::Ports,
+    tunnel_progress, tunnels,
+>>>>>>> 8a35bf2 (feat(tui): ports screen, tunnel start progress, tunnel list)
 };
 use crate::tui::matcher::{Row, compare_rows, matching_rows, row_label, row_rank};
 use crate::tui::widgets::block;
@@ -351,11 +356,25 @@ impl Screen for Finder {
                     forwards: Vec::new(),
                 })));
             }
+<<<<<<< HEAD
             Action::Copy(target) => {
+=======
+            Action::OpenPorts => {
+                let Some(row) = rows.get(self.selected.min(last)) else {
+                    return Outcome::Stay;
+                };
+                return match Ports::open(ctx, row.row.entry, row.row.alias) {
+                    Ok(ports) => Outcome::Push(Box::new(ports)),
+                    Err(error) => Outcome::Toast(error),
+                };
+            }
+            Action::TunnelStart => {
+>>>>>>> 8a35bf2 (feat(tui): ports screen, tunnel start progress, tunnel list)
                 let Some(row) = rows.get(self.selected.min(last)) else {
                     return Outcome::Stay;
                 };
                 let entry = row.row.entry;
+<<<<<<< HEAD
                 let tunnel_id = ctx
                     .tunnels
                     .iter()
@@ -389,12 +408,21 @@ impl Screen for Finder {
             }
             Action::Undo => return Outcome::Effect(Effect::Undo),
             Action::Redo => return Outcome::Effect(Effect::Redo),
+=======
+                return tunnel_progress::begin(
+                    entry,
+                    row.row.alias,
+                    tunnel_progress::remembered_forwards(ctx, entry),
+                );
+            }
+            Action::TunnelStopAll => return tunnels::stop_all(ctx),
+>>>>>>> 8a35bf2 (feat(tui): ports screen, tunnel start progress, tunnel list)
             Action::CommandLine => {
-                return Outcome::Push(Box::new(CommandLine::new(
-                    self.kind(),
-                    self.mode,
-                    self.availability(ctx),
-                )));
+                let mut line = CommandLine::new(self.kind(), self.mode, self.availability(ctx));
+                if let Some(row) = rows.get(self.selected.min(last)) {
+                    line = line.with_target(row.row.entry, row.row.alias);
+                }
+                return Outcome::Push(Box::new(line));
             }
             Action::Quit => return Outcome::Effect(Effect::Quit { cancelled: false }),
             Action::Goto(GotoTarget::Recent) => {
