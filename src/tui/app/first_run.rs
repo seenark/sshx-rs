@@ -1,4 +1,4 @@
-use super::{Ctx, Effect, Outcome, Screen, finder::Finder, input_mode};
+use super::{Ctx, Effect, Outcome, Screen, cmdline::CommandLine, finder::Finder, input_mode};
 use crate::tui::widgets::block;
 use ratatui::{
     Frame,
@@ -60,6 +60,12 @@ impl FirstRun {
         }
     }
 
+    fn label(&mut self, scope: &str) {
+        if let Some(candidate) = self.candidates.get_mut(self.selected) {
+            candidate.root.scope = scope.to_string();
+        }
+    }
+
     fn current(&mut self) -> Option<&mut Candidate> {
         self.candidates.get_mut(self.selected)
     }
@@ -67,52 +73,41 @@ impl FirstRun {
 
 impl Screen for FirstRun {
     fn kind(&self) -> keymap::Screen {
-        keymap::Screen::Finder
+        keymap::Screen::FirstRun
     }
 
     fn input_mode(&self) -> InputMode {
         InputMode::Normal
     }
 
-    fn uses_keymap(&self) -> bool {
-        false
-    }
-
     fn availability(&self, _ctx: &Ctx) -> Availability {
         Availability::default()
     }
 
-    fn on_action(&mut self, _action: Action, _count: usize, _ctx: &Ctx) -> Outcome {
-        Outcome::Stay
-    }
-
-    fn on_key(&mut self, key: Key, ctx: &Ctx) -> Outcome {
+    fn on_action(&mut self, action: Action, _count: usize, ctx: &Ctx) -> Outcome {
         let last = self.candidates.len().saturating_sub(1);
-        match key {
-            Key::Char('j') | Key::Down => self.selected = (self.selected + 1).min(last),
-            Key::Char('k') | Key::Up => self.selected = self.selected.saturating_sub(1),
-            Key::Char('x' | ' ') => {
+        match action {
+            Action::Down => self.selected = (self.selected + 1).min(last),
+            Action::Up => self.selected = self.selected.saturating_sub(1),
+            Action::ToggleRow => {
                 if let Some(candidate) = self.current() {
                     candidate.ticked = !candidate.ticked;
                 }
             }
-            Key::Char('p') => {
-                if let Some(candidate) = self.current() {
-                    candidate.root.scope = "personal".to_string();
-                }
-            }
-            Key::Char('w') => {
-                if let Some(candidate) = self.current() {
-                    candidate.root.scope = "work".to_string();
-                }
-            }
-            Key::Char('s') => {
+            Action::LabelPersonal => self.label("personal"),
+            Action::LabelWork => self.label("work"),
+            Action::Back => {
                 return Outcome::Replace(Box::new(Finder::new(input_mode(ctx.prefs.startmode))));
             }
-            Key::Char('q') | Key::Esc => {
-                return Outcome::Effect(Effect::Quit { cancelled: false });
+            Action::Quit => return Outcome::Effect(Effect::Quit { cancelled: false }),
+            Action::CommandLine => {
+                return Outcome::Push(Box::new(CommandLine::new(
+                    self.kind(),
+                    self.input_mode(),
+                    self.availability(ctx),
+                )));
             }
-            Key::Enter => {
+            Action::Confirm => {
                 let roots = self
                     .candidates
                     .iter()
@@ -126,6 +121,10 @@ impl Screen for FirstRun {
             }
             _ => {}
         }
+        Outcome::Stay
+    }
+
+    fn on_key(&mut self, _key: Key, _ctx: &Ctx) -> Outcome {
         Outcome::Stay
     }
 
@@ -160,7 +159,7 @@ impl Screen for FirstRun {
         }
         lines.push(Line::default());
         lines.push(Line::from(Span::styled(
-            "x tick · p personal · w work · enter save · s skip · q quit",
+            "x tick · p personal · w work · enter save · s skip · q quit · ? help",
             Style::default().fg(Color::DarkGray),
         )));
         frame.render_widget(

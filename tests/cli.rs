@@ -8619,38 +8619,405 @@ fn tui_connect_pre_start_interrupt_returns_to_the_finder_and_stays_cancellable()
 
 #[cfg(unix)]
 #[test]
-fn tui_connect_rejects_custom_forwards_and_password_descriptors_before_the_ui() {
+fn tui_connect_with_a_local_forward_shows_the_fixed_row_and_connects_with_it() {
     let (root, home) = fixture_root();
     let config = home.join(".ssh/config");
     write(&config, "Host prod\n  HostName prod.example\n");
     let bin = fake_ssh(&root);
-    for (extra, code) in [
-        (
-            &["-L", "127.0.0.1:15432:db.internal:5432"][..],
-            "TUI_FORWARD_UNSUPPORTED",
-        ),
-        (
-            &["-R", "127.0.0.1:15432:db.internal:5432"][..],
-            "TUI_FORWARD_UNSUPPORTED",
-        ),
-        (&["-D", "127.0.0.1:1080"][..], "TUI_FORWARD_UNSUPPORTED"),
-        (&["--password-fd", "99"][..], "TUI_PASSWORD_FD_UNSUPPORTED"),
-    ] {
-        let mut args = vec![
+    let port = free_local_port();
+    let forward = format!("127.0.0.1:{port}:db.internal:5432");
+    let stop = Arc::new(AtomicBool::new(false));
+    let listener_stop = Arc::clone(&stop);
+    let started = root.join("master-started");
+    let listener_thread = thread::spawn(move || {
+        while !started.exists() && !listener_stop.load(Ordering::Relaxed) {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let _listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+        while !listener_stop.load(Ordering::Relaxed) {
+            thread::sleep(Duration::from_millis(10));
+        }
+    });
+    let (status, output) = run_with_pty_interactions(
+        &home,
+        &[
             "--config",
             config.to_str().unwrap(),
             "tui",
             "connect",
             "prod",
-        ];
-        args.extend_from_slice(extra);
-        let (status, output) =
-            run_with_pty_interactions(&home, &args, &bin, &root, &[], None, None);
-        assert_eq!(status.code(), Some(2), "{extra:?}: {output}");
-        assert!(output.contains(code), "{extra:?}: {output}");
-        assert!(!output.contains("Search:"), "{extra:?}: {output}");
-    }
+            "-L",
+            forward.as_str(),
+        ],
+        &bin,
+        &root,
+        &[(b"ports \xc2\xb7 prod", b"\r")],
+        None,
+        Some((100, 30)),
+    );
+    stop.store(true, Ordering::Relaxed);
+    listener_thread.join().unwrap();
+    assert!(status.success(), "status={status:?} output={output}");
+    assert!(
+        contains_tui_text(
+            output.as_bytes(),
+            format!("-L {forward} (from command line)").as_bytes()
+        ),
+        "{output}"
+    );
+    let runtime = fs::read_to_string(root.join("runtime-config")).unwrap();
+    assert!(
+        runtime.contains(&format!("LocalForward 127.0.0.1:{port} db.internal:5432")),
+        "{runtime}"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn tui_connect_with_a_pair_route_still_rejects_custom_forwards() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(
+        &config,
+        concat!(
+            "Host gateway\n",
+            "  HostName gateway.example\n",
+            "  LocalForward 2200 vm.internal:22\n",
+            "Host vm\n",
+            "  HostName vm.internal\n",
+            "  Port 22\n",
+        ),
+    );
+    let setup = run(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "pair",
+            "setup",
+            "gateway",
+            "vm",
+            "--yes",
+            "--no-input",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(setup.status.success(), "{setup:?}");
+    let bin = fake_ssh(&root);
+    let (status, output) = run_with_pty_interactions(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "tui",
+            "connect",
+            "vm",
+            "-D",
+            "127.0.0.1:1080",
+        ],
+        &bin,
+        &root,
+        &[],
+        None,
+        None,
+    );
+    assert_eq!(status.code(), Some(2), "{output}");
+    assert!(output.contains("PAIR_FORWARD_INVALID"), "{output}");
     assert!(!root.join("master-started").exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn tui_connect_bind_opens_the_ports_screen_for_the_chosen_host() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(
+        &config,
+        "Host prod\n  HostName prod.example\n  ##SSHX SERVICE 6379\n",
+    );
+    let bin = fake_ssh(&root);
+    let (status, output) = run_with_pty_interactions(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "tui",
+            "connect",
+            "--bind",
+        ],
+        &bin,
+        &root,
+        &[(b"Search:", b"\r"), (b"ports \xc2\xb7 prod", b"\x03")],
+        None,
+        Some((100, 30)),
+    );
+    assert_eq!(status.code(), Some(130), "{output}");
+    assert!(
+        contains_tui_text(output.as_bytes(), b"[ ] localhost:6379 \xe2\x86\x92 6379"),
+        "{output}"
+    );
+    assert!(!root.join("master-started").exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn tui_tunnel_start_with_a_local_forward_starts_it_without_service_rows() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(&config, "Host direct\n  HostName direct.example\n");
+    let port = free_local_port();
+    let forward = format!("127.0.0.1:{port}:db.internal:5432");
+    let bin = fake_tunnel_ssh(&root);
+    let (status, output) = run_with_pty_interactions(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "tui",
+            "tunnel",
+            "start",
+            "direct",
+            "-L",
+            forward.as_str(),
+        ],
+        &bin,
+        &root,
+        &[(b"start tunnel", b"\r"), (b"dt-", b"q")],
+        None,
+        Some((100, 30)),
+    );
+    assert!(status.success(), "status={status:?} output={output}");
+    assert!(
+        contains_tui_text(
+            output.as_bytes(),
+            format!("-L {forward} (from command line)").as_bytes()
+        ),
+        "{output}"
+    );
+    let ssh_args = fs::read_to_string(root.join("runtime-config.args")).unwrap();
+    assert!(ssh_args.contains(&format!("-L {forward}")), "{ssh_args}");
+    let listed = run_fake_ssh(&home, &["tunnel", "list", "--format", "json"], &bin, &root);
+    let tunnels: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    let id = tunnels["tunnels"][0]["id"].as_str().unwrap();
+    let stopped = run_fake_ssh(&home, &["tunnel", "stop", id], &bin, &root);
+    assert!(stopped.status.success(), "{stopped:?}");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn tunnel_retry_keeps_tunnel_mode_and_reuses_password_fd() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    let local_port = free_local_port();
+    write(
+        &config,
+        &format!(
+            "Host direct\n  HostName direct.example\n  ##PORT 5432\n  ##SSHX SERVICE 5432 LOCAL={local_port}\n"
+        ),
+    );
+    let bin = fake_tunnel_ssh(&root);
+    fake_sshpass(&root);
+    let ssh = bin.join("ssh");
+    let script = fs::read_to_string(&ssh).unwrap();
+    let needle = "  *\" -N \"*)\n";
+    let fail_once = concat!(
+        "  *\" -N \"*)\n",
+        "    if [ ! -f \"$SSHX_CAPTURE.failed-once\" ]; then\n",
+        "      : > \"$SSHX_CAPTURE.failed-once\"\n",
+        "      echo \"Permission denied, please try again.\" >&2\n",
+        "      exit 5\n",
+        "    fi\n",
+    );
+    assert!(script.contains(needle));
+    fs::write(&ssh, script.replacen(needle, fail_once, 1)).unwrap();
+    let sshpass = root.join("bin/sshpass");
+    let script = fs::read_to_string(&sshpass).unwrap();
+    let capture = r#"[ -n "$SSHX_PASSWORD_CAPTURE" ] && eval "cat <&$password_fd" > "$SSHX_PASSWORD_CAPTURE""#;
+    let replacement = r#"eval "cat <&$password_fd" >> "$SSHX_CAPTURE.passwords""#;
+    assert!(script.contains(capture));
+    fs::write(&sshpass, script.replace(capture, replacement)).unwrap();
+    let password_fd = password_pipe(b"retry-secret\n");
+    let password_fd_arg = password_fd.to_string();
+    let (status, output) = run_with_pty_interactions(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "tunnel",
+            "direct",
+            "start",
+            "direct",
+            "--password-fd",
+            &password_fd_arg,
+        ],
+        &bin,
+        &root,
+        &[
+            (b"start tunnel", b"x\r"),
+            (b"Password for direct host `direct` (replacement):", b"\n"),
+            (b"SSH_AUTH_FAILED", b"\x1b"),
+            (b"start tunnel", b"\r"),
+            (b"dt-", b"q"),
+        ],
+        None,
+        Some((100, 30)),
+    );
+    unsafe {
+        libc::close(password_fd);
+    }
+    assert!(status.success(), "status={status:?} output={output}");
+    assert!(!output.contains("direct-shell"), "{output}");
+    assert!(!output.contains("retry-secret"), "password was rendered");
+    assert_eq!(
+        fs::read_to_string(root.join("runtime-config.passwords"))
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["retry-secret", "retry-secret"]
+    );
+    let listed = run_fake_ssh(
+        &home,
+        &["tunnel", "direct", "list", "--format", "json"],
+        &bin,
+        &root,
+    );
+    let document: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    let id = document["tunnels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tunnel| tunnel["state"] == "active")
+        .and_then(|tunnel| tunnel["id"].as_str())
+        .expect("retry should leave an active standalone Tunnel");
+    let stopped = run_fake_ssh(
+        &home,
+        &["tunnel", "direct", "stop", id, "--format", "json"],
+        &bin,
+        &root,
+    );
+    assert!(stopped.status.success(), "{stopped:?}");
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// A pipe preloaded with `password`, inheritable by children; returns the read end.
+#[cfg(unix)]
+fn password_pipe(password: &[u8]) -> libc::c_int {
+    let mut fds = [-1; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    let mut writer = unsafe { fs::File::from_raw_fd(fds[1]) };
+    writer.write_all(password).unwrap();
+    drop(writer);
+    let flags = unsafe { libc::fcntl(fds[0], libc::F_GETFD) };
+    assert!(flags >= 0);
+    assert_eq!(
+        unsafe { libc::fcntl(fds[0], libc::F_SETFD, flags & !libc::FD_CLOEXEC) },
+        0
+    );
+    fds[0]
+}
+
+#[cfg(unix)]
+#[test]
+fn paired_retry_reuses_gateway_and_vm_password_fds() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    write(
+        &config,
+        concat!(
+            "##SSHX ID=11111111-1111-4111-8111-111111111111\n",
+            "##SSHX VM=22222222-2222-4222-8222-222222222222\n",
+            "Host gateway\n",
+            "  HostName gateway.example\n",
+            "  LocalForward 2200 vm.internal:22\n",
+            "##SSHX ID=22222222-2222-4222-8222-222222222222\n",
+            "##SSHX GATEWAY=11111111-1111-4111-8111-111111111111\n",
+            "##SSHX TRANSIT=vm.internal:22\n",
+            "Host vm\n",
+            "  HostName vm.internal\n",
+            "  Port 22\n",
+        ),
+    );
+    let bin = paired_fake_ssh(&root);
+    let ssh = bin.join("ssh");
+    let script = fs::read_to_string(&ssh).unwrap();
+    let fail_once = script.replace(
+        r#"if [ "$SSHX_PAIRED_FAIL_ROLE" = "VM" ] && grep -q '^Host vm$' "$config"; then"#,
+        r#"if grep -q '^Host vm$' "$config" && [ ! -f "$SSHX_CAPTURE.vm-failed-once" ]; then
+      : > "$SSHX_CAPTURE.vm-failed-once""#,
+    );
+    assert_ne!(script, fail_once);
+    fs::write(ssh, fail_once).unwrap();
+    let sshpass = bin.join("sshpass");
+    let script = fs::read_to_string(&sshpass).unwrap();
+    let gateway_capture = r#"eval "cat <&$password_fd" > "$SSHX_PAIRED_GATEWAY_PASSWORD""#;
+    let vm_capture = r#"eval "cat <&$password_fd" > "$SSHX_PAIRED_VM_PASSWORD""#;
+    assert!(script.contains(gateway_capture));
+    assert!(script.contains(vm_capture));
+    let script = script
+        .replace(
+            gateway_capture,
+            r#"eval "cat <&$password_fd" >> "$SSHX_CAPTURE.gateway-passwords""#,
+        )
+        .replace(
+            vm_capture,
+            r#"eval "cat <&$password_fd" >> "$SSHX_CAPTURE.vm-passwords""#,
+        );
+    fs::write(sshpass, script).unwrap();
+    let gateway_fd = password_pipe(b"gateway-secret\n");
+    let vm_fd = password_pipe(b"vm-secret\n");
+    let gateway_fd_arg = gateway_fd.to_string();
+    let vm_fd_arg = vm_fd.to_string();
+    let (status, output) = run_with_pty_interactions(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "tui",
+            "connect",
+            "vm",
+            "--gateway-password-fd",
+            &gateway_fd_arg,
+            "--vm-password-fd",
+            &vm_fd_arg,
+        ],
+        &bin,
+        &root,
+        &[
+            (b"ports \xc2\xb7 vm", b"\r"),
+            (b"Password for VM `vm` (replacement):", b"\n"),
+            (b"ssh vm failed", b"r"),
+            (b"Save replacement password for gateway `gateway`?", b"n\n"),
+            (b"Save replacement password for VM `vm`?", b"n\n"),
+        ],
+        None,
+        Some((100, 30)),
+    );
+    unsafe {
+        libc::close(gateway_fd);
+        libc::close(vm_fd);
+    }
+    assert!(status.success(), "status={status:?} output={output}");
+    assert_eq!(
+        fs::read_to_string(root.join("runtime-config.gateway-passwords"))
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["gateway-secret", "gateway-secret"]
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("runtime-config.vm-passwords"))
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["vm-secret", "vm-secret"]
+    );
+    assert!(!output.contains("gateway-secret"), "{output}");
+    assert!(!output.contains("vm-secret"), "{output}");
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -8903,8 +9270,11 @@ fn interrupted_tunnel_start_exits_and_cleans_resources() {
         None,
         Some((80, 24)),
     );
-    assert!(!status.success(), "status={status:?} output={output}");
-    assert!(output.contains("SESSION_INTERRUPTED"), "{output}");
+    assert_eq!(
+        status.code(),
+        Some(130),
+        "status={status:?} output={output}"
+    );
     assert!(!root.join("master-started").exists());
     assert!(root.join("master-closed").exists());
     drop(
@@ -9327,33 +9697,5 @@ fn host_rename_picker_preserves_selected_alias_and_identity() {
             "  HostName second.example\n",
         )
     );
-    fs::remove_dir_all(root).unwrap();
-}
-
-#[cfg(unix)]
-#[test]
-fn host_form_continuations_reject_the_preview_flag_before_the_ui() {
-    let (root, home) = fixture_root();
-    let config = home.join(".ssh/config");
-    let original = "Host prod\n  HostName prod.example\n";
-    write(&config, original);
-    let bin = root.join("bin");
-    fs::create_dir(&bin).unwrap();
-    for args in [
-        &["host", "update", "prod", "--preview"][..],
-        &["host", "delete", "--preview"][..],
-        &["tui", "host", "create", "--preview"][..],
-    ] {
-        let mut full = vec!["--config", config.to_str().unwrap()];
-        full.extend_from_slice(args);
-        let (status, output) =
-            run_with_pty_interactions(&home, &full, &bin, &root, &[], None, None);
-        assert_eq!(status.code(), Some(2), "{args:?}: {output}");
-        assert!(
-            output.contains("PREVIEW_TUI_CONFLICT"),
-            "{args:?}: {output}"
-        );
-    }
-    assert_eq!(fs::read_to_string(&config).unwrap(), original);
     fs::remove_dir_all(root).unwrap();
 }

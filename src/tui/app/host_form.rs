@@ -1,4 +1,6 @@
-use super::{Ctx, Effect, EffectResult, Outcome, Runtime, Screen, help::Help, undo::Rekey};
+use super::{
+    Ctx, Effect, EffectResult, Outcome, Preview, Runtime, Screen, help::Help, undo::Rekey,
+};
 use crate::tui::matcher::matching_rows;
 use crate::tui::widgets::{block, password_backspace, password_insert};
 use ratatui::{
@@ -124,6 +126,24 @@ impl EditorRequest {
 }
 
 impl HostWrite {
+    /// The text `--preview` prints without the TUI.
+    fn review(&self, preview: Preview) -> Result<String, String> {
+        match self {
+            HostWrite::Create(request) => sshx::output::render_create(
+                &mutation::plan_create(request)?,
+                sshx::output::OutputFormat::Human,
+                false,
+            ),
+            HostWrite::Update { request, .. } => {
+                let mut plan = mutation::plan_update(request)?;
+                if let Preview::Edit(operation) = preview {
+                    plan.operation = operation;
+                }
+                sshx::output::render_edit(&plan, sshx::output::OutputFormat::Human, false)
+            }
+        }
+    }
+
     /// The exact lines the engine will write or change, password masked.
     fn preview(&self) -> Result<Vec<String>, String> {
         let files = match self {
@@ -453,15 +473,21 @@ impl HostForm {
         };
     }
 
-    fn save(&self, close: bool) -> Outcome {
+    fn save(&self, close: bool, ctx: &Ctx) -> Outcome {
         match self.build() {
             Err(error) => Outcome::Toast(error),
             Ok(None) => Outcome::Toast("no changes to write".to_string()),
-            Ok(Some(write)) => Outcome::Effect(Effect::SaveHost(Box::new(SaveRequest {
-                write,
-                alias: self.text(Field::Alias).to_string(),
-                close,
-            }))),
+            Ok(Some(write)) => match ctx.intent.preview {
+                Some(preview) => match write.review(preview) {
+                    Ok(text) => Outcome::Effect(Effect::Print(text)),
+                    Err(error) => Outcome::Toast(error),
+                },
+                None => Outcome::Effect(Effect::SaveHost(Box::new(SaveRequest {
+                    write,
+                    alias: self.text(Field::Alias).to_string(),
+                    close,
+                }))),
+            },
         }
     }
 
@@ -536,8 +562,8 @@ impl HostForm {
         let text = self.command.take().unwrap_or_default();
         self.mode = InputMode::Normal;
         match keymap::parse_command(&text) {
-            Ok(Command::Write) => self.save(false),
-            Ok(Command::WriteQuit) => self.save(true),
+            Ok(Command::Write) => self.save(false, ctx),
+            Ok(Command::WriteQuit) => self.save(true, ctx),
             Ok(Command::Quit) => Outcome::Pop,
             Ok(Command::Help) => Outcome::Push(Box::new(Help::new(
                 keymap::Screen::HostForm,
@@ -636,8 +662,8 @@ impl Screen for HostForm {
                 self.command = Some(String::new());
                 self.mode = InputMode::Insert;
             }
-            Action::Write => return self.save(false),
-            Action::WriteQuit => return self.save(true),
+            Action::Write => return self.save(false, ctx),
+            Action::WriteQuit => return self.save(true, ctx),
             Action::Quit | Action::Back => return Outcome::Pop,
             _ => {}
         }
@@ -677,10 +703,13 @@ impl Screen for HostForm {
     }
 
     fn draw(&self, frame: &mut Frame, area: Rect, ctx: &Ctx) {
-        let title = match &self.edit {
+        let mut title = match &self.edit {
             Some(edit) => format!(" edit host · {} ", edit.alias),
             None => " new host ".to_string(),
         };
+        if ctx.intent.preview.is_some() {
+            title.push_str("· preview only: :w prints the review, nothing is written ");
+        }
         let outer = block(title, Color::Cyan);
         let inner = outer.inner(area);
         frame.render_widget(outer, area);

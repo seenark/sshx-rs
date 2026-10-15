@@ -116,6 +116,7 @@ pub enum Screen {
     Tunnels,
     TunnelProgress,
     Failure,
+    FirstRun,
     Help,
     CommandLine,
 }
@@ -131,6 +132,7 @@ pub enum Section {
     Tunnels,
     Form,
     Failure,
+    Setup,
     Nav,
     Modes,
     General,
@@ -146,6 +148,7 @@ impl Section {
             Section::Tunnels => "TUNNELS",
             Section::Form => "FORM",
             Section::Failure => "FAILURE",
+            Section::Setup => "SETUP",
             Section::Nav => "NAV",
             Section::Modes => "MODES",
             Section::General => "GENERAL",
@@ -160,6 +163,7 @@ impl Section {
             Screen::DeleteConfirm => Section::Hosts,
             Screen::Tunnels | Screen::TunnelProgress => Section::Tunnels,
             Screen::Failure => Section::Failure,
+            Screen::FirstRun => Section::Setup,
             Screen::Help | Screen::CommandLine => Section::General,
         }
     }
@@ -237,6 +241,8 @@ pub enum Action {
     Complete,
     Retry,
     ShowLog,
+    LabelPersonal,
+    LabelWork,
 }
 
 impl Action {
@@ -363,6 +369,7 @@ const FORM: &[Screen] = &[Screen::HostForm];
 const CONFIRM: &[Screen] = &[Screen::DeleteConfirm];
 const TUNNELS: &[Screen] = &[Screen::Tunnels];
 const FAILURE: &[Screen] = &[Screen::Failure];
+const FIRST_RUN: &[Screen] = &[Screen::FirstRun];
 const HELP: &[Screen] = &[Screen::Help];
 const COMMAND_LINE: &[Screen] = &[Screen::CommandLine];
 const ALL_SCREENS: &[Screen] = &[
@@ -373,6 +380,7 @@ const ALL_SCREENS: &[Screen] = &[
     Screen::Tunnels,
     Screen::TunnelProgress,
     Screen::Failure,
+    Screen::FirstRun,
     Screen::Help,
     Screen::CommandLine,
 ];
@@ -391,6 +399,7 @@ const NOT_OVERLAY: &[Screen] = &[
     Screen::Tunnels,
     Screen::TunnelProgress,
     Screen::Failure,
+    Screen::FirstRun,
 ];
 const QUITTABLE: &[Screen] = &[
     Screen::Finder,
@@ -398,12 +407,14 @@ const QUITTABLE: &[Screen] = &[
     Screen::Tunnels,
     Screen::TunnelProgress,
     Screen::Failure,
+    Screen::FirstRun,
 ];
 const COMMANDABLE: &[Screen] = &[
     Screen::Finder,
     Screen::Ports,
     Screen::HostForm,
     Screen::Tunnels,
+    Screen::FirstRun,
 ];
 const TUNNEL_LISTING: &[Screen] = &[Screen::Finder, Screen::Ports, Screen::Tunnels];
 const BACKABLE: &[Screen] = &[
@@ -536,6 +547,17 @@ static BINDINGS: &[Binding] = &[
     bind("e", NORMAL, FAILURE, A::EditHostForm, S::Failure, "Edit host"),
     bind("y", NORMAL, FAILURE, A::Copy(CopyTarget::VerboseSshCommand), S::Failure, "Copy ssh -v command"),
     bind("l", NORMAL, FAILURE, A::ShowLog, S::Failure, "Show full log"),
+
+    // First run
+    bind("j", NORMAL, FIRST_RUN, A::Down, S::Setup, "Next config file"),
+    bind("<down>", NORMAL, FIRST_RUN, A::Down, S::Setup, "Next config file"),
+    bind("k", NORMAL, FIRST_RUN, A::Up, S::Setup, "Previous config file"),
+    bind("<up>", NORMAL, FIRST_RUN, A::Up, S::Setup, "Previous config file"),
+    bind("x", NORMAL, FIRST_RUN, A::ToggleRow, S::Setup, "Tick or untick config file"),
+    bind("p", NORMAL, FIRST_RUN, A::LabelPersonal, S::Setup, "Label personal"),
+    bind("w", NORMAL, FIRST_RUN, A::LabelWork, S::Setup, "Label work"),
+    bind("<enter>", NORMAL, FIRST_RUN, A::Confirm, S::Setup, "Save ticked config files"),
+    bind("s", NORMAL, FIRST_RUN, A::Back, S::Setup, "Skip setup"),
 
     // Back / dismiss
     bind("<esc>", NORMAL, BACKABLE, A::Back, S::General, "Back"),
@@ -1168,6 +1190,12 @@ mod tests {
         let n = InputMode::Normal;
         assert_eq!(run("x", n, Screen::Ports), act(ToggleRow));
         assert_eq!(run("o", n, Screen::Ports), act(AddRow));
+        assert_eq!(run("x", n, Screen::FirstRun), act(ToggleRow));
+        assert_eq!(run("w", n, Screen::FirstRun), act(LabelWork));
+        assert_eq!(run("<enter>", n, Screen::FirstRun), act(Confirm));
+        assert_eq!(run("q", n, Screen::FirstRun), act(Quit));
+        assert_eq!(run("?", n, Screen::FirstRun), act(Help));
+        assert_eq!(run("<esc>", n, Screen::FirstRun), Step::Unmapped);
         assert_eq!(run("dd", n, Screen::Ports), act(DeleteRow));
         assert_eq!(run("s", n, Screen::Ports), act(SaveRow));
         assert_eq!(run("space t t", n, Screen::Ports), act(TunnelStart));

@@ -1,4 +1,8 @@
-use super::{Ctx, Effect, EffectResult, ForwardRequest, Outcome, Runtime, Screen, service_bind};
+use super::{
+    Ctx, Effect, EffectResult, FixedForwards, ForwardRequest, Outcome, Runtime, Screen,
+    service_bind,
+};
+use crate::tui::CANCELLED;
 use crate::tui::widgets::block;
 use ratatui::{
     Frame,
@@ -84,6 +88,7 @@ fn already_active(
     prefs: &Preferences,
     home: &Path,
     entries: &[HostEntry],
+    fixed: &FixedForwards,
     request: &TunnelStartRequest,
 ) -> Result<bool, String> {
     let route = sshx::pair::paired_route(entries, &request.entry)?;
@@ -99,7 +104,14 @@ fn already_active(
             sshx::tunnel::has_active_paired_request(route, home, gateway, &request.alias, &forwards)
         }
         None => {
-            let specs = sshx::tunnel::parse_forwards(&direct_specs(&forwards), &[], &[], false)?;
+            let mut local = direct_specs(&forwards);
+            local.extend(fixed.local.iter().cloned());
+            let specs = sshx::tunnel::parse_forwards(
+                &local,
+                &fixed.remote,
+                &fixed.dynamic,
+                fixed.allow_bind,
+            )?;
             sshx::tunnel::has_active_direct_request(&request.entry, home, &request.alias, &specs)
         }
     })
@@ -126,9 +138,6 @@ pub(super) fn begin(
     alias: &str,
     forwards: Vec<ForwardRequest>,
 ) -> Outcome {
-    if forwards.is_empty() {
-        return Outcome::Toast(NO_FORWARDS.to_string());
-    }
     let bind = match service_bind(ctx.prefs) {
         Ok(bind) => bind,
         Err(error) => return Outcome::Toast(error),
@@ -138,7 +147,21 @@ pub(super) fn begin(
         alias: alias.to_string(),
         forwards,
     };
-    if already_active(ctx.prefs, ctx.home, ctx.entries, &request).unwrap_or(false) {
+    if request.forwards.is_empty() {
+        return if ctx.intent.fixed.is_empty() {
+            Outcome::Toast(NO_FORWARDS.to_string())
+        } else {
+            Outcome::Effect(Effect::TunnelStart(Box::new(request)))
+        };
+    }
+    let active = already_active(
+        ctx.prefs,
+        ctx.home,
+        ctx.entries,
+        &ctx.intent.fixed,
+        &request,
+    );
+    if active.unwrap_or(false) {
         return Outcome::Effect(Effect::TunnelStart(Box::new(request)));
     }
     let mut preflight = Preflight {
@@ -190,7 +213,14 @@ pub(super) fn begin_many(ctx: &Ctx, rows: &[(&HostEntry, &str)]) -> Outcome {
             alias: (*alias).to_string(),
             forwards,
         };
-        if !already_active(ctx.prefs, ctx.home, ctx.entries, &request).unwrap_or(false)
+        if !already_active(
+            ctx.prefs,
+            ctx.home,
+            ctx.entries,
+            &ctx.intent.fixed,
+            &request,
+        )
+        .unwrap_or(false)
             && let Some((_, message)) = bound_issues(&request.forwards, &bind).into_iter().next()
         {
             batch
@@ -575,14 +605,20 @@ fn interrupted(error: &str) -> bool {
 /// Standalone tunnel start in cooked mode: the registry request is written only here, with the
 /// ports that survived preflight. Failures stay on the evidence screen.
 pub(super) fn start(
-    runtime: &Runtime,
+    runtime: &mut Runtime,
     request: &TunnelStartRequest,
 ) -> Result<EffectResult, String> {
     let data = &runtime.data;
-    let reused =
-        already_active(&data.prefs, &data.home, &data.catalog.entries, request).unwrap_or(false);
+    let reused = already_active(
+        &data.prefs,
+        &data.home,
+        &data.catalog.entries,
+        &data.intent.fixed,
+        request,
+    )
+    .unwrap_or(false);
     match open(runtime, request) {
-        Err(error) if interrupted(&error) => Err(error),
+        Err(error) if interrupted(&error) => Err(CANCELLED.to_string()),
         result => {
             let mut screen = TunnelProgress::finished(&request.alias, result);
             screen.reused = reused;
@@ -596,11 +632,14 @@ pub(super) fn start(
 }
 
 /// Starts each request in turn and reports every outcome, started or not, on one screen.
-pub(super) fn start_many(runtime: &Runtime, batch: &TunnelBatch) -> Result<EffectResult, String> {
+pub(super) fn start_many(
+    runtime: &mut Runtime,
+    batch: &TunnelBatch,
+) -> Result<EffectResult, String> {
     let mut lines = Vec::new();
     for request in &batch.starts {
         match open(runtime, request) {
-            Err(error) if interrupted(&error) => return Err(error),
+            Err(error) if interrupted(&error) => return Err(CANCELLED.to_string()),
             Err(error) => lines.push((false, format!("{}: {error}", request.alias))),
             Ok(view) => {
                 lines.push((true, format!("{} → tunnel {}", request.alias, view.id)));
@@ -620,8 +659,10 @@ pub(super) fn start_many(runtime: &Runtime, batch: &TunnelBatch) -> Result<Effec
     })
 }
 
-fn open(runtime: &Runtime, request: &TunnelStartRequest) -> Result<TunnelView, String> {
+fn open(runtime: &mut Runtime, request: &TunnelStartRequest) -> Result<TunnelView, String> {
+    let cli = runtime.cli;
     let data = &runtime.data;
+    let fixed = &data.intent.fixed;
     if data
         .catalog
         .diagnostics
@@ -646,7 +687,10 @@ fn open(runtime: &Runtime, request: &TunnelStartRequest) -> Result<TunnelView, S
     {
         return Err(changed());
     }
-    crate::check_start_route(runtime.cli, route.is_some())?;
+    crate::check_start_route(cli, route.is_some())?;
+    if route.is_some() {
+        fixed.check_direct_route()?;
+    }
     let target = route.as_ref().map_or(&request.entry, |route| &route.vm);
     let forwards = super::resolve_forwards(&data.prefs, target, &request.forwards)?;
     let response = match &route {
@@ -663,24 +707,27 @@ fn open(runtime: &Runtime, request: &TunnelStartRequest) -> Result<TunnelView, S
                 &request.alias,
                 false,
                 sshx::connect::PairedCredentials {
-                    gateway_password_fd: None,
-                    vm_password_fd: None,
+                    gateway_password_fd: cli.gateway_password_fd,
+                    vm_password_fd: cli.vm_password_fd.or(cli.password_fd),
                 },
                 &forwards,
             )?
         }
         None => {
-            let local = direct_specs(&forwards);
+            let mut local = direct_specs(&forwards);
+            local.extend(fixed.local.iter().cloned());
             sshx::tunnel::start(
                 &request.entry,
                 &data.home,
                 &request.alias,
                 false,
-                &mut sshx::connect::StandaloneCredentials::new(None),
+                runtime
+                    .credentials
+                    .standalone(&request.entry.id, cli.password_fd),
                 &local,
-                &[],
-                &[],
-                false,
+                &fixed.remote,
+                &fixed.dynamic,
+                fixed.allow_bind,
                 &sshx::usage::used_from_service_forwards(&request.entry, &forwards),
             )?
         }

@@ -505,6 +505,19 @@ impl Screen for Ports {
         ])
         .areas(inner);
         let dim = Style::default().fg(Color::DarkGray);
+        let fixed = ctx.intent.fixed.rows();
+        let rows_area = if fixed.is_empty() {
+            rows_area
+        } else {
+            let height = u16::try_from(fixed.len())
+                .unwrap_or(u16::MAX)
+                .min(rows_area.height.saturating_sub(1));
+            let [top, rest] =
+                Layout::vertical([Constraint::Length(height), Constraint::Min(1)]).areas(rows_area);
+            let lines = fixed.into_iter().map(Line::from).collect::<Vec<_>>();
+            frame.render_widget(Paragraph::new(lines).style(dim), top);
+            rest
+        };
         if self.rows.is_empty() {
             frame.render_widget(
                 Paragraph::new("No service forwards yet. Press o to add one (REMOTE[=LOCAL]).")

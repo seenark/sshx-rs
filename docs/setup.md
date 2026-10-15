@@ -108,13 +108,13 @@ sshx doctor --format json
 - A which-key box opens on every prefix key (`space`, `g`, `y`, `d`, `c`, `Z`); `Esc` or `Backspace` goes up one level. `?` (Normal input mode, or Insert with an empty search) and `F1` open help, grouped by section and filterable.
 - `:` opens a command line with `Tab` completion: `:q`, `:help`, `:ssh HOST [REMOTE[=LOCAL]...]`, `:set OPTION[=VALUE]`, `:root add|remove PATH`, `:tunnel list`. `:set` persists `startmode` (`insert`|`normal`), `autoinfo` (`false` hides the which-key box), `bind` (loopback only), `clipboard_clear` (`off` or seconds), and `password_confirm` in the sshx settings file.
 - The status line shows input mode, config-root filter, position, running standalone tunnels, toast, and pending keys.
-- With no registered config roots, a first-run screen lists detected SSH config files (`~/.ssh/config`, `~/.ssh/config.d/*`). Tick with `x`, label with `p` (personal) or `w` (work), and press `Enter` to register them. `s` skips setup and `q` quits.
+- With no registered config roots, a first-run screen lists detected SSH config files (`~/.ssh/config`, `~/.ssh/config.d/*`). Tick with `x`, label with `p` (personal) or `w` (work), and press `Enter` to register them. `s` skips setup, `q` or `:q` quits, `?` lists these keys, and `Esc` never quits.
 
 ## List and select HostEntries
 
 A **HostEntry** is an exact `Host` block identified by source file and Host line. An alias is not a unique identity; duplicate aliases remain separate entries.
 
-In the finder, `d d` shows the exact block (passwords redacted) and asks `y`/`n`; `u` undoes it afterwards. Pair members and HostEntries used by a running standalone tunnel are refused. Incomplete `sshx host delete` opens the finder where `Enter` opens that confirmation, and `sshx tui host delete HOST` opens it for an exact HostEntry; both return to the finder afterwards. `--preview` is rejected with the TUI because there is no separate review step. Fully specified CLI deletion retains its existing consent behavior.
+In the finder, `d d` shows the exact block (passwords redacted) and asks `y`/`n`; `u` undoes it afterwards. Pair members and HostEntries used by a running standalone tunnel are refused. Incomplete `sshx host delete` opens the finder where `Enter` opens that confirmation, and `sshx tui host delete HOST` opens it for an exact HostEntry; both return to the finder afterwards. With `--preview`, `y` prints the review without deleting anything. Fully specified CLI deletion retains its existing consent behavior.
 
 ```sh
 sshx host list
@@ -130,7 +130,7 @@ sshx connect --id <entry-id> --no-input
 sshx connect db-prod --source ~/.ssh/hosts.conf --line 42 --no-input
 ```
 
-`sshx tui connect HOST`, `sshx tui tunnel start HOST`, and incomplete `connect` or `tunnel start` commands continue the requested operation on usable stdin and stderr terminals. Without a selector they open the finder (Enter starts a Session; for `tunnel start` Enter opens the ports screen in Tunnel mode); with an exact alias, ID, or source/line identity they open the ports screen for that HostEntry. Unknown, ambiguous, or conflicting explicit selectors and malformed forwarding options fail before the UI opens. `-L`, `-R`, `-D`, and password descriptors are rejected by TUI continuations: run the command with a selector instead.
+`sshx tui connect HOST`, `sshx tui tunnel start HOST`, and incomplete `connect` or `tunnel start` commands continue the requested operation on usable stdin and stderr terminals. Without a selector they open the finder (Enter starts a Session; for `tunnel start` Enter opens the ports screen in Tunnel mode); with an exact alias, ID, or source/line identity they open the ports screen for that HostEntry. Unknown, ambiguous, or conflicting explicit selectors and malformed forwarding options fail before the UI opens. `-L`, `-R` and `-D` (direct routes only; a Pair route rejects them with `PAIR_FORWARD_INVALID`) are listed on the ports screen as fixed rows such as `-L 127.0.0.1:15432:db.internal:5432 (from command line)` and open with the Session or Tunnel together with the checked service forwards. `--password-fd`, `--gateway-password-fd` and `--vm-password-fd` reach the Session or Tunnel exactly as without the TUI, and a retry after an authentication failure reuses the retained descriptor value. `--bind` opens the ports screen for the chosen HostEntry. An interrupted tunnel start exits `130`.
 
 Bare `sshx tui --id ID` or `sshx tui --source FILE --line N` prefills the exact Hosts row without locking subsequent browsing to that identity. Source selectors resolve the physical file identity, including normalized paths, and still require an exact Host line.
 
@@ -146,7 +146,7 @@ sshx host rename db-prod --alias database
 sshx host delete database
 ```
 
-Duplicate aliases need `--id`, or alias plus `--source` and `--line`. Complete CLI mutations keep preview and consent behavior. `--preview` writes nothing; `--yes` confirms explicitly.
+Duplicate aliases need `--id`, or alias plus `--source` and `--line`. Complete CLI mutations keep preview and consent behavior. `--preview` writes nothing; `--yes` confirms explicitly. With `--preview` the TUI form (or delete confirmation) says `preview only`, and `:w` (or `y`) prints the same review as the CLI and exits without writing.
 
 `sshx host update HOST` and `sshx host rename HOST` open the host form when no change is supplied; `sshx tui host update HOST --hostname DESTINATION` and `sshx tui host rename HOST --alias ALIAS` open it with the supplied values filled in. The form shows a live preview of the exact block that will be written; a stored password is never revealed, typing replaces it, and backspace clears it. Save with `:w`, `:wq` or `ZZ`; `:q` cancels. Without a selector the finder opens and `Enter` opens the form. `--no-input`, password stdin, and JSON/YAML output never open the form.
 
@@ -185,7 +185,7 @@ The finder preview shows the HostEntry ID, source file and Host line. Duplicate 
 
 Run `sshx host create` on a terminal to open the new-host form, or `sshx host create --alias prod` to open it with `prod` prefilled (`--hostname`, `--user`, `--port`, `--file` and a single matching `--scope`/`--project` root prefill too). Only alias and host are required. The `file` field picks a registered config root or included file. Password input stays masked and the destination file must deny group and other access before storing a password; new files use mode `0600`.
 
-The form previews the exact block while you type. Save with `:w`, `:wq` or `ZZ`; `:q` cancels without changing SSH config. `--preview` is rejected with the form; use it with a complete CLI command instead.
+The form previews the exact block while you type. Save with `:w`, `:wq` or `ZZ`; `:q` cancels without changing SSH config. With `--preview`, `:w` prints the review and exits without writing.
 
 A scope conflicting with explicit `--config` fails before opening the form. After saving, the form returns to the finder.
 Complete CLI commands run directly:
@@ -273,7 +273,7 @@ Custom listeners in direct Session and standalone Tunnel mode accept IPv4 and IP
 
 Session mode closes its session-bound master and forwards when the shell exits. A session started from the finder or a TUI continuation ends sshx with ssh's exit code. A standalone Tunnel remains active after leaving the TUI; use its displayed Tunnel ID to manage it.
 
-`--bind` selects declared `##PORT` services interactively. A requested local port conflict returns a row-specific error; sshx does not close an unrelated process or silently choose another port.
+`--bind` selects declared `##PORT` services interactively; with `sshx tui` or a finder continuation it opens the ports screen for the chosen HostEntry. A requested local port conflict returns a row-specific error; sshx does not close an unrelated process or silently choose another port.
 
 ## Standalone tunnel lifecycle
 
