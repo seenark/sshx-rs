@@ -415,6 +415,7 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
                         &forwards,
                         false,
                     )
+                    .and_then(finish_session)
                 } else {
                     let forwards = requested_forwards(entry, &cli)?;
                     let direct = sshx::tunnel::parse_forwards(
@@ -433,6 +434,7 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
                         &direct,
                         false,
                     )
+                    .and_then(finish_session)
                 }
             }
         }
@@ -519,6 +521,21 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
         | Command::TunnelChoose { .. }
         | Command::TunnelStatus(_)
         | Command::TunnelStop(_) => unreachable!(),
+    }
+}
+
+fn finish_session(code: i32) -> Result<(), String> {
+    if code != 0 {
+        process::exit(code);
+    }
+    Ok(())
+}
+
+fn session_status(code: i32) -> String {
+    if code == 0 {
+        "Session ended.".to_string()
+    } else {
+        format!("Session ended (exit {code}).")
     }
 }
 
@@ -1735,7 +1752,7 @@ fn run_connection_workspace(
                     &choice.forwards,
                     true,
                 )
-                .map(|()| "Session ended.".to_string())
+                .map(session_status)
             }
             (Some(route), tui::ConnectionMode::Tunnel) => {
                 let gateway_alias = route
@@ -1775,7 +1792,7 @@ fn run_connection_workspace(
                             true,
                         )
                     })
-                    .map(|()| "Session ended.".to_string())
+                    .map(session_status)
             }
             (None, tui::ConnectionMode::Tunnel) => {
                 let (declared, mut local, remote, dynamic) =
@@ -1799,10 +1816,7 @@ fn run_connection_workspace(
                 .map(|response| format!("Tunnel started: {}", response.tunnels[0].id))
             }
         };
-        let operation_completed = outcome.is_ok()
-            || outcome.as_ref().is_err_and(|error| {
-                error.starts_with("SESSION_EXIT:") || error.starts_with("VM_SESSION_EXIT:")
-            });
+        let operation_completed = outcome.is_ok();
         completed |= operation_completed;
         status = Some(outcome.unwrap_or_else(|error| error));
         if return_to_hosts && choice.mode == tui::ConnectionMode::Session && operation_completed
