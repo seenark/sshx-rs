@@ -1,5 +1,5 @@
 mod help;
-mod picker;
+mod tui;
 use serde::Serialize;
 use sshx::discovery::{
     Catalog, DiscoveryRoot, HostEntry, SourceIdentity, discover_roots, scope_for_path,
@@ -21,7 +21,7 @@ use std::process::{self, Stdio};
 fn main() {
     match run(env::args_os().skip(1).collect()) {
         Ok(()) => {}
-        Err(error) if error == picker::CANCELLED => {
+        Err(error) if error == tui::CANCELLED => {
             eprintln!("Cancelled.");
             process::exit(130);
         }
@@ -557,7 +557,7 @@ fn run_hosts(
     initial_status: Option<String>,
 ) -> Result<(), String> {
     let mut roots = roots.to_vec();
-    let mut state = picker::HostsState::default();
+    let mut state = tui::HostsState::default();
     state.editing_enabled = true;
     let mut status = initial_status;
     let mut prefill_selector =
@@ -630,7 +630,7 @@ fn run_hosts(
                     }
                     many => return Err(format_ambiguous("source and Host line", many)),
                 };
-                picker::Selection {
+                tui::Selection {
                     entry,
                     alias: entry.aliases.first().map_or("", String::as_str),
                 }
@@ -639,7 +639,7 @@ fn run_hosts(
             prefill_selector = false;
         }
         let sources = catalog_source_snapshots(&catalog);
-        let selection = match picker::browse_hosts(
+        let selection = match tui::browse_hosts(
             &filtered,
             &catalog.entries,
             &mut state,
@@ -653,7 +653,7 @@ fn run_hosts(
                 create.projects = cli.projects.clone();
                 match run_host_create(&create, &roots) {
                     Ok(()) => status = Some("HostEntry created.".to_string()),
-                    Err(error) if error == picker::CANCELLED => status = None,
+                    Err(error) if error == tui::CANCELLED => status = None,
                     Err(error) => status = Some(error),
                 }
                 continue;
@@ -672,7 +672,7 @@ fn run_hosts(
                         roots = settings::load(home)?;
                         Some("Config root registered.".to_string())
                     }
-                    Err(error) if error == picker::CANCELLED => None,
+                    Err(error) if error == tui::CANCELLED => None,
                     Err(error) => Some(error),
                 };
                 continue;
@@ -746,7 +746,7 @@ fn run_hosts(
                         "HostEntry updated.".to_string()
                     })
                 }
-                Err(error) if error == picker::CANCELLED => {
+                Err(error) if error == tui::CANCELLED => {
                     Some(if operation == MutationKind::Delete {
                         "HostEntry deletion cancelled.".to_string()
                     } else {
@@ -772,7 +772,7 @@ fn run_hosts(
             &catalog,
             selection,
             home,
-            picker::ConnectionMode::Session,
+            tui::ConnectionMode::Session,
             false,
             &mut standalone_credentials,
             &sources,
@@ -781,7 +781,7 @@ fn run_hosts(
             Ok(outcome) if outcome.quit => return Ok(()),
             Ok(outcome) if outcome.completed => outcome.status,
             Ok(_) => None,
-            Err(error) if error == picker::CANCELLED => None,
+            Err(error) if error == tui::CANCELLED => None,
             Err(error) => Some(error),
         };
     }
@@ -820,15 +820,15 @@ fn run_pairs_workspace(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), String
                 ),
             }
         }));
-        match picker::pairs_workspace(&pairs, &catalog.entries, &findings, status.as_deref())? {
-            picker::PairWorkspaceAction::Exit => return Ok(()),
-            picker::PairWorkspaceAction::Validate => {
+        match tui::pairs_workspace(&pairs, &catalog.entries, &findings, status.as_deref())? {
+            tui::PairWorkspaceAction::Exit => return Ok(()),
+            tui::PairWorkspaceAction::Validate => {
                 status = Some(
                     "Validation refreshed from SSH config; no files changed or OpenSSH started."
                         .to_string(),
                 );
             }
-            picker::PairWorkspaceAction::Setup => {
+            tui::PairWorkspaceAction::Setup => {
                 let mut pair = Cli::parse(vec!["pair".into(), "setup".into()])?;
                 pair.config = cli.config.clone();
                 pair.scopes = cli.scopes.clone();
@@ -836,26 +836,26 @@ fn run_pairs_workspace(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), String
                 pair.tui = true;
                 status = match run_pair(&pair, roots) {
                     Ok(()) => Some("Pair setup complete.".to_string()),
-                    Err(error) if error == picker::CANCELLED => {
+                    Err(error) if error == tui::CANCELLED => {
                         Some("Pair setup cancelled.".to_string())
                     }
                     Err(error) => Some(error),
                 };
             }
-            picker::PairWorkspaceAction::Delete(index) => {
+            tui::PairWorkspaceAction::Delete(index) => {
                 status = match pairs
                     .get(index)
                     .ok_or_else(|| "PAIR_SELECTION: selected Pair is no longer current".to_string())
                     .and_then(|selected| run_pair_delete_workspace(roots, selected))
                 {
                     Ok(()) => Some("Pair deleted. Both HostEntries kept.".to_string()),
-                    Err(error) if error == picker::CANCELLED => {
+                    Err(error) if error == tui::CANCELLED => {
                         Some("Pair deletion cancelled.".to_string())
                     }
                     Err(error) => Some(error),
                 };
             }
-            picker::PairWorkspaceAction::Recover => {
+            tui::PairWorkspaceAction::Recover => {
                 let recovered = (|| {
                     mutation::validate_mutation_roots(&configured)?;
                     let targets = mutation::pair_recovery_targets(&pending)?;
@@ -978,19 +978,19 @@ fn run_pair_delete_workspace(
         }
         Err(error) => {
             review.push_str(&format!("\n{error}\n"));
-            picker::mutation_review_workspace(
+            tui::mutation_review_workspace(
                 "Pair deletion blocked",
                 &review,
-                picker::MutationReviewMode::Blocked,
+                tui::MutationReviewMode::Blocked,
             )?;
             return Err(error);
         }
     };
-    if picker::mutation_review_workspace(
+    if tui::mutation_review_workspace(
         "Review Pair deletion",
         &review,
-        picker::MutationReviewMode::Delete,
-    )? == picker::MutationReviewAction::Apply
+        tui::MutationReviewMode::Delete,
+    )? == tui::MutationReviewAction::Apply
     {
         let catalog = current_catalog()?;
         current_plan(&catalog)?;
@@ -1010,7 +1010,7 @@ fn run_pair_delete_workspace(
         mutation::apply_pair(&reviewed_plan)?;
         Ok(())
     } else {
-        Err(picker::CANCELLED.to_string())
+        Err(tui::CANCELLED.to_string())
     }
 }
 
@@ -1027,9 +1027,9 @@ fn run_tunnels_workspace(
         let tunnels = sshx::tunnel::list(home, route)?.tunnels;
         let allowed = requested.map(|(action, _)| action);
         let (index, action) =
-            match picker::tunnels_workspace(&tunnels, status.as_deref(), selected, allowed) {
+            match tui::tunnels_workspace(&tunnels, status.as_deref(), selected, allowed) {
                 Ok(result) => result,
-                Err(error) if error == picker::CANCELLED && (requested.is_none() || completed) => {
+                Err(error) if error == tui::CANCELLED && (requested.is_none() || completed) => {
                     return Ok(());
                 }
                 Err(error) => return Err(error),
@@ -1091,10 +1091,10 @@ fn run_setup_workspace(cli: &Cli, home: &Path) -> Result<(), String> {
     let mut status = None;
     loop {
         let roots = settings::load(home)?;
-        let (edited, submit) = picker::setup_workspace(&roots, fields, status.as_deref())?;
+        let (edited, submit) = tui::setup_workspace(&roots, fields, status.as_deref())?;
         fields = edited;
         if !submit {
-            return Err(picker::CANCELLED.to_string());
+            return Err(tui::CANCELLED.to_string());
         }
         let path = settings::normalize_path(Path::new(fields[2].trim()), home);
         let scope = fields[0].trim();
@@ -1189,15 +1189,15 @@ fn run_tui_operation(cli: &Cli) -> Result<(), String> {
         | Command::TunnelDirectStart(selector)
         | Command::TunnelPairedStart(selector) => {
             let mode = if matches!(cli.command, Command::Connect(_)) {
-                picker::ConnectionMode::Session
+                tui::ConnectionMode::Session
             } else {
-                picker::ConnectionMode::Tunnel
+                tui::ConnectionMode::Tunnel
             };
             let label = match cli.action {
                 Some(HostAction::CopySsh) => "Copy SSH HostEntry",
                 Some(HostAction::CopySshx) => "Copy sshx HostEntry",
                 Some(HostAction::CopyPassword) => "Copy password HostEntry",
-                _ if mode == picker::ConnectionMode::Session => "Connect HostEntry",
+                _ if mode == tui::ConnectionMode::Session => "Connect HostEntry",
                 _ => "Tunnel HostEntry",
             };
             let initial = if selector.is_some() || cli.id.is_some() {
@@ -1248,7 +1248,7 @@ fn run_tui_operation(cli: &Cli) -> Result<(), String> {
                     );
                 }
             }
-            let mut state = picker::HostsState::default();
+            let mut state = tui::HostsState::default();
             if let Some(initial) = initial {
                 state.prefill(initial.entry, initial.alias, "");
             }
@@ -1274,10 +1274,10 @@ fn run_tui_operation(cli: &Cli) -> Result<(), String> {
                     .filter(|entry| entry_matches_provenance(entry, cli))
                     .collect::<Vec<_>>();
                 let sources = catalog_source_snapshots(&catalog);
-                let selected = match picker::select(&filtered, label, &mut state, status.as_deref())
+                let selected = match tui::select(&filtered, label, &mut state, status.as_deref())
                 {
                     Ok(selected) => selected,
-                    Err(error) if error == picker::CANCELLED && completed => return Ok(()),
+                    Err(error) if error == tui::CANCELLED && completed => return Ok(()),
                     Err(error) => return Err(error),
                 };
                 let source = &selected.entry.source;
@@ -1358,7 +1358,7 @@ fn run_tui_operation(cli: &Cli) -> Result<(), String> {
                                 return if completed {
                                     Ok(())
                                 } else {
-                                    Err(picker::CANCELLED.to_string())
+                                    Err(tui::CANCELLED.to_string())
                                 };
                             }
                             None
@@ -1388,7 +1388,7 @@ fn run_tui_operation(cli: &Cli) -> Result<(), String> {
             }
         }
         Command::Show(selector) => {
-            let mut state = picker::HostsState::default();
+            let mut state = tui::HostsState::default();
             if selector.is_some() || cli.id.is_some() {
                 let selected =
                     select_connect_entry(&filtered, selector.as_deref(), cli, "host show")?;
@@ -1402,7 +1402,7 @@ fn run_tui_operation(cli: &Cli) -> Result<(), String> {
                     .filter(|entry| entry_matches_provenance(entry, cli))
                     .collect::<Vec<_>>();
                 let sources = catalog_source_snapshots(&catalog);
-                let selection = picker::browse_hosts(
+                let selection = tui::browse_hosts(
                     &filtered,
                     &catalog.entries,
                     &mut state,
@@ -1412,7 +1412,7 @@ fn run_tui_operation(cli: &Cli) -> Result<(), String> {
                     return if result.is_some() {
                         Ok(())
                     } else {
-                        Err(picker::CANCELLED.to_string())
+                        Err(tui::CANCELLED.to_string())
                     };
                 };
                 let copy_password = std::mem::take(&mut state.copy_password);
@@ -1496,9 +1496,9 @@ struct ConnectionOutcome {
 fn run_connection_workspace(
     cli: &Cli,
     catalog: &Catalog,
-    selected: picker::Selection<'_>,
+    selected: tui::Selection<'_>,
     home: &Path,
-    mode: picker::ConnectionMode,
+    mode: tui::ConnectionMode,
     use_password_fds: bool,
     standalone_credentials: &mut sshx::connect::StandaloneCredentials,
     sources: &HashMap<&str, Option<Vec<u8>>>,
@@ -1648,7 +1648,7 @@ fn run_connection_workspace(
                 .filter(|_| use_password_fds),
         });
     loop {
-        let choice = match picker::connection_workspace(
+        let choice = match tui::connection_workspace(
             &route_label,
             route.is_some(),
             &services,
@@ -1683,14 +1683,14 @@ fn run_connection_workspace(
             },
         ) {
             Ok(choice) => choice,
-            Err(error) if error == picker::BACK => {
+            Err(error) if error == tui::BACK => {
                 return Ok(ConnectionOutcome {
                     completed,
                     quit: false,
                     status,
                 });
             }
-            Err(error) if error == picker::CANCELLED => {
+            Err(error) if error == tui::CANCELLED => {
                 return Ok(ConnectionOutcome {
                     completed,
                     quit: true,
@@ -1707,7 +1707,7 @@ fn run_connection_workspace(
             return Err("HOST_SOURCE_CHANGED: selected HostEntry or Pair gateway changed; select current source again".to_string());
         }
         let outcome = match (&route, choice.mode) {
-            (Some(route), picker::ConnectionMode::Session) => {
+            (Some(route), tui::ConnectionMode::Session) => {
                 let gateway_alias = route
                     .gateway
                     .aliases
@@ -1725,7 +1725,7 @@ fn run_connection_workspace(
                 )
                 .map(|()| "Session ended.".to_string())
             }
-            (Some(route), picker::ConnectionMode::Tunnel) => {
+            (Some(route), tui::ConnectionMode::Tunnel) => {
                 let gateway_alias = route
                     .gateway
                     .aliases
@@ -1748,7 +1748,7 @@ fn run_connection_workspace(
                 )
                 .map(|response| format!("Tunnel started: {}", response.tunnels[0].id))
             }
-            (None, picker::ConnectionMode::Session) => {
+            (None, tui::ConnectionMode::Session) => {
                 let (declared, local, remote, dynamic) = split_selected_forwards(&choice.forwards);
                 sshx::tunnel::parse_forwards(&local, &remote, &dynamic, cli.allow_bind)
                     .and_then(|direct| {
@@ -1765,7 +1765,7 @@ fn run_connection_workspace(
                     })
                     .map(|()| "Session ended.".to_string())
             }
-            (None, picker::ConnectionMode::Tunnel) => {
+            (None, tui::ConnectionMode::Tunnel) => {
                 let (declared, mut local, remote, dynamic) =
                     split_selected_forwards(&choice.forwards);
                 for forward in &declared {
@@ -1793,7 +1793,7 @@ fn run_connection_workspace(
             });
         completed |= operation_completed;
         status = Some(outcome.unwrap_or_else(|error| error));
-        if return_to_hosts && choice.mode == picker::ConnectionMode::Session && operation_completed
+        if return_to_hosts && choice.mode == tui::ConnectionMode::Session && operation_completed
         {
             return Ok(ConnectionOutcome {
                 completed,
@@ -2122,10 +2122,10 @@ fn run_pair_setup_workspace(
     catalog: &[HostEntry],
     entries: &[&HostEntry],
     paths: &[PathBuf],
-    gateway: Option<picker::Selection<'_>>,
-    vm: Option<picker::Selection<'_>>,
+    gateway: Option<tui::Selection<'_>>,
+    vm: Option<tui::Selection<'_>>,
 ) -> Result<(), String> {
-    let selected_index = |selection: picker::Selection<'_>| {
+    let selected_index = |selection: tui::Selection<'_>| {
         entries
             .iter()
             .position(|entry| std::ptr::eq(*entry, selection.entry))
@@ -2141,7 +2141,7 @@ fn run_pair_setup_workspace(
                 )
             })
     };
-    let draft = picker::PairSetupDraft {
+    let draft = tui::PairSetupDraft {
         gateway: gateway.and_then(selected_index),
         vm: vm.and_then(selected_index),
         transit_host: cli.transit_host.clone().unwrap_or_default(),
@@ -2158,7 +2158,7 @@ fn run_pair_setup_workspace(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let mut pending = None;
-    let completed = picker::pair_setup_workspace(entries, draft, cli.preview, |draft, action| {
+    let completed = tui::pair_setup_workspace(entries, draft, cli.preview, |draft, action| {
         for (path, before) in &snapshots {
             if !std::fs::read(path).is_ok_and(|after| after == *before) {
                 pending = None;
@@ -2168,7 +2168,7 @@ fn run_pair_setup_workspace(
                 ));
             }
         }
-        if action == picker::PairSetupAction::Apply {
+        if action == tui::PairSetupAction::Apply {
             let plan = pending.take().ok_or_else(|| {
                 "PAIR_REVIEW_REQUIRED: review current Pair changes before applying".to_string()
             })?;
@@ -2228,7 +2228,7 @@ fn run_pair_setup_workspace(
     if completed {
         Ok(())
     } else {
-        Err(picker::CANCELLED.to_string())
+        Err(tui::CANCELLED.to_string())
     }
 }
 
@@ -2238,7 +2238,7 @@ fn select_pair_entry<'a>(
     source: Option<&PathBuf>,
     line: Option<usize>,
     role: &str,
-) -> Result<Option<picker::Selection<'a>>, String> {
+) -> Result<Option<tui::Selection<'a>>, String> {
     if source.is_some() != line.is_some() {
         return Err(format!(
             "SELECTOR_INCOMPLETE: {role} source and line must be provided together"
@@ -2283,7 +2283,7 @@ fn select_pair_entry<'a>(
                 .or_else(|| entry.aliases.first())
                 .map(String::as_str)
                 .unwrap_or_default();
-            Ok(Some(picker::Selection { entry, alias }))
+            Ok(Some(tui::Selection { entry, alias }))
         }
         [] if source.is_some() => Err(format!(
             "HOST_MISMATCH: {role} selector `{}` does not match source and Host line",
@@ -2446,7 +2446,7 @@ fn run_host_create_workspace(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), 
     let mut focus = None;
     let mut status = None::<String>;
     loop {
-        let (edited, selected, action) = picker::host_create_workspace(
+        let (edited, selected, action) = tui::host_create_workspace(
             fields,
             roots,
             focus,
@@ -2456,7 +2456,7 @@ fn run_host_create_workspace(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), 
         )?;
         fields = edited;
         focus = Some(selected);
-        if action != picker::HostCreateAction::Submit {
+        if action != tui::HostCreateAction::Submit {
             continue;
         }
         let result = (|| {
@@ -2543,7 +2543,7 @@ fn run_host_create_workspace(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), 
             Err(error) => status = Some(error),
             Ok(plan) => {
                 let review = render_create(&plan, OutputFormat::Human, false)?;
-                let (edited, selected, action) = picker::host_create_workspace(
+                let (edited, selected, action) = tui::host_create_workspace(
                     fields,
                     roots,
                     focus,
@@ -2554,19 +2554,19 @@ fn run_host_create_workspace(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), 
                 fields = edited;
                 focus = Some(selected);
                 match action {
-                    picker::HostCreateAction::PreviewComplete => {
+                    tui::HostCreateAction::PreviewComplete => {
                         print!("{review}");
                         return Ok(());
                     }
-                    picker::HostCreateAction::Apply => match mutation::apply(&plan) {
+                    tui::HostCreateAction::Apply => match mutation::apply(&plan) {
                         Ok(()) => {
                             print!("{}", render_create(&plan, cli.format, true)?);
                             return Ok(());
                         }
                         Err(error) => status = Some(error),
                     },
-                    picker::HostCreateAction::Edit => status = None,
-                    picker::HostCreateAction::Submit => {}
+                    tui::HostCreateAction::Edit => status = None,
+                    tui::HostCreateAction::Submit => {}
                 }
             }
         }
@@ -2840,23 +2840,23 @@ fn run_host_delete_workspace(
         review.push_str(&format!("\n{error}\n"));
     }
     let mode = if blocker.is_some() {
-        picker::MutationReviewMode::Blocked
+        tui::MutationReviewMode::Blocked
     } else if cli.preview {
-        picker::MutationReviewMode::PreviewOnly
+        tui::MutationReviewMode::PreviewOnly
     } else {
-        picker::MutationReviewMode::Delete
+        tui::MutationReviewMode::Delete
     };
-    let title = if mode == picker::MutationReviewMode::Blocked {
+    let title = if mode == tui::MutationReviewMode::Blocked {
         "HostEntry deletion blocked"
     } else {
         "Review HostEntry mutation"
     };
-    let action = picker::mutation_review_workspace(title, &review, mode)?;
+    let action = tui::mutation_review_workspace(title, &review, mode)?;
     if let Some(error) = blocker {
         return Err(error);
     }
     safety(&current_catalog()?)?;
-    if action == picker::MutationReviewAction::Apply {
+    if action == tui::MutationReviewAction::Apply {
         mutation::apply_edit(&plan)?;
         print!("{}", render_edit(&plan, cli.format, true)?);
     } else {
@@ -2947,8 +2947,8 @@ fn run_host_edit_workspace(
         entry.source.byte_end
     );
     loop {
-        let (edited, selected, action) = picker::host_edit_workspace(
-            picker::HostEditState {
+        let (edited, selected, action) = tui::host_edit_workspace(
+            tui::HostEditState {
                 fields,
                 clears,
                 password_edited,
@@ -2964,7 +2964,7 @@ fn run_host_edit_workspace(
         clears = edited.clears;
         password_edited = edited.password_edited;
         focus = Some(selected);
-        if action != picker::HostEditAction::Submit {
+        if action != tui::HostEditAction::Submit {
             continue;
         }
         let result = (|| {
@@ -3008,8 +3008,8 @@ fn run_host_edit_workspace(
             "{identity}{}",
             render_edit(&plan, OutputFormat::Human, false)?
         );
-        let (edited, selected, action) = picker::host_edit_workspace(
-            picker::HostEditState {
+        let (edited, selected, action) = tui::host_edit_workspace(
+            tui::HostEditState {
                 fields,
                 clears,
                 password_edited,
@@ -3026,13 +3026,13 @@ fn run_host_edit_workspace(
         password_edited = edited.password_edited;
         focus = Some(selected);
         match action {
-            picker::HostEditAction::Edit => status = None,
-            picker::HostEditAction::PreviewComplete => {
+            tui::HostEditAction::Edit => status = None,
+            tui::HostEditAction::PreviewComplete => {
                 unchanged()?;
                 print!("{review}");
                 return Ok(());
             }
-            picker::HostEditAction::Apply => {
+            tui::HostEditAction::Apply => {
                 match unchanged().and_then(|()| mutation::apply_edit(&plan)) {
                     Ok(()) => {
                         print!("{}", render_edit(&plan, cli.format, true)?);
@@ -3041,7 +3041,7 @@ fn run_host_edit_workspace(
                     Err(error) => status = Some(error),
                 }
             }
-            picker::HostEditAction::Submit => {}
+            tui::HostEditAction::Submit => {}
         }
     }
 }
@@ -3051,7 +3051,7 @@ fn select_mutation_entry<'a>(
     positional: Option<&str>,
     cli: &Cli,
     picker_label: &str,
-) -> Result<picker::Selection<'a>, String> {
+) -> Result<tui::Selection<'a>, String> {
     if positional.is_none() && cli.id.is_none() {
         if cli.format.is_machine() || cli.password_stdin || !io::stderr().is_terminal() {
             return Err(
@@ -3410,9 +3410,9 @@ fn run_doctor_workspace(cli: &Cli, home: &Path) -> Result<(), String> {
     loop {
         let (roots, settings_error) = doctor_roots(cli, home);
         let report = doctor_report(cli, home, &roots, settings_error.as_deref());
-        match picker::doctor_workspace(&report.findings, &report.repairs, status.as_deref())? {
-            picker::DoctorAction::Exit => return Ok(()),
-            picker::DoctorAction::Repair => {
+        match tui::doctor_workspace(&report.findings, &report.repairs, status.as_deref())? {
+            tui::DoctorAction::Exit => return Ok(()),
+            tui::DoctorAction::Repair => {
                 let results = sshx::permissions::apply_all(&report.repairs);
                 status = Some(render_repairs(&results, OutputFormat::Human)?);
             }
@@ -3664,7 +3664,7 @@ fn select_connect_entry<'a>(
     positional: Option<&str>,
     cli: &Cli,
     picker_label: &str,
-) -> Result<picker::Selection<'a>, String> {
+) -> Result<tui::Selection<'a>, String> {
     let selector = cli.id.as_deref().or(positional);
     if cli.location.source.is_some() != cli.location.line.is_some() {
         return Err(
@@ -3731,7 +3731,7 @@ fn select_connect_entry<'a>(
                 .or_else(|| entry.aliases.first())
                 .map(String::as_str)
                 .unwrap_or_default();
-            Ok(picker::Selection { entry, alias })
+            Ok(tui::Selection { entry, alias })
         }
         [] if cli.location.source.is_some() => Err(format!(
             "HOST_MISMATCH: selector `{selector}` does not match source and Host line"
@@ -3746,13 +3746,13 @@ fn select_connect_entry<'a>(
 fn interactive_select<'a>(
     entries: &[&'a HostEntry],
     label: &str,
-) -> Result<picker::Selection<'a>, String> {
-    picker::select(entries, label, &mut picker::HostsState::default(), None)
+) -> Result<tui::Selection<'a>, String> {
+    tui::select(entries, label, &mut tui::HostsState::default(), None)
 }
 
 fn run_host_action(
     action: HostAction,
-    selected: &picker::Selection<'_>,
+    selected: &tui::Selection<'_>,
     entries: &[HostEntry],
     cli: &Cli,
 ) -> Result<(), String> {
