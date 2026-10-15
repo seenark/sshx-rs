@@ -1145,6 +1145,10 @@ impl HostEditTerminal {
                 break;
             }
             if Instant::now() >= deadline || self.child.try_wait().unwrap().is_some() {
+                while self.drain() {}
+                if contains_tui_text(&self.output, marker) {
+                    break;
+                }
                 panic!(
                     "PTY did not show {marker}: {}",
                     String::from_utf8_lossy(&self.output)
@@ -1154,13 +1158,20 @@ impl HostEditTerminal {
         }
     }
 
-    fn drain(&mut self) {
+    /// Returns whether any bytes were read.
+    fn drain(&mut self) -> bool {
         let mut buffer = [0u8; 8192];
         match self.master.read(&mut buffer) {
-            Ok(size) => self.output.extend_from_slice(&buffer[..size]),
+            Ok(size) => {
+                self.output.extend_from_slice(&buffer[..size]);
+                size > 0
+            }
             Err(error)
                 if error.kind() == std::io::ErrorKind::WouldBlock
-                    || error.raw_os_error() == Some(libc::EIO) => {}
+                    || error.raw_os_error() == Some(libc::EIO) =>
+            {
+                false
+            }
             Err(error) => panic!("PTY read failed: {error}"),
         }
     }
@@ -1175,6 +1186,8 @@ impl HostEditTerminal {
         loop {
             self.drain();
             if let Some(status) = self.child.try_wait().unwrap() {
+                // The child can exit before its last output is read; collect what is still buffered.
+                while self.drain() {}
                 return status.code();
             }
             assert!(

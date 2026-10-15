@@ -261,14 +261,18 @@ impl Tui {
         }
     }
 
-    fn pump(&mut self) {
+    /// Returns whether any bytes were read.
+    fn pump(&mut self) -> bool {
         let mut buffer = [0u8; 4096];
         match self.master.read(&mut buffer) {
-            Ok(size) => self.output.extend_from_slice(&buffer[..size]),
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(5));
+            Ok(size) if size > 0 => {
+                self.output.extend_from_slice(&buffer[..size]);
+                true
             }
-            Err(_) => thread::sleep(Duration::from_millis(5)),
+            _ => {
+                thread::sleep(Duration::from_millis(5));
+                false
+            }
         }
     }
 
@@ -313,7 +317,8 @@ impl Tui {
         loop {
             self.pump();
             if let Some(status) = self.child.try_wait().unwrap() {
-                self.pump();
+                // The child can exit before its last output is read; collect what is still buffered.
+                while self.pump() {}
                 return (status, self.screen());
             }
             assert!(

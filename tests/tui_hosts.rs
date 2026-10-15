@@ -719,20 +719,27 @@ impl Terminal {
         }
     }
 
-    fn drain(&mut self) {
+    /// Returns whether any bytes were read.
+    fn drain(&mut self) -> bool {
         let mut buffer = [0u8; 8192];
         match self.master.read(&mut buffer) {
-            Ok(size) => self.raw.extend_from_slice(&buffer[..size]),
+            Ok(size) => {
+                self.raw.extend_from_slice(&buffer[..size]);
+                size > 0
+            }
             Err(error)
                 if error.kind() == std::io::ErrorKind::WouldBlock
-                    || error.raw_os_error() == Some(libc::EIO) => {}
+                    || error.raw_os_error() == Some(libc::EIO) =>
+            {
+                false
+            }
             Err(error) => panic!("PTY read failed: {error}"),
         }
     }
 
     /// The screen as it looks now, whitespace removed so layout never matters.
     fn snapshot(&mut self) -> String {
-        self.drain();
+        while self.drain() {}
         let text = render(&self.raw);
         self.snapshots.push(text.clone());
         text
@@ -747,6 +754,10 @@ impl Terminal {
                 return;
             }
             if Instant::now() >= deadline || self.child.try_wait().unwrap().is_some() {
+                let screen = self.snapshot();
+                if screen.contains(&wanted) {
+                    return;
+                }
                 panic!("PTY did not show {marker}: {screen}");
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -772,6 +783,7 @@ impl Terminal {
         loop {
             self.drain();
             if let Some(status) = self.child.try_wait().unwrap() {
+                // The child can exit before its last output is read; collect what is still buffered.
                 self.snapshot();
                 return status.code();
             }
