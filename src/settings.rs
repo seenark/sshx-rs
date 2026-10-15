@@ -17,16 +17,51 @@ pub struct RegisteredRoot {
 struct SettingsFile {
     version: u8,
     roots: Vec<RegisteredRoot>,
+    #[serde(default)]
+    preferences: Preferences,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StartMode {
+    #[default]
+    Insert,
+    Normal,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+pub struct Preferences {
+    pub startmode: StartMode,
+    pub autoinfo: bool,
+    pub bind: String,
+    /// Seconds before a copied secret is cleared; `None` disables clearing.
+    pub clipboard_clear: Option<u64>,
+    pub password_confirm: bool,
+    pub password_warning_acknowledged: bool,
+}
+
+impl Default for Preferences {
+    fn default() -> Self {
+        Self {
+            startmode: StartMode::Insert,
+            autoinfo: true,
+            bind: "127.0.0.1".to_string(),
+            clipboard_clear: Some(30),
+            password_confirm: false,
+            password_warning_acknowledged: false,
+        }
+    }
 }
 
 pub fn settings_path(home: &Path) -> PathBuf {
     home.join(".config/sshx/config.json")
 }
 
-pub fn load(home: &Path) -> Result<Vec<RegisteredRoot>, String> {
+fn load_file(home: &Path) -> Result<Option<SettingsFile>, String> {
     let path = settings_path(home);
     if !path.is_file() {
-        return Ok(Vec::new());
+        return Ok(None);
     }
     let bytes =
         fs::read(&path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
@@ -39,10 +74,34 @@ pub fn load(home: &Path) -> Result<Vec<RegisteredRoot>, String> {
             path.display()
         ));
     }
-    Ok(settings.roots)
+    Ok(Some(settings))
+}
+
+pub fn load(home: &Path) -> Result<Vec<RegisteredRoot>, String> {
+    Ok(load_file(home)?.map_or_else(Vec::new, |settings| settings.roots))
+}
+
+pub fn load_preferences(home: &Path) -> Result<Preferences, String> {
+    Ok(load_file(home)?.map_or_else(Preferences::default, |settings| settings.preferences))
 }
 
 pub fn save(home: &Path, roots: &[RegisteredRoot]) -> Result<(), String> {
+    let preferences = load_file(home)
+        .ok()
+        .flatten()
+        .map_or_else(Preferences::default, |settings| settings.preferences);
+    write_file(home, roots.to_vec(), preferences)
+}
+
+pub fn save_preferences(home: &Path, preferences: &Preferences) -> Result<(), String> {
+    write_file(home, load(home)?, preferences.clone())
+}
+
+fn write_file(
+    home: &Path,
+    roots: Vec<RegisteredRoot>,
+    preferences: Preferences,
+) -> Result<(), String> {
     let path = settings_path(home);
     let parent = path
         .parent()
@@ -50,7 +109,8 @@ pub fn save(home: &Path, roots: &[RegisteredRoot]) -> Result<(), String> {
     private_directory(parent)?;
     let settings = SettingsFile {
         version: SETTINGS_VERSION,
-        roots: roots.to_vec(),
+        roots,
+        preferences,
     };
     let mut rendered = serde_json::to_vec_pretty(&settings)
         .map_err(|error| format!("cannot render sshx settings: {error}"))?;

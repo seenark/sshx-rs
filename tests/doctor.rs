@@ -690,6 +690,33 @@ fn settings_save_creates_private_modes_regardless_of_umask() {
 }
 
 #[test]
+fn root_save_keeps_preferences_and_v1_files_load_defaults() {
+    let (root, home) = fixture();
+    let path = settings::settings_path(&home);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, r#"{"version":1,"roots":[]}"#).unwrap();
+    assert_eq!(
+        settings::load_preferences(&home).unwrap(),
+        settings::Preferences::default()
+    );
+    let preferences = settings::Preferences {
+        autoinfo: false,
+        clipboard_clear: None,
+        ..settings::Preferences::default()
+    };
+    settings::save_preferences(&home, &preferences).unwrap();
+    let roots = vec![RegisteredRoot {
+        scope: "personal".to_string(),
+        path: home.join(".ssh/config"),
+        project: None,
+    }];
+    settings::save(&home, &roots).unwrap();
+    assert_eq!(settings::load(&home).unwrap(), roots);
+    assert_eq!(settings::load_preferences(&home).unwrap(), preferences);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn manual_chmod_hint_is_shell_quoted() {
     let hint = permissions::manual_chmod_command(
         &PathBuf::from("/tmp/my config's/id_rsa"),
