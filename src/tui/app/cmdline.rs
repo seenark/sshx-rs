@@ -1,5 +1,6 @@
 use super::{
     ConnectRequest, Ctx, Effect, ForwardRequest, Outcome, PreferenceChange, Screen, help::Help,
+    tunnel_progress,
 };
 use ratatui::{
     Frame,
@@ -18,6 +19,7 @@ pub(super) struct CommandLine {
     under: keymap::Screen,
     under_mode: InputMode,
     under_availability: Availability,
+    target: Option<(HostEntry, String)>,
     text: String,
 }
 
@@ -153,10 +155,15 @@ impl CommandLine {
             under,
             under_mode,
             under_availability,
+            target: None,
             text: String::new(),
         }
     }
 
+    pub(super) fn with_target(mut self, entry: &HostEntry, alias: &str) -> Self {
+        self.target = Some((entry.clone(), alias.to_string()));
+        self
+    }
     fn run(&self, ctx: &Ctx) -> Outcome {
         let command = match keymap::parse_command(&self.text) {
             Ok(command) => command,
@@ -186,10 +193,37 @@ impl CommandLine {
                 }
             }
             Command::TunnelList => Outcome::Effect(Effect::Tunnels),
-            Command::TunnelStart { .. } | Command::TunnelStop { .. } => Outcome::Toast(
-                "tunnel start/stop commands are not available in this build; `:tunnel list` shows tunnels"
-                    .to_string(),
-            ),
+            Command::TunnelStart { host, forwards } => {
+                let started = match host {
+                    Some(host) => {
+                        resolve_host(ctx, &host).map(|(entry, alias)| (entry.clone(), alias))
+                    }
+                    None => self
+                        .target
+                        .clone()
+                        .ok_or_else(|| "nothing selected: name a host".to_string()),
+                }
+                .and_then(|(entry, alias)| {
+                    let forwards = if forwards.is_empty() {
+                        tunnel_progress::remembered_forwards(ctx, &entry)
+                    } else {
+                        forward_requests(&entry, &forwards)?
+                    };
+                    Ok(tunnel_progress::begin(&entry, &alias, forwards))
+                });
+                match started {
+                    Ok(Outcome::Push(screen)) => Outcome::Replace(screen),
+                    Ok(outcome) => outcome,
+                    Err(error) => Outcome::Toast(error),
+                }
+            }
+            Command::TunnelStop { id } => {
+                if ctx.tunnels.iter().any(|tunnel| tunnel.id == id) {
+                    Outcome::Effect(Effect::TunnelStop(vec![id]))
+                } else {
+                    Outcome::Toast(format!("TUNNEL_NOT_FOUND: tunnel `{id}` does not exist"))
+                }
+            }
             Command::Set { option, value } => match preference_change(&option, value.as_deref()) {
                 Ok(change) => Outcome::Effect(Effect::SetPreference(change)),
                 Err(error) => Outcome::Toast(error),

@@ -890,7 +890,8 @@ pub fn complete_command(prefix: &str) -> Vec<&'static str> {
     out
 }
 
-fn parse_forward(arg: &str) -> Result<ForwardArg, String> {
+/// Parses one `REMOTE[=LOCAL]` argument.
+pub fn parse_forward(arg: &str) -> Result<ForwardArg, String> {
     let bad = || format!("invalid forward `{arg}`; expected REMOTE[=LOCAL]");
     let port = |s: &str| s.parse::<u16>().ok().filter(|p| *p != 0).ok_or_else(bad);
     match arg.split_once('=') {

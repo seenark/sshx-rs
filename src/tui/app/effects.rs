@@ -1,9 +1,10 @@
 use super::{
-    ConnectRequest, Effect, EffectResult, PreferenceChange, Runtime, copy, delete,
-    failure::Failure, finder::Finder, host_form, input_mode, undo,
+    ConnectRequest, Effect, EffectResult, PreferenceChange, Runtime, Screen, copy, delete,
+    failure::Failure, finder::Finder, host_form, input_mode, tunnels::Tunnels, undo,
 };
 use crate::tui::CANCELLED;
 use sshx::discovery::scope_for_path;
+use sshx::keymap;
 use sshx::settings::{self, RegisteredRoot};
 use std::path::Path;
 
@@ -22,6 +23,10 @@ pub(super) fn execute(runtime: &mut Runtime, effect: Effect) -> Result<EffectRes
         Effect::DeleteHost(request) => delete::delete(runtime, &request),
         Effect::Undo => undo::undo(runtime),
         Effect::Redo => undo::redo(runtime),
+        Effect::TunnelStart(request) => super::tunnel_progress::start(runtime, &request),
+        Effect::TunnelStop(ids) => super::tunnels::stop(runtime, &ids),
+        Effect::TunnelRestart(id) => super::tunnels::restart(runtime, &id),
+        Effect::SaveService(edit) => super::ports::save_service(runtime, &edit),
     }
 }
 
@@ -145,12 +150,17 @@ fn start_session(runtime: &Runtime, request: &ConnectRequest) -> Result<EffectRe
     }
 }
 
+/// Opens the tunnel list; the run loop re-reads the registry after every effect, so the list
+/// always starts from fresh master and listener evidence.
 fn tunnels(runtime: &Runtime) -> Result<EffectResult, String> {
-    match crate::run_tunnels_workspace(runtime.cli, &runtime.data.home, 0, None) {
-        Ok(()) => Ok(EffectResult::default()),
-        Err(error) if error == CANCELLED => Ok(EffectResult::default()),
-        Err(error) => Ok(toast(error)),
-    }
+    let listing = runtime
+        .stack
+        .last()
+        .is_some_and(|screen| screen.kind() == keymap::Screen::Tunnels);
+    Ok(EffectResult {
+        push: (!listing).then(|| Box::new(Tunnels::new()) as Box<dyn Screen>),
+        ..EffectResult::default()
+    })
 }
 
 fn set_preference(runtime: &mut Runtime, change: PreferenceChange) -> Result<EffectResult, String> {

@@ -1403,7 +1403,8 @@ fn tunnels_tab_stops_active_tunnel_and_refreshes_registry() {
         &[
             (b"Search:", b"\x1b"),
             (b"NORMAL", b"gt"),
-            (b"Tunnel details", b"s"),
+            (id.as_bytes(), b"dd"),
+            (b"Stop tunnel", b"y"),
             (b"stopped", b"\x1b"),
             (b"Search:", b"q"),
         ],
@@ -1435,13 +1436,12 @@ fn tunnels_tab_stops_active_tunnel_and_refreshes_registry() {
 
     let config_changed = b"Host direct\n  HostName direct.changed\n";
     let error_marker = "CONFIG_CHANGED: selected HostEntry changed on disk";
-    let interactions: [(&[u8], &[u8]); 7] = [
+    let interactions: [(&[u8], &[u8]); 6] = [
         (b"Search:", b"\x1b"),
         (b"NORMAL", b"gt"),
-        (b"Tunnel details", b"\x1b[B"),
-        (second_id.as_bytes(), b"r"),
-        (error_marker.as_bytes(), b"\r"),
-        (b"ID:", b"\x1b"),
+        (second_id.as_bytes(), b"jr"),
+        (error_marker.as_bytes(), b"\x1b"),
+        (b"green responsive", b"\x1b"),
         (b"Search:", b"q"),
     ];
     let (status, output) = run_with_pty_interactions_with_hook(
@@ -1521,8 +1521,9 @@ fn tunnels_tui_restarts_stopped_tunnel_from_explicit_config() {
         &[
             (b"Search:", b"\x1b"),
             (b"NORMAL", b"gt"),
-            (b"Tunnel details", b"r"),
-            (b"active", b"\x1b"),
+            (stopped_id.as_bytes(), b"r"),
+            (b"listener ready", b"\x1b"),
+            (b"green responsive", b"\x1b"),
             (b"Search:", b"q"),
         ],
         None,
@@ -1561,7 +1562,7 @@ fn tunnels_tui_restarts_stopped_tunnel_from_explicit_config() {
 
 #[cfg(unix)]
 #[test]
-fn tunnels_workspace_scrolls_details_on_compact_terminal() {
+fn tunnel_list_fits_a_compact_terminal() {
     let (root, home) = fixture_root();
     let config = home.join(".ssh/config");
     write(&config, "Host direct\n  HostName direct.example\n");
@@ -1590,12 +1591,10 @@ fn tunnels_workspace_scrolls_details_on_compact_terminal() {
     );
     assert!(started.status.success(), "{started:?}");
 
-    let mut page_downs = "\x1b[6~".repeat(24).into_bytes();
-    page_downs.push(0x1b);
     let interactions: [(&[u8], &[u8]); 4] = [
         (b"Search:", b"\x1b"),
         (b"NORMAL", b"gt"),
-        (b"Tunnel details", &page_downs),
+        (b"standalone tunnels", b"\x1b"),
         (b"Search:", b"q"),
     ];
     let (status, output) = run_with_pty_interactions(
@@ -1608,10 +1607,13 @@ fn tunnels_workspace_scrolls_details_on_compact_terminal() {
         Some((52, 12)),
     );
     assert!(status.success(), "status={status:?} output={output}");
-    for visible_detail in ["ID:", "Mappings:", "Application health: not measured"] {
+    for visible in [
+        "master · listener".to_string(),
+        format!("localhost:{local_port} → 22"),
+    ] {
         assert!(
-            contains_tui_text(output.as_bytes(), visible_detail.as_bytes()),
-            "missing {visible_detail:?} in {output}"
+            contains_tui_text(output.as_bytes(), visible.as_bytes()),
+            "missing {visible:?} in {output}"
         );
     }
     fs::remove_dir_all(root).unwrap();
@@ -11278,7 +11280,7 @@ fn goto_tunnels_opens_the_tunnels_workspace_and_returns_to_the_finder() {
         &[
             (b"Search:", b"\x1b"),
             (b"NORMAL", b"gt"),
-            (b"No registered tunnels.", b"\x1b"),
+            (b"No standalone tunnels.", b"\x1b"),
             (b"Search:", b"q"),
         ],
         None,

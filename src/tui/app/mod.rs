@@ -7,9 +7,13 @@ mod finder;
 mod first_run;
 mod help;
 mod host_form;
+mod ports;
 mod status;
+mod tunnel_progress;
+mod tunnels;
 mod undo;
 mod whichkey;
+mod yesno;
 
 use crate::Cli;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -27,7 +31,7 @@ use std::path::{Path, PathBuf};
 
 use super::terminal::{AppTerminal, read_key, with_terminal};
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub(crate) struct ForwardRequest {
     pub remote: u16,
     pub local: u16,
@@ -62,6 +66,10 @@ pub(crate) enum Effect {
     DeleteHost(Box<delete::DeleteRequest>),
     Undo,
     Redo,
+    TunnelStart(Box<tunnel_progress::TunnelStartRequest>),
+    TunnelStop(Vec<String>),
+    TunnelRestart(String),
+    SaveService(Box<ports::ServiceEdit>),
 }
 
 #[derive(Default)]

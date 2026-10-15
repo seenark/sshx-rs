@@ -4,6 +4,8 @@ use super::{
     copy::CopyRequest,
     delete::DeleteConfirm,
     host_form::{EditorRequest, HostForm, open},
+    ports::Ports,
+    tunnel_progress, tunnels,
 };
 use crate::tui::matcher::{Row, compare_rows, matching_rows, row_label, row_rank};
 use crate::tui::widgets::block;
@@ -351,6 +353,15 @@ impl Screen for Finder {
                     forwards: Vec::new(),
                 })));
             }
+            Action::OpenPorts => {
+                let Some(row) = rows.get(self.selected.min(last)) else {
+                    return Outcome::Stay;
+                };
+                return match Ports::open(ctx, row.row.entry, row.row.alias) {
+                    Ok(ports) => Outcome::Push(Box::new(ports)),
+                    Err(error) => Outcome::Toast(error),
+                };
+            }
             Action::Copy(target) => {
                 let Some(row) = rows.get(self.selected.min(last)) else {
                     return Outcome::Stay;
@@ -389,12 +400,24 @@ impl Screen for Finder {
             }
             Action::Undo => return Outcome::Effect(Effect::Undo),
             Action::Redo => return Outcome::Effect(Effect::Redo),
+            Action::TunnelStart => {
+                let Some(row) = rows.get(self.selected.min(last)) else {
+                    return Outcome::Stay;
+                };
+                let entry = row.row.entry;
+                return tunnel_progress::begin(
+                    entry,
+                    row.row.alias,
+                    tunnel_progress::remembered_forwards(ctx, entry),
+                );
+            }
+            Action::TunnelStopAll => return tunnels::stop_all(ctx),
             Action::CommandLine => {
-                return Outcome::Push(Box::new(CommandLine::new(
-                    self.kind(),
-                    self.mode,
-                    self.availability(ctx),
-                )));
+                let mut line = CommandLine::new(self.kind(), self.mode, self.availability(ctx));
+                if let Some(row) = rows.get(self.selected.min(last)) {
+                    line = line.with_target(row.row.entry, row.row.alias);
+                }
+                return Outcome::Push(Box::new(line));
             }
             Action::Quit => return Outcome::Effect(Effect::Quit { cancelled: false }),
             Action::Goto(GotoTarget::Recent) => {
