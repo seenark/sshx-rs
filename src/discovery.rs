@@ -843,7 +843,7 @@ fn expand_tilde(pattern: &str) -> String {
     pattern.to_string()
 }
 
-fn absolute_path(path: &Path) -> Result<PathBuf, DiscoveryError> {
+pub(crate) fn absolute_path(path: &Path) -> Result<PathBuf, DiscoveryError> {
     let path = if path.is_absolute() {
         path.to_path_buf()
     } else {
