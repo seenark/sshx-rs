@@ -479,7 +479,7 @@ pub fn open(
     home: &Path,
     no_input: bool,
     selected_alias: &str,
-) -> Result<(), String> {
+) -> Result<i32, String> {
     open_with_password_fd(entry, home, no_input, selected_alias, None)
 }
 
@@ -489,7 +489,7 @@ pub fn open_with_password_fd(
     no_input: bool,
     selected_alias: &str,
     password_fd: Option<i32>,
-) -> Result<(), String> {
+) -> Result<i32, String> {
     open_with_password_fd_and_forwards(entry, home, no_input, selected_alias, password_fd, &[])
 }
 
@@ -500,7 +500,7 @@ pub fn open_with_password_fd_and_forwards(
     selected_alias: &str,
     password_fd: Option<i32>,
     forwards: &[ServiceForward],
-) -> Result<(), String> {
+) -> Result<i32, String> {
     open_with_password_fd_and_all_forwards(
         entry,
         home,
@@ -523,7 +523,7 @@ pub fn open_with_password_fd_and_all_forwards(
     forwards: &[ServiceForward],
     direct_forwards: &[session::ForwardSpec],
     terminal: bool,
-) -> Result<(), String> {
+) -> Result<i32, String> {
     SIGNAL.store(0, Ordering::Relaxed);
     install_signal_handlers();
     let result = open_session(
@@ -592,7 +592,7 @@ fn open_session(
     forwards: &[ServiceForward],
     direct_forwards: &[session::ForwardSpec],
     terminal: bool,
-) -> Result<(), String> {
+) -> Result<i32, String> {
     session::preflight(forwards)?;
     preflight_direct_listeners(forwards, direct_forwards)?;
     session::warn_remote_exposure(direct_forwards);
@@ -671,11 +671,7 @@ fn open_session(
     if let Some(signal) = received_signal() {
         return Err(format!("SESSION_INTERRUPTED: signal {signal}"));
     }
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("SESSION_EXIT: {status}"))
-    }
+    Ok(exit_code(status))
 }
 pub fn open_paired(
     route: &PairedRoute,
@@ -685,7 +681,7 @@ pub fn open_paired(
     vm_alias: &str,
     gateway_password_fd: Option<i32>,
     vm_password_fd: Option<i32>,
-) -> Result<(), String> {
+) -> Result<i32, String> {
     let mut credentials = PairedSessionCredentials::new(PairedCredentials {
         gateway_password_fd,
         vm_password_fd,
@@ -712,7 +708,7 @@ pub fn open_paired_with_forwards(
     credentials: &mut PairedSessionCredentials,
     forwards: &[ServiceForward],
     terminal: bool,
-) -> Result<(), String> {
+) -> Result<i32, String> {
     SIGNAL.store(0, Ordering::Relaxed);
     install_signal_handlers();
     let result = open_paired_session(
@@ -739,7 +735,7 @@ fn open_paired_session(
     credentials: &mut PairedSessionCredentials,
     forwards: &[ServiceForward],
     terminal: bool,
-) -> Result<(), String> {
+) -> Result<i32, String> {
     session::preflight(forwards).map_err(|error| format!("VM_{error}"))?;
     let transit_port = allocate_transit_port()?;
     let gateway_config = compile_gateway_config(
@@ -817,10 +813,20 @@ fn open_paired_session(
     if let Some(signal) = received_signal() {
         return Err(format!("SESSION_INTERRUPTED: signal {signal}"));
     }
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("VM_SESSION_EXIT: {status}"))
+    Ok(exit_code(status))
+}
+
+fn exit_code(status: ExitStatus) -> i32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        status
+            .code()
+            .unwrap_or_else(|| 128 + status.signal().unwrap_or(0))
+    }
+    #[cfg(not(unix))]
+    {
+        status.code().unwrap_or(1)
     }
 }
 
@@ -1852,6 +1858,66 @@ fn classify_master_failure(
         format!("SSH_AUTH_FAILED: {detail}")
     }
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Hop {
+    Direct,
+    Gateway,
+    Vm,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionFailure {
+    pub hop: Hop,
+    pub code: String,
+    pub detail: String,
+}
+
+/// Recognizes errors from starting a session master; anything else is `None`.
+pub fn classify_session_error(error: &str) -> Option<SessionFailure> {
+    if let Some(detail) = error.strip_prefix("TRANSIT_BIND_FAILED: ") {
+        return Some(SessionFailure {
+            hop: Hop::Gateway,
+            code: "TRANSIT_BIND_FAILED".to_string(),
+            detail: detail
+                .strip_prefix("gateway transit forward failed: ")
+                .unwrap_or(detail)
+                .to_string(),
+        });
+    }
+    let mut hop = Hop::Direct;
+    let mut inner = error;
+    for (prefix, prefix_hop) in [("GATEWAY_", Hop::Gateway), ("VM_", Hop::Vm)] {
+        if let Some(rest) = error.strip_prefix(prefix) {
+            let (stage, rest) = rest.split_once(": ")?;
+            if !matches!(
+                stage,
+                "AUTH_FAILED" | "TRUST_REQUIRED" | "TRUST_FAILED" | "SERVICE_BIND_FAILED"
+            ) {
+                return None;
+            }
+            hop = prefix_hop;
+            inner = rest;
+        }
+    }
+    let (code, detail) = inner.split_once(": ").unwrap_or((inner, ""));
+    let master_code = matches!(
+        code,
+        "SSH_AUTH_FAILED"
+            | "SSH_AUTH_TIMEOUT"
+            | "HOST_KEY_TRUST_REQUIRED"
+            | "HOST_KEY_CHANGED"
+            | "SERVICE_BIND_FAILED"
+    );
+    if !master_code || detail.starts_with("cannot reserve local listener") {
+        return None;
+    }
+    Some(SessionFailure {
+        hop,
+        code: code.to_string(),
+        detail: detail.to_string(),
+    })
+}
 pub fn stored_password(entry: &HostEntry, no_input: bool) -> Result<Option<String>, String> {
     selected_password(entry, no_input)
 }
@@ -2783,6 +2849,100 @@ fn set_mode(path: &Path, mode: u32) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    use super::{Hop, SessionFailure, classify_session_error};
+
+    fn failure(hop: Hop, code: &str, detail: &str) -> Option<SessionFailure> {
+        Some(SessionFailure {
+            hop,
+            code: code.to_string(),
+            detail: detail.to_string(),
+        })
+    }
+
+    #[test]
+    fn classifies_direct_master_failures() {
+        assert_eq!(
+            classify_session_error("SSH_AUTH_FAILED: user@host: Permission denied (publickey)."),
+            failure(
+                Hop::Direct,
+                "SSH_AUTH_FAILED",
+                "user@host: Permission denied (publickey)."
+            )
+        );
+        assert_eq!(
+            classify_session_error("SSH_AUTH_TIMEOUT: OpenSSH authentication did not become ready"),
+            failure(
+                Hop::Direct,
+                "SSH_AUTH_TIMEOUT",
+                "OpenSSH authentication did not become ready"
+            )
+        );
+        assert_eq!(
+            classify_session_error(
+                "HOST_KEY_CHANGED: remote host key changed; refusing replacement"
+            )
+            .map(|failure| failure.hop),
+            Some(Hop::Direct)
+        );
+    }
+
+    #[test]
+    fn classifies_gateway_and_vm_hops() {
+        assert_eq!(
+            classify_session_error(&paired_stage_error(
+                "gateway",
+                "SSH_AUTH_FAILED: gw: Permission denied (publickey).".to_string()
+            )),
+            failure(
+                Hop::Gateway,
+                "SSH_AUTH_FAILED",
+                "gw: Permission denied (publickey)."
+            )
+        );
+        assert_eq!(
+            classify_session_error(&paired_stage_error(
+                "VM",
+                "HOST_KEY_TRUST_REQUIRED: host key requires interactive confirmation".to_string()
+            )),
+            failure(
+                Hop::Vm,
+                "HOST_KEY_TRUST_REQUIRED",
+                "host key requires interactive confirmation"
+            )
+        );
+        assert_eq!(
+            classify_session_error(&paired_stage_error(
+                "gateway",
+                "SSH_AUTH_FAILED: bind failed".to_string()
+            ))
+            .map(|failure| (failure.hop, failure.code)),
+            Some((Hop::Gateway, "TRANSIT_BIND_FAILED".to_string()))
+        );
+        assert_eq!(
+            classify_session_error(&paired_stage_error(
+                "VM",
+                "SERVICE_BIND_FAILED: requested service forward failed".to_string()
+            ))
+            .map(|failure| (failure.hop, failure.code)),
+            Some((Hop::Vm, "SERVICE_BIND_FAILED".to_string()))
+        );
+    }
+
+    #[test]
+    fn ignores_errors_outside_master_start() {
+        for error in [
+            "SESSION_INTERRUPTED: signal 2",
+            "SESSION_FAILED: cannot inspect shell: boom",
+            "VM_FORWARD_DUPLICATE: local listener 5432 was requested more than once",
+            "VM_SESSION_FAILED: cannot start shell",
+            "SERVICE_BIND_FAILED: cannot reserve local listener 127.0.0.1:80: in use",
+            "FORWARD_INVALID: -L requires a local listener",
+            "",
+        ] {
+            assert_eq!(classify_session_error(error), None, "{error}");
+        }
+    }
+
     use super::{
         Runtime, compile_config, compile_config_with_forwards, effective_known_hosts,
         known_hosts_path, paired_stage_error, service_forwards_ready,

@@ -949,6 +949,12 @@ pub fn parse_forwards(
     Ok(forwards)
 }
 
+/// First port above `start` that binds on 127.0.0.1 and is not in `reserved`.
+pub fn next_free_local_port(start: u16, reserved: &[u16]) -> Option<u16> {
+    (start.checked_add(1)?..=u16::MAX)
+        .find(|port| !reserved.contains(port) && TcpListener::bind(("127.0.0.1", *port)).is_ok())
+}
+
 pub fn reserve_forwards(forwards: &[ForwardSpec]) -> Result<(), String> {
     let mut reserved = Vec::new();
     for forward in forwards {
@@ -1703,6 +1709,19 @@ fn redact_error(error: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::next_free_local_port;
+
+    #[test]
+    fn next_free_local_port_skips_busy_and_reserved_ports() {
+        let busy = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = busy.local_addr().unwrap().port();
+        let next = next_free_local_port(port - 1, &[]);
+        assert!(next.is_some_and(|candidate| candidate > port));
+        let after = next_free_local_port(port - 1, &[next.unwrap()]);
+        assert!(after.is_some_and(|candidate| candidate > next.unwrap()));
+        assert_eq!(next_free_local_port(u16::MAX, &[]), None);
+    }
+
     use super::{
         RegistryEntry, active_direct_identity_matches, parse_forwards, reserve_forwards,
         split_colons,

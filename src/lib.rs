@@ -1,4 +1,5 @@
 pub mod connect;
+pub mod copy;
 pub mod discovery;
 pub mod doctor;
 pub mod keymap;
