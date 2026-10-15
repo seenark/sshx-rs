@@ -379,7 +379,7 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
                         || !cli.dynamic_forwards.is_empty()
                     {
                         return Err(
-                            "PAIR_FORWARD_INVALID: Pair routes accept declared VM services only"
+                            "PAIR_FORWARD_INVALID: Pair routes accept only REMOTE[=LOCAL] service forwards"
                                 .to_string(),
                         );
                     }
@@ -445,7 +445,7 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
                     || !cli.dynamic_forwards.is_empty()
                 {
                     return Err(
-                        "PAIR_FORWARD_INVALID: Pair routes accept declared VM services only"
+                        "PAIR_FORWARD_INVALID: Pair routes accept only REMOTE[=LOCAL] service forwards"
                             .to_string(),
                     );
                 }
@@ -1243,7 +1243,7 @@ fn run_tui_operation(cli: &Cli) -> Result<(), String> {
                         || !cli.dynamic_forwards.is_empty())
                 {
                     return Err(
-                        "PAIR_FORWARD_INVALID: Pair routes accept declared VM services only"
+                        "PAIR_FORWARD_INVALID: Pair routes accept only REMOTE[=LOCAL] service forwards"
                             .to_string(),
                     );
                 }
@@ -1581,13 +1581,24 @@ fn run_connection_workspace(
             Err(error) => return Err(error),
         }
     };
+    for forward in &preselected {
+        if !services.iter().any(|service| service.id == forward.id) {
+            services.push(sshx::session::DeclaredService {
+                id: forward.id.clone(),
+                remote_port: forward.remote_port,
+                destination_host: forward.destination_host.clone(),
+                default_local_port: forward.local_port,
+                name: None,
+            });
+        }
+    }
     if route.is_some()
         && (!cli.local_forwards.is_empty()
             || !cli.remote_forwards.is_empty()
             || !cli.dynamic_forwards.is_empty())
     {
         return Err(
-            "PAIR_FORWARD_INVALID: Pair routes accept declared VM services only".to_string(),
+            "PAIR_FORWARD_INVALID: Pair routes accept only REMOTE[=LOCAL] service forwards".to_string(),
         );
     }
     let custom = sshx::tunnel::parse_forwards(
@@ -1607,6 +1618,7 @@ fn run_connection_workspace(
             remote_port: forward.remote_port.unwrap_or(0),
             destination_host: forward.remote_host.clone().unwrap_or_default(),
             default_local_port: forward.local_port.unwrap_or(0),
+            name: None,
         });
         preselected.push(sshx::session::ServiceForward {
             id,

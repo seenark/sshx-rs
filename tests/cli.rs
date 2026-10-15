@@ -5935,6 +5935,141 @@ fn paired_session_rejects_custom_local_remote_and_socks_before_start() {
     fs::remove_dir_all(root).unwrap();
 }
 
+fn free_local_port() -> u16 {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    listener.local_addr().unwrap().port()
+}
+
+#[test]
+fn direct_session_forwards_undeclared_remote_port_to_loopback() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    let original = "Host direct\n  HostName direct.example\n";
+    write(&config, original);
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+    let local_port = free_local_port();
+    let bin = fake_ssh(&root);
+    fake_sshpass(&root);
+    let stop = Arc::new(AtomicBool::new(false));
+    let listener_stop = Arc::clone(&stop);
+    let started = root.join("master-started");
+    let listener_thread = thread::spawn(move || {
+        while !started.exists() && !listener_stop.load(Ordering::Relaxed) {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let _listener = TcpListener::bind(("127.0.0.1", local_port)).unwrap();
+        while !listener_stop.load(Ordering::Relaxed) {
+            thread::sleep(Duration::from_millis(10));
+        }
+    });
+    let args = vec![
+        "--config".to_string(),
+        config.to_string_lossy().into_owned(),
+        "connect".to_string(),
+        "direct".to_string(),
+        "--forward".to_string(),
+        format!("9090={local_port}"),
+        "--no-input".to_string(),
+    ];
+    let output = run_fake_ssh_owned(&home, &args, &bin, &root);
+    stop.store(true, Ordering::Relaxed);
+    listener_thread.join().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let runtime = fs::read_to_string(root.join("runtime-config")).unwrap();
+    assert!(
+        runtime.contains(&format!(
+            "LocalForward 127.0.0.1:{local_port} 127.0.0.1:9090"
+        )),
+        "{runtime}"
+    );
+    assert_eq!(fs::read_to_string(&config).unwrap(), original);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn paired_session_forwards_undeclared_remote_port_through_vm_only() {
+    let (root, home) = fixture_root();
+    let config = home.join(".ssh/config");
+    let original = concat!(
+        "##SSHX ID=11111111-1111-4111-8111-111111111111\n",
+        "##SSHX VM=22222222-2222-4222-8222-222222222222\n",
+        "Host gateway\n",
+        "  HostName gateway.example\n",
+        "  LocalForward 2200 vm.internal:22\n",
+        "  SessionType none\n",
+        "##SSHX ID=22222222-2222-4222-8222-222222222222\n",
+        "##SSHX GATEWAY=11111111-1111-4111-8111-111111111111\n",
+        "##SSHX TRANSIT=vm.internal:22\n",
+        "Host vm\n",
+        "  HostName vm.internal\n",
+        "  User vm-user\n",
+        "  Port 22\n",
+    );
+    write(&config, original);
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+    let local_port = free_local_port();
+    let bin = paired_fake_ssh(&root);
+    let stop = Arc::new(AtomicBool::new(false));
+    let listener_stop = Arc::clone(&stop);
+    let captures = root.join("captures");
+    let listener_thread = thread::spawn(move || {
+        let vm_started = || {
+            fs::read_dir(&captures).is_ok_and(|entries| {
+                entries.flatten().any(|entry| {
+                    fs::read_to_string(entry.path()).is_ok_and(|text| text.contains("Host vm\n"))
+                })
+            })
+        };
+        while !vm_started() && !listener_stop.load(Ordering::Relaxed) {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let _listener = TcpListener::bind(("127.0.0.1", local_port)).unwrap();
+        while !listener_stop.load(Ordering::Relaxed) {
+            thread::sleep(Duration::from_millis(10));
+        }
+    });
+    let forward = format!("9090={local_port}");
+    let output = run_paired_fake_ssh(
+        &home,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "connect",
+            "vm",
+            "--forward",
+            forward.as_str(),
+            "--no-input",
+        ],
+        &bin,
+        &root,
+    );
+    stop.store(true, Ordering::Relaxed);
+    listener_thread.join().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let mut gateway_runtime = String::new();
+    let mut vm_runtime = String::new();
+    for capture in fs::read_dir(root.join("captures")).unwrap() {
+        let text = fs::read_to_string(capture.unwrap().path()).unwrap();
+        if text.contains("Host gateway\n") {
+            gateway_runtime = text;
+        } else if text.contains("Host vm\n") {
+            vm_runtime = text;
+        }
+    }
+    assert!(
+        vm_runtime.contains(&format!(
+            "LocalForward 127.0.0.1:{local_port} 127.0.0.1:9090"
+        )),
+        "{vm_runtime}"
+    );
+    assert!(
+        !gateway_runtime.contains(&local_port.to_string()) && !gateway_runtime.contains(":9090"),
+        "{gateway_runtime}"
+    );
+    assert_eq!(fs::read_to_string(&config).unwrap(), original);
+    fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn direct_service_forward_preflight_preserves_busy_external_listener() {
     let (root, home) = fixture_root();
@@ -10640,14 +10775,6 @@ fn continuation_validates_exact_selectors_and_flags_before_ui() {
         &[
             "tui",
             "connect",
-            "--id",
-            "11111111-1111-4111-8111-111111111111",
-            "--forward",
-            "9999",
-        ],
-        &[
-            "tui",
-            "connect",
             "--password-fd",
             "3",
             "--vm-password-fd",
@@ -10928,7 +11055,7 @@ fn continuation_rejects_changed_source_then_cancels_empty_refresh() {
 
 #[cfg(unix)]
 #[test]
-fn continuation_changed_host_can_replace_declared_forward_and_start_tunnel() {
+fn continuation_changed_host_keeps_requested_forward_as_ad_hoc_row_and_starts_tunnel() {
     let (root, home) = fixture_root();
     let config = home.join(".ssh/config");
     let original = "Host first\n  HostName first.example\n  ##PORT 5432\nHost second\n  HostName second.example\n  ##PORT 6379\n";
@@ -10937,7 +11064,6 @@ fn continuation_changed_host_can_replace_declared_forward_and_start_tunnel() {
     let local_port = listener.local_addr().unwrap().port();
     drop(listener);
     let forward = format!("5432={local_port}");
-    let edit = format!("e{}{}\r\r", "\x7f".repeat(4), local_port);
     let bin = fake_tunnel_ssh(&root);
     let (status, output) = run_with_pty_interactions(
         &home,
@@ -10954,7 +11080,7 @@ fn continuation_changed_host_can_replace_declared_forward_and_start_tunnel() {
         &root,
         &[
             (b"Search:", b"second\r"),
-            (b"Connection workspace", edit.as_bytes()),
+            (b"Connection workspace", b"\r"),
             (b"Enter confirm", b"\r"),
             (b"Tunnel started:", b"\x1b"),
             (b"Search:", b"\x1b"),
@@ -10967,10 +11093,10 @@ fn continuation_changed_host_can_replace_declared_forward_and_start_tunnel() {
     assert!(runtime.contains("Host second\n"), "{runtime}");
     let arguments = fs::read_to_string(root.join("runtime-config.args")).unwrap();
     assert!(
-        arguments.contains(&format!("-L 127.0.0.1:{local_port}:127.0.0.1:6379")),
+        arguments.contains(&format!("-L 127.0.0.1:{local_port}:127.0.0.1:5432")),
         "{arguments}"
     );
-    assert!(!arguments.contains(":5432"), "{arguments}");
+    assert!(!arguments.contains(":6379"), "{arguments}");
     let listed = run_fake_ssh(&home, &["tunnel", "list", "--format", "json"], &bin, &root);
     assert!(listed.status.success(), "{listed:?}");
     let document: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();

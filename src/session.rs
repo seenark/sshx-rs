@@ -9,6 +9,7 @@ pub struct DeclaredService {
     pub remote_port: u16,
     pub destination_host: String,
     pub default_local_port: u16,
+    pub name: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -188,42 +189,52 @@ pub fn declared_services(entry: &HostEntry) -> Result<Vec<DeclaredService>, Stri
         }
     }
 
-    let mut services = Vec::with_capacity(ports.len());
+    let mut services = Vec::with_capacity(ports.len() + metadata.len());
     for (index, remote_port) in ports.into_iter().enumerate() {
         services.push(DeclaredService {
             id: format!("{remote_port}#{}", index + 1),
             remote_port,
             destination_host: "127.0.0.1".to_string(),
             default_local_port: remote_port,
+            name: None,
         });
     }
 
+    // A SERVICE line refines every service declared for its remote port, or declares one itself.
     for metadata in metadata {
-        let mut matched = false;
+        if !services
+            .iter()
+            .any(|service| service.remote_port == metadata.remote_port)
+        {
+            services.push(DeclaredService {
+                id: format!("{}#{}", metadata.remote_port, services.len() + 1),
+                remote_port: metadata.remote_port,
+                destination_host: "127.0.0.1".to_string(),
+                default_local_port: metadata.remote_port,
+                name: None,
+            });
+        }
         for service in services
             .iter_mut()
             .filter(|service| service.remote_port == metadata.remote_port)
         {
-            matched = true;
             if let Some(host) = metadata.destination_host.as_deref() {
-                validate_destination_host(host)?;
                 service.destination_host = host.to_string();
             }
             if let Some(local_port) = metadata.default_local_port {
-                validate_port(local_port, "SERVICE_DEFAULT")?;
                 service.default_local_port = local_port;
             }
-        }
-        if !matched {
-            return Err(format!(
-                "FORWARD_METADATA_INVALID: service metadata references undeclared remote port {}",
-                metadata.remote_port
-            ));
+            if let Some(name) = metadata.name.as_deref() {
+                service.name = Some(name.to_string());
+            }
         }
     }
     Ok(services)
 }
 
+/// Resolves `REMOTE[=LOCAL]` and `PORT#INDEX[=LOCAL]` specifications. A bare remote port needs no
+/// declaration: it targets `127.0.0.1` on the route's last hop, and a declared service only
+/// supplies defaults. Ad hoc forwards use the bare remote port as their id; declared ids contain `#`.
 pub fn resolve_forwards(
     entry: &HostEntry,
     specifications: &[String],
@@ -240,8 +251,13 @@ pub fn resolve_forwards(
                     || (by_remote_port && service.remote_port == remote_port)
             })
             .collect::<Vec<_>>();
-        let service = match matches.as_slice() {
-            [service] => *service,
+        let (id, destination_host, default_local_port) = match matches.as_slice() {
+            [service] => (
+                service.id.clone(),
+                service.destination_host.clone(),
+                service.default_local_port,
+            ),
+            [] if by_remote_port => (selector.to_string(), "127.0.0.1".to_string(), remote_port),
             [] => {
                 return Err(format!(
                     "FORWARD_NOT_FOUND: service `{selector}` is not declared for selected host"
@@ -255,19 +271,18 @@ pub fn resolve_forwards(
         };
         if forwards
             .iter()
-            .any(|forward: &ServiceForward| forward.id == service.id)
+            .any(|forward: &ServiceForward| forward.id == id)
         {
             return Err(format!(
-                "FORWARD_DUPLICATE: service `{}` was requested more than once",
-                service.id
+                "FORWARD_DUPLICATE: service `{id}` was requested more than once"
             ));
         }
-        let local_port = local_override.unwrap_or(service.default_local_port);
+        let local_port = local_override.unwrap_or(default_local_port);
         validate_port(local_port, "SERVICE_BIND")?;
         forwards.push(ServiceForward {
-            id: service.id.clone(),
-            remote_port: service.remote_port,
-            destination_host: service.destination_host.clone(),
+            id,
+            remote_port,
+            destination_host,
             local_port,
         });
     }
@@ -406,6 +421,24 @@ struct ServiceMetadata {
     remote_port: u16,
     destination_host: Option<String>,
     default_local_port: Option<u16>,
+    name: Option<String>,
+}
+
+pub(crate) enum DeclarationLine {
+    Port(u16),
+    Service(u16),
+}
+
+/// Classifies a config line as a `##PORT` or `##SSHX SERVICE` declaration; invalid lines are `None`.
+pub(crate) fn declaration_line(line: &str) -> Option<DeclarationLine> {
+    let line = line.trim_start();
+    if let Ok(Some(port)) = declared_port(line) {
+        return Some(DeclarationLine::Port(port));
+    }
+    match service_metadata(line) {
+        Ok(Some(metadata)) => Some(DeclarationLine::Service(metadata.remote_port)),
+        _ => None,
+    }
 }
 
 fn declared_port(line: &str) -> Result<Option<u16>, String> {
@@ -440,6 +473,7 @@ fn service_metadata(line: &str) -> Result<Option<ServiceMetadata>, String> {
     let mut remote_port = None;
     let mut destination_host = None;
     let mut default_local_port = None;
+    let mut name = None;
     let mut positional_host = false;
     for token in rest.split_whitespace() {
         if let Some((key, value)) = token.split_once('=') {
@@ -453,6 +487,7 @@ fn service_metadata(line: &str) -> Result<Option<ServiceMetadata>, String> {
                 "local" | "local_port" | "bind" | "bind_port" => {
                     default_local_port = Some(parse_metadata_port(value)?)
                 }
+                "name" => name = Some(value.to_string()),
                 _ => {
                     return Err(format!(
                         "FORWARD_METADATA_INVALID: unknown SERVICE field `{key}`"
@@ -492,11 +527,27 @@ fn service_metadata(line: &str) -> Result<Option<ServiceMetadata>, String> {
     if let Some(port) = default_local_port {
         validate_port(port, "SERVICE_DEFAULT")?;
     }
+    if let Some(name) = name.as_deref() {
+        validate_service_name(name)?;
+    }
     Ok(Some(ServiceMetadata {
         remote_port,
         destination_host,
         default_local_port,
+        name,
     }))
+}
+
+pub(crate) fn validate_service_name(name: &str) -> Result<(), String> {
+    if name.is_empty()
+        || name.contains(|character: char| character.is_whitespace() || character.is_control())
+    {
+        return Err(
+            "FORWARD_METADATA_INVALID: SERVICE NAME must be non-empty without whitespace or control characters"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 fn marker_value<'a>(line: &'a str, marker: &str) -> Option<&'a str> {
@@ -521,7 +572,7 @@ fn parse_metadata_port(value: &str) -> Result<u16, String> {
         .map_err(|_| "FORWARD_METADATA_INVALID: service port must be a number".to_string())
 }
 
-fn validate_port(port: u16, code: &str) -> Result<(), String> {
+pub(crate) fn validate_port(port: u16, code: &str) -> Result<(), String> {
     if port == 0 {
         return Err(format!("{code}_INVALID: port must be between 1 and 65535"));
     }
@@ -551,7 +602,7 @@ pub(crate) fn unbracket_ipv6_host(host: &str) -> Result<&str, String> {
         None => Ok(host),
     }
 }
-fn validate_destination_host(host: &str) -> Result<(), String> {
+pub(crate) fn validate_destination_host(host: &str) -> Result<(), String> {
     if host.is_empty()
         || host.starts_with('-')
         || host.contains(|character: char| {
@@ -569,9 +620,7 @@ fn parse_specification(value: &str) -> Result<(&str, u16, Option<u16>), String> 
         .split_once('=')
         .map_or((value, None), |(left, right)| (left, Some(right)));
     if selector.is_empty() || selector.contains(':') || selector.contains('/') {
-        return Err(
-            "FORWARD_UNSAFE: forward selector must contain only a declared remote port".to_string(),
-        );
+        return Err("FORWARD_UNSAFE: forward selector must contain only a remote port".to_string());
     }
     let (remote, index) = selector
         .split_once('#')
@@ -644,7 +693,7 @@ fn prompt_line(prompt: &str) -> Result<String, String> {
 mod tests {
     use super::{
         ServiceForward, declared_services, preflight, preflight_issues,
-        resolve_custom_local_forwards, resolve_forwards,
+        resolve_custom_local_forwards, resolve_forwards, validate_service_name,
     };
     use crate::discovery::{HostEntry, Provenance, SourceIdentity};
     use std::fs;
@@ -892,6 +941,99 @@ mod tests {
         ));
         let error = declared_services(&entry).expect_err("SSH tokens must be rejected");
         assert!(error.starts_with("FORWARD_UNSAFE"), "{error}");
+        fs::remove_file(path).expect("fixture should remove");
+    }
+
+    #[test]
+    fn service_line_declares_without_port_line_and_carries_name() {
+        let (path, entry) = entry(concat!(
+            "Host selected\n",
+            "  ##SSHX SERVICE 5432 LOCAL=15432 HOST=db.internal NAME=postgres\n",
+            "  ##SSHX SERVICE 80\n",
+        ));
+        let services = declared_services(&entry).expect("SERVICE lines should declare");
+        assert_eq!(services.len(), 2);
+        assert_eq!(services[0].id, "5432#1");
+        assert_eq!(services[0].destination_host, "db.internal");
+        assert_eq!(services[0].default_local_port, 15432);
+        assert_eq!(services[0].name.as_deref(), Some("postgres"));
+        assert_eq!(services[1].id, "80#2");
+        assert_eq!(services[1].default_local_port, 80);
+        assert_eq!(services[1].name, None);
+        fs::remove_file(path).expect("fixture should remove");
+    }
+
+    #[test]
+    fn service_line_refines_matching_port_line_into_one_service() {
+        let (path, entry) = entry(concat!(
+            "Host selected\n",
+            "  ##PORT 5432\n",
+            "  ##SSHX SERVICE 5432 NAME=pg LOCAL=15432\n",
+        ));
+        let services = declared_services(&entry).expect("services should parse");
+        assert_eq!(services.len(), 1);
+        assert_eq!(services[0].id, "5432#1");
+        assert_eq!(services[0].default_local_port, 15432);
+        assert_eq!(services[0].name.as_deref(), Some("pg"));
+        fs::remove_file(path).expect("fixture should remove");
+    }
+
+    #[test]
+    fn service_name_must_be_non_empty_without_control_characters() {
+        let (path, empty_name) = entry("Host selected\n  ##SSHX SERVICE 5432 NAME=\n");
+        let error = declared_services(&empty_name).expect_err("empty name must be rejected");
+        assert!(error.starts_with("FORWARD_METADATA_INVALID"), "{error}");
+        let (control_path, control_entry) =
+            entry("Host selected\n  ##SSHX SERVICE 5432 NAME=a\u{7}b\n");
+        assert!(declared_services(&control_entry).is_err());
+        assert!(validate_service_name("two words").is_err());
+        assert!(validate_service_name("pg-primary").is_ok());
+        fs::remove_file(path).expect("fixture should remove");
+        fs::remove_file(control_path).expect("fixture should remove");
+    }
+
+    #[test]
+    fn undeclared_remote_port_forwards_to_loopback_with_chosen_local_port() {
+        let (path, entry) = entry("Host selected\n  ##PORT 5432\n");
+        let forwards = resolve_forwards(&entry, &["9090".to_string(), "8080=18080".to_string()])
+            .expect("undeclared ports should resolve");
+        assert_eq!(
+            forwards
+                .iter()
+                .map(|forward| (
+                    forward.id.as_str(),
+                    forward.destination_host.as_str(),
+                    forward.remote_port,
+                    forward.local_port
+                ))
+                .collect::<Vec<_>>(),
+            [
+                ("9090", "127.0.0.1", 9090, 9090),
+                ("8080", "127.0.0.1", 8080, 18080)
+            ]
+        );
+        fs::remove_file(path).expect("fixture should remove");
+    }
+
+    #[test]
+    fn declared_service_supplies_defaults_to_remote_port_forward() {
+        let (path, entry) =
+            entry("Host selected\n  ##SSHX SERVICE 5432 LOCAL=15432 HOST=db.internal NAME=pg\n");
+        let forwards = resolve_forwards(&entry, &["5432".to_string()]).unwrap();
+        assert_eq!(forwards[0].destination_host, "db.internal");
+        assert_eq!(forwards[0].local_port, 15432);
+        let overridden = resolve_forwards(&entry, &["5432=16000".to_string()]).unwrap();
+        assert_eq!(overridden[0].local_port, 16000);
+        fs::remove_file(path).expect("fixture should remove");
+    }
+
+    #[test]
+    fn port_index_selector_still_requires_a_declaration() {
+        let (path, entry) = entry("Host selected\n  ##PORT 5432\n");
+        assert!(resolve_forwards(&entry, &["5432#1".to_string()]).is_ok());
+        let error = resolve_forwards(&entry, &["9090#1".to_string()])
+            .expect_err("undeclared index selector must fail");
+        assert!(error.starts_with("FORWARD_NOT_FOUND"), "{error}");
         fs::remove_file(path).expect("fixture should remove");
     }
 }
