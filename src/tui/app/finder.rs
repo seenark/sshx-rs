@@ -1,6 +1,9 @@
 use super::{
-    ConnectRequest, Ctx, Effect, Outcome, Screen, ScreenStatus, cmdline::CommandLine,
+    ConnectRequest, Ctx, Effect, Outcome, Screen, ScreenStatus,
+    cmdline::CommandLine,
     copy::CopyRequest,
+    delete::DeleteConfirm,
+    host_form::{EditorRequest, HostForm, open},
 };
 use crate::tui::matcher::{Row, compare_rows, matching_rows, row_label, row_rank};
 use crate::tui::widgets::block;
@@ -370,6 +373,22 @@ impl Screen for Finder {
                     tunnel_id,
                 })));
             }
+            Action::NewHost => return open(HostForm::create(ctx)),
+            Action::EditHostForm | Action::EditHostInEditor | Action::DeleteHost => {
+                let Some(row) = rows.get(self.selected.min(last)) else {
+                    return Outcome::Stay;
+                };
+                let (entry, alias) = (row.row.entry, row.row.alias);
+                return match action {
+                    Action::EditHostForm => open(HostForm::edit(ctx, entry, alias)),
+                    Action::EditHostInEditor => {
+                        Outcome::Effect(Effect::EditInEditor(Box::new(EditorRequest::new(entry))))
+                    }
+                    _ => open(DeleteConfirm::new(ctx, entry, alias)),
+                };
+            }
+            Action::Undo => return Outcome::Effect(Effect::Undo),
+            Action::Redo => return Outcome::Effect(Effect::Redo),
             Action::CommandLine => {
                 return Outcome::Push(Box::new(CommandLine::new(
                     self.kind(),

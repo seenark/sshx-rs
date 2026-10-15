@@ -460,7 +460,11 @@ impl AppliedChange {
         }
         let mut done = Vec::new();
         for write in order {
-            if let Err(error) = rewrite(write, write_state(write, !forward), write_state(write, forward)) {
+            if let Err(error) = rewrite(
+                write,
+                write_state(write, !forward),
+                write_state(write, forward),
+            ) {
                 for earlier in done.into_iter().rev() {
                     let _ = rewrite(
                         earlier,
@@ -3132,8 +3136,8 @@ mod tests {
             )
         );
         let (id, start, end) = fixture.block_a();
-        let values = current_values(&super::span_request(&fixture.path, &id, "a", start, end))
-            .unwrap();
+        let values =
+            current_values(&super::span_request(&fixture.path, &id, "a", start, end)).unwrap();
         assert_eq!(values.proxy_jump.as_deref(), Some("jump"));
         assert_eq!(values.identity_file, None);
     }
@@ -3155,9 +3159,9 @@ mod tests {
         let plan = plan_create(&request).unwrap();
         apply(&plan).unwrap();
         assert!(
-            fixture
-                .text()
-                .ends_with("Host b\n  HostName b.example\n  ProxyJump a\n  IdentityFile ~/.ssh/b\n"),
+            fixture.text().ends_with(
+                "Host b\n  HostName b.example\n  ProxyJump a\n  IdentityFile ~/.ssh/b\n"
+            ),
             "{}",
             fixture.text()
         );

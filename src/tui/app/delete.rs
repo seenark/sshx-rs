@@ -54,7 +54,12 @@ impl DeleteConfirm {
         let block = plan(entry, alias)?
             .files
             .iter()
-            .flat_map(|file| file.patch.lines().skip(3).map(|line| line.replace("<redacted>", "••••")))
+            .flat_map(|file| {
+                file.patch
+                    .lines()
+                    .skip(3)
+                    .map(|line| line.replace("<redacted>", "••••"))
+            })
             .collect();
         Ok(Self {
             request: DeleteRequest {
