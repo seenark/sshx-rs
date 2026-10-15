@@ -1,5 +1,7 @@
 mod cmdline;
+mod copy;
 mod effects;
+mod failure;
 mod finder;
 mod first_run;
 mod help;
@@ -22,11 +24,13 @@ use std::path::{Path, PathBuf};
 
 use super::terminal::{AppTerminal, read_key, with_terminal};
 
+#[derive(Clone)]
 pub(crate) struct ForwardRequest {
     pub remote: u16,
     pub local: u16,
 }
 
+#[derive(Clone)]
 pub(crate) struct ConnectRequest {
     pub entry: HostEntry,
     pub alias: String,
@@ -49,6 +53,7 @@ pub(crate) enum Effect {
     RootAdd(String),
     RootRemove(String),
     RegisterRoots(Vec<RegisteredRoot>),
+    Copy(Box<copy::CopyRequest>),
 }
 
 #[derive(Default)]

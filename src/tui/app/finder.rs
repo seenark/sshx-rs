@@ -1,4 +1,7 @@
-use super::{ConnectRequest, Ctx, Effect, Outcome, Screen, ScreenStatus, cmdline::CommandLine};
+use super::{
+    ConnectRequest, Ctx, Effect, Outcome, Screen, ScreenStatus, cmdline::CommandLine,
+    copy::CopyRequest,
+};
 use crate::tui::matcher::{Row, compare_rows, matching_rows, row_label, row_rank};
 use crate::tui::widgets::block;
 use ratatui::{
@@ -343,6 +346,28 @@ impl Screen for Finder {
                     entry: row.row.entry.clone(),
                     alias: row.row.alias.to_string(),
                     forwards: Vec::new(),
+                })));
+            }
+            Action::Copy(target) => {
+                let Some(row) = rows.get(self.selected.min(last)) else {
+                    return Outcome::Stay;
+                };
+                let entry = row.row.entry;
+                let tunnel_id = ctx
+                    .tunnels
+                    .iter()
+                    .find(|tunnel| {
+                        tunnel.state == "active"
+                            && (tunnel.entry_id == entry.id
+                                || tunnel.vm_entry_id.as_deref() == Some(entry.id.as_str()))
+                    })
+                    .map(|tunnel| tunnel.id.clone());
+                return Outcome::Effect(Effect::Copy(Box::new(CopyRequest {
+                    target,
+                    entry: entry.clone(),
+                    alias: row.row.alias.to_string(),
+                    forwards: Vec::new(),
+                    tunnel_id,
                 })));
             }
             Action::CommandLine => {
