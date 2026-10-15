@@ -2248,6 +2248,7 @@ fn save_replacement_for(
         clear_user: false,
         clear_port: false,
         clear_password: false,
+        ..UpdateRequest::default()
     })?;
     mutation::apply_edit(&plan)
 }

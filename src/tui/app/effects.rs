@@ -1,6 +1,6 @@
 use super::{
-    ConnectRequest, Effect, EffectResult, PreferenceChange, Runtime, copy, failure::Failure,
-    finder::Finder, input_mode,
+    ConnectRequest, Effect, EffectResult, PreferenceChange, Runtime, copy, delete,
+    failure::Failure, finder::Finder, host_form, input_mode, undo,
 };
 use crate::tui::CANCELLED;
 use sshx::discovery::scope_for_path;
@@ -17,6 +17,11 @@ pub(super) fn execute(runtime: &mut Runtime, effect: Effect) -> Result<EffectRes
         Effect::RootRemove(path) => root_remove(runtime, &path),
         Effect::RegisterRoots(roots) => register_roots(runtime, roots),
         Effect::Copy(request) => copy::copy(runtime, &request),
+        Effect::SaveHost(request) => host_form::save(runtime, &request),
+        Effect::EditInEditor(request) => host_form::edit_in_editor(&request),
+        Effect::DeleteHost(request) => delete::delete(runtime, &request),
+        Effect::Undo => undo::undo(runtime),
+        Effect::Redo => undo::redo(runtime),
     }
 }
 

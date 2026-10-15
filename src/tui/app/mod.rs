@@ -1,11 +1,14 @@
 mod cmdline;
 mod copy;
+mod delete;
 mod effects;
 mod failure;
 mod finder;
 mod first_run;
 mod help;
+mod host_form;
 mod status;
+mod undo;
 mod whichkey;
 
 use crate::Cli;
@@ -54,6 +57,11 @@ pub(crate) enum Effect {
     RootRemove(String),
     RegisterRoots(Vec<RegisteredRoot>),
     Copy(Box<copy::CopyRequest>),
+    SaveHost(Box<host_form::SaveRequest>),
+    EditInEditor(Box<host_form::EditorRequest>),
+    DeleteHost(Box<delete::DeleteRequest>),
+    Undo,
+    Redo,
 }
 
 #[derive(Default)]
@@ -238,6 +246,7 @@ pub(crate) struct Runtime<'a> {
     keymap: Keymap,
     which_key: Option<WhichKey>,
     toast: Option<String>,
+    undo: undo::UndoStack,
 }
 
 pub(crate) fn run_app(
@@ -315,6 +324,7 @@ impl<'a> Runtime<'a> {
             stack: vec![screen],
             keymap: Keymap::new(),
             which_key: None,
+            undo: undo::UndoStack::default(),
             toast: match (initial_toast, discovery_error) {
                 (Some(toast), Some(error)) => Some(format!("{toast}\n{error}")),
                 (toast, error) => toast.or(error),

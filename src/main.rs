@@ -2413,6 +2413,7 @@ fn run_host_edit(cli: &Cli, roots: &[RegisteredRoot]) -> Result<(), String> {
         clear_user: cli.clear_user,
         clear_port: cli.clear_port,
         clear_password: cli.clear_password,
+        ..UpdateRequest::default()
     };
     if request.alias.is_some()
         || request.hostname.is_some()
@@ -2681,6 +2682,7 @@ fn run_host_edit_workspace(
         clear_user: false,
         clear_port: false,
         clear_password: false,
+        ..UpdateRequest::default()
     };
     let current = mutation::current_values(&request)?;
     let original = [
