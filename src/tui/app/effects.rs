@@ -1,5 +1,6 @@
 use super::{
-    ConnectRequest, Effect, EffectResult, PreferenceChange, Runtime, finder::Finder, input_mode,
+    ConnectRequest, Effect, EffectResult, PreferenceChange, Runtime, copy, failure::Failure,
+    finder::Finder, input_mode,
 };
 use crate::tui::CANCELLED;
 use sshx::discovery::scope_for_path;
@@ -15,6 +16,7 @@ pub(super) fn execute(runtime: &mut Runtime, effect: Effect) -> Result<EffectRes
         Effect::RootAdd(path) => root_add(runtime, &path),
         Effect::RootRemove(path) => root_remove(runtime, &path),
         Effect::RegisterRoots(roots) => register_roots(runtime, roots),
+        Effect::Copy(request) => copy::copy(runtime, &request),
     }
 }
 
@@ -36,8 +38,9 @@ fn quit(cancelled: bool) -> Result<EffectResult, String> {
 }
 
 /// Session mode through the existing direct and Pair session functions. A finished session
-/// ends sshx; a master that never started returns to the finder with the error as a toast,
-/// after rediscovery because the failure may come from sources that changed on disk.
+/// ends sshx; a master that failed to start shows the failure screen, and any other error
+/// (interruptions included) returns to the finder as a toast, after rediscovery because the
+/// failure may come from sources that changed on disk.
 fn connect(runtime: &Runtime, request: &ConnectRequest) -> Result<EffectResult, String> {
     let mut result = start_session(runtime, request)?;
     result.refresh |= result.exit.is_none();
@@ -117,8 +120,23 @@ fn start_session(runtime: &Runtime, request: &ConnectRequest) -> Result<EffectRe
             exit: Some(code),
             ..EffectResult::default()
         }),
-        Err(error) if error.starts_with("SESSION_INTERRUPTED") => Err(error),
-        Err(error) => Ok(toast(error)),
+        Err(error) => Ok(match sshx::connect::classify_session_error(&error) {
+            Some(failure) => EffectResult {
+                push: Some(Box::new(Failure::new(
+                    request,
+                    failure,
+                    route.as_ref().and_then(|route| {
+                        Some((
+                            route.gateway.aliases.first()?.clone(),
+                            request.alias.clone(),
+                        ))
+                    }),
+                    error,
+                ))),
+                ..EffectResult::default()
+            },
+            None => toast(error),
+        }),
     }
 }
 
