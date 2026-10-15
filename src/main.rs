@@ -195,7 +195,7 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
             println!("{}", help::render(&[])?);
             return Ok(());
         }
-        return tui::run_app(&cli, &home_dir()?, None);
+        return tui::run_app(&cli, &home_dir()?, registered_roots(&cli)?, None);
     }
     if cli.action.is_some() && cli.format.is_machine() {
         return Err(
@@ -218,7 +218,7 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
             cli.id = None;
             cli.location = SourceLocation::default();
             cli.command = Command::Hosts { explicit: true };
-            return tui::run_app(&cli, &home_dir()?, Some(status.to_string()));
+            return tui::run_app(&cli, &home_dir()?, roots, Some(status.to_string()));
         }
         return Ok(());
     }
@@ -915,7 +915,12 @@ fn run_tui_operation(cli: &Cli) -> Result<(), String> {
     }
     if matches!(cli.command, Command::Setup) {
         run_setup_workspace(cli, &home)?;
-        return tui::run_app(cli, &home, Some("Config root registered.".to_string()));
+        return tui::run_app(
+            cli,
+            &home,
+            settings::load(&home)?,
+            Some("Config root registered.".to_string()),
+        );
     }
     if matches!(cli.command, Command::Doctor) {
         return run_doctor_workspace(cli, &home);
@@ -957,7 +962,7 @@ fn run_tui_operation(cli: &Cli) -> Result<(), String> {
     let roots = registered_roots(cli)?;
     if matches!(cli.command, Command::PairList | Command::PairValidate) {
         run_pairs_workspace(cli, &roots)?;
-        return tui::run_app(cli, &home, None);
+        return tui::run_app(cli, &home, roots, None);
     }
     let mut catalog =
         discover_roots(&settings::discovery_roots(&roots)).map_err(|error| error.to_string())?;
@@ -1270,7 +1275,6 @@ fn entry_sources_unchanged<K: std::borrow::Borrow<str> + std::hash::Hash + Eq>(
 struct ConnectionOutcome {
     completed: bool,
     quit: bool,
-    status: Option<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1322,7 +1326,6 @@ fn run_connection_workspace(
             .map(|()| ConnectionOutcome {
                 completed: false,
                 quit: false,
-                status: None,
             });
     }
     if matches!(cli.command, Command::TunnelPairedStart(_)) && route.is_none() {
@@ -1331,7 +1334,6 @@ fn run_connection_workspace(
             .map(|()| ConnectionOutcome {
                 completed: false,
                 quit: false,
-                status: None,
             });
     }
     let target = route.as_ref().map_or(entry, |route| &route.vm);
@@ -1481,14 +1483,12 @@ fn run_connection_workspace(
                 return Ok(ConnectionOutcome {
                     completed,
                     quit: false,
-                    status,
                 });
             }
             Err(error) if error == tui::CANCELLED => {
                 return Ok(ConnectionOutcome {
                     completed,
                     quit: true,
-                    status,
                 });
             }
             Err(error) => return Err(error),
@@ -1588,7 +1588,6 @@ fn run_connection_workspace(
             return Ok(ConnectionOutcome {
                 completed,
                 quit: false,
-                status,
             });
         }
         restored = Some(choice);

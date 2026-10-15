@@ -223,9 +223,7 @@ fn pairs_tab_reviews_exact_secondary_alias_sources_then_refreshes_applied_record
         fs::write(source, bytes).unwrap();
     }
     let before = fixture.snapshot();
-    let mut terminal = PairTerminal::open(&fixture, &[]);
-    terminal.expect("sshx Hosts");
-    terminal.send(b"\x10");
+    let mut terminal = PairTerminal::open(&fixture, &["tui", "pair", "list"]);
     terminal.expect("No valid Pair relationships.");
     terminal.send(b"s");
     terminal.expect("Pair setup");
@@ -282,10 +280,7 @@ fn pairs_tab_reviews_exact_secondary_alias_sources_then_refreshes_applied_record
             *mode
         );
     }
-    terminal.send(b"\x1b");
-    terminal.expect("sshx Hosts");
-    terminal.send(b"\x1b");
-    assert_eq!(terminal.finish(), Some(0));
+    terminal.leave_pairs();
 }
 
 #[test]
@@ -2202,8 +2197,10 @@ impl PairTerminal {
 
     fn leave_pairs(&mut self) {
         self.send(b"\x1b");
-        self.expect("sshx Hosts");
+        self.expect("Search:");
         self.send(b"\x1b");
+        self.expect("NORMAL");
+        self.send(b"q");
         assert_eq!(self.finish(), Some(0));
     }
 

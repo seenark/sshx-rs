@@ -62,7 +62,7 @@ Default personal root is `~/.ssh/config`. This environment also supports the exi
 
 Run `sshx` with no arguments to open Hosts. Run `sshx --config PATH` to open Hosts against an explicit config root; this also requires usable terminals.
 
-In Hosts, select a HostEntry and press **Ctrl+Y** to copy its stored password. This shortcut also works in `sshx tui host show`. It requires a direct HostEntry with a non-empty stored password and a supported clipboard backend. The copy needs no confirmation unless the `password_confirm` setting is on; then answer `y` to `Copy stored password now? [y/N]:`. The clipboard-history warning appears on the first copy only. Copying, declining, or an unavailable action returns to Hosts with the same search and selection; it never starts SSH or displays the password. After `clipboard_clear` seconds (default 30), a detached helper clears the clipboard if it still holds the copied password. Clipboard backends without a readback tool are never cleared.
+The Hosts TUI has no copy keys yet; run `sshx connect HOST --action copy-password` to copy a stored password. It requires a direct HostEntry with a non-empty stored password and a supported clipboard backend. The copy needs no confirmation unless the `password_confirm` setting is on; then answer `y` to `Copy stored password now? [y/N]:`. The clipboard-history warning appears on the first copy only. Copying, declining, or an unavailable action returns to Hosts with the same search and selection; it never starts SSH or displays the password. After `clipboard_clear` seconds (default 30), a detached helper clears the clipboard if it still holds the copied password. Clipboard backends without a readback tool are never cleared.
 
 Let setup discover existing roots:
 
@@ -84,7 +84,7 @@ Register another scope or project without moving files:
 sshx setup --project payments --root work=~/work/ssh/config
 ```
 
-In Hosts, press **Ctrl+S** for Setup or **Ctrl+D** for Doctor, including when no HostEntries are found. Setup lists registered roots and lets you edit scope (usually personal/work), optional project, and an existing SSH config path. Press **Ctrl+S** to register the displayed root; opening or editing Setup never registers it. Missing paths, directories, and symlinked root files do not register. **Esc** cancels without changing SSH config or root settings.
+Run `sshx setup` for Setup or `sshx doctor` for Doctor. Setup lists registered roots and lets you edit scope (usually personal/work), optional project, and an existing SSH config path. Press **Ctrl+S** to register the displayed root; opening or editing Setup never registers it. Missing paths, directories, and symlinked root files do not register. **Esc** cancels without changing SSH config or root settings.
 
 Partial `sshx setup --scope work --project payments` continues in Setup when no work root is discovered on a usable TTY, with scope and project prefilled and the path focused. Complete root options retain direct CLI behavior, including `--config PATH` with inferred scope. Use `sshx tui setup --config PATH --scope work --project payments` to edit even a complete request before registering. Successful registration returns to Hosts and rediscovers HostEntries from SSH config files. Without usable terminals, with `--no-input`, or with machine output, missing roots produce an actionable CLI error instead of opening Setup.
 
@@ -95,13 +95,26 @@ sshx doctor
 sshx doctor --format json
 ```
 
-`doctor` groups findings by severity and stage, with path, evidence, and next action. It reports only by default. In Hosts, choose Doctor, then **Repair eligible permissions** to review one explicit plan. The CLI equivalent is `sshx doctor --fix-permissions`. Both require one confirmation before chmod. Wrong-owner, symlink, shared, and otherwise ineligible paths stay unchanged. Doctor never enrolls host keys, rewrites config, adopts processes, or stops tunnels.
+`doctor` groups findings by severity and stage, with path, evidence, and next action. It reports only by default. Run `sshx tui doctor`, then **Repair eligible permissions** to review one explicit plan. The CLI equivalent is `sshx doctor --fix-permissions`. Both require one confirmation before chmod. Wrong-owner, symlink, shared, and otherwise ineligible paths stay unchanged. Doctor never enrolls host keys, rewrites config, adopts processes, or stops tunnels.
+
+## The Hosts TUI
+
+`sshx` with usable terminals opens Hosts, a modal finder in the style of Helix and Neovim. Typing searches (Insert input mode, the default); `Esc` switches to Normal input mode and never quits. `i`, `a`, or `/` return to Insert. `q` or `:q` quits from Normal input mode; `Ctrl+C` quits from any input mode with status `130`.
+
+- Empty search shows a RECENT group (from per-HostEntry usage state), then every HostEntry grouped by config root. A typed query sorts by fuzzy rank, then use frequency, then alias. Duplicate aliases keep their source and ID labels. `⇄N` counts declared services.
+- A preview pane shows the route (direct, or `gateway → VM` for a Pair), HostName, declared services, and last use. It collapses below 70 columns.
+- `Enter` opens Session mode immediately with no service forwards and no prompts. After the session ends, sshx exits with ssh's exit code.
+- Movement: `j`/`k` or arrows, counts such as `5j`, `gg`, `ge`, `^d`, `^u`. `g r`, `g p`, `g w` jump to the recent, personal, and work groups; `g t` opens the Tunnels workspace. `space f p|w|r` filter to the personal root, work root, or recent HostEntries; repeating a filter clears it.
+- A which-key box opens on every prefix key (`space`, `g`, `y`, `d`, `c`, `Z`); `Esc` or `Backspace` goes up one level. `?` (Normal input mode, or Insert with an empty search) and `F1` open help, grouped by section and filterable.
+- `:` opens a command line with `Tab` completion: `:q`, `:help`, `:ssh HOST [REMOTE[=LOCAL]...]`, `:set OPTION[=VALUE]`, `:root add|remove PATH`, `:tunnel list`. `:set` persists `startmode` (`insert`|`normal`), `autoinfo` (`false` hides the which-key box), `bind` (loopback only), `clipboard_clear` (`off` or seconds), and `password_confirm` in the sshx settings file.
+- The status line shows input mode, config-root filter, position, running standalone tunnels, toast, and pending keys.
+- With no registered config roots, a first-run screen lists detected SSH config files (`~/.ssh/config`, `~/.ssh/config.d/*`). Tick with `x`, label with `p` (personal) or `w` (work), and press `Enter` to register them. `s` skips setup and `q` quits.
 
 ## List and select HostEntries
 
 A **HostEntry** is an exact `Host` block identified by source file and Host line. An alias is not a unique identity; duplicate aliases remain separate entries.
 
-To delete from Hosts, press `Ctrl+X` on the selected HostEntry. Review its exact source, Host line, byte span, redacted deletion diff, and Pair dependencies before pressing `Enter`; `Esc` cancels. Pair references and active managed use block deletion. Incomplete `sshx host delete` opens the exact picker and review, and `sshx tui host delete HOST` opens review explicitly. After explicit TUI deletion or preview, Hosts shows the result and stays open until you quit. `--preview` never writes, and TUI review still requires confirmation with `--yes`. Fully specified CLI deletion retains its existing consent behavior.
+The Hosts TUI does not delete HostEntries yet. Review its exact source, Host line, byte span, redacted deletion diff, and Pair dependencies before pressing `Enter`; `Esc` cancels. Pair references and active managed use block deletion. Incomplete `sshx host delete` opens the exact picker and review, and `sshx tui host delete HOST` opens review explicitly. After explicit TUI deletion or preview, Hosts shows the result and stays open until you quit. `--preview` never writes, and TUI review still requires confirmation with `--yes`. Fully specified CLI deletion retains its existing consent behavior.
 
 ```sh
 sshx host list
@@ -135,7 +148,7 @@ sshx host delete database
 
 Duplicate aliases need `--id`, or alias plus `--source` and `--line`. Complete CLI mutations keep preview and consent behavior. `--preview` writes nothing; `--yes` confirms explicitly.
 
-In Hosts, press `Ctrl+U` to update the selected HostEntry or `Ctrl+R` to rename only its selected alias. `sshx host update HOST` and `sshx host rename HOST` continue in the editor when no change is supplied; `sshx tui host update HOST --hostname DESTINATION` and `sshx tui host rename HOST --alias ALIAS` open it even with complete fields. Fields show `keep`, `replace`, or `clear`; a password marked `keep` is never revealed, typing replaces it, and `Ctrl+X` clears it. Interactive review always requires `Enter`, including with `--yes`; `--no-input`, password stdin, and JSON/YAML output never open the editor.
+The Hosts TUI does not update or rename HostEntries yet. `sshx host update HOST` and `sshx host rename HOST` continue in the editor when no change is supplied; `sshx tui host update HOST --hostname DESTINATION` and `sshx tui host rename HOST --alias ALIAS` open it even with complete fields. Fields show `keep`, `replace`, or `clear`; a password marked `keep` is never revealed, typing replaces it, and `Ctrl+X` clears it. Interactive review always requires `Enter`, including with `--yes`; `--no-input`, password stdin, and JSON/YAML output never open the editor.
 
 On compact terminals, the update and rename editors keep review and cancellation controls visible. Move between update fields with `Tab` or the arrow keys; the field list scrolls to keep the selected field visible.
 
@@ -170,7 +183,7 @@ The picker keeps alias rows concise. Select a row and use Tab to inspect its Hos
 
 ## Create HostEntries
 
-From Hosts, press `Ctrl+N` to open the editable HostEntry form. Run `sshx host create --alias prod` to open the same form with `prod` prefilled. The form selects an existing config root, destination file, alias, host destination, and optional fields. Password input stays masked. The destination file must deny group and other access before storing a password; new files use mode `0600`.
+Run `sshx host create` to open the editable HostEntry form, or `sshx host create --alias prod` to open the same form with `prod` prefilled. The form selects an existing config root, destination file, alias, host destination, and optional fields. Password input stays masked. The destination file must deny group and other access before storing a password; new files use mode `0600`.
 
 Press `Ctrl+S` to review the filesystem change in the same workspace. Press `Enter` to apply with explicit consent, or `E`/`Esc` to return to the form. Validation errors keep entered values and focus the affected field. Short terminals scroll with the selected field. Press `Esc` in the form or `Ctrl+C` to cancel without changing SSH config. With `--preview`, `Enter` finishes review without applying.
 
@@ -185,7 +198,7 @@ sshx host create --scope personal --file ~/.ssh/config --alias prod --hostname p
 
 A **Pair** links exact gateway and VM HostEntries. The gateway OpenSSH master opens a temporary loopback transit forward. A separate VM OpenSSH master uses that port and its own host-key identity.
 
-In the Hosts TUI, press `Ctrl+P` to open Pairs, or run `sshx tui pair list` or `sshx tui pair validate`. Use Up/Down to select a Pair or a diagnostic group. The detail pane shows exact gateway and VM aliases, IDs, source paths and Host lines, approved transit, and route validity. Diagnostic groups show evidence and guidance; use Page Up/Page Down to scroll details. Press `V` to rediscover and validate current SSH config without changing files, repairing permissions, or starting OpenSSH. Press `Esc` to return to Hosts, or `S` to begin Pair setup.
+Run `sshx tui pair list` or `sshx tui pair validate` to open Pairs. Use Up/Down to select a Pair or a diagnostic group. The detail pane shows exact gateway and VM aliases, IDs, source paths and Host lines, approved transit, and route validity. Diagnostic groups show evidence and guidance; use Page Up/Page Down to scroll details. Press `V` to rediscover and validate current SSH config without changing files, repairing permissions, or starting OpenSSH. Press `Esc` to return to Hosts (then `Esc`, `q` to quit), or `S` to begin Pair setup.
 
 Press `D` on an exact Pair record to review deletion. Review shows both aliases, immutable IDs, source paths and Host lines, stored transit, and a redacted diff. `Enter` deletes the relationship; `Esc` or `Ctrl+C` cancels and returns to Pairs. Both HostEntries, IDs, passwords, comments, and OpenSSH directives—including existing forwards—remain unchanged. Pairs refreshes after deletion, and the unlinked HostEntries can be paired again. Diagnostic groups and empty rows cannot be deleted.
 
@@ -243,7 +256,7 @@ sshx connect vm-alias --forward 5432=5432 --forward 6379=6378 --forward 3001=300
 sshx tunnel direct start db-prod --forward 5432=5432 --forward 6379=6378 --forward 3001=3001 --no-input
 ```
 
-From Hosts, press `Enter` on a direct HostEntry or Pair VM to open one connection workspace. It shows Session/Tunnel mode, exact route and source identity, declared service rows, and supplied direct forwarding rows; Pair review identifies both gateway and VM. Use `m` to switch mode, `Space` to select rows, `a` to add custom `-L`, `r` to add `-R`, and `d` to add `-D` rows. Use `e` to edit a declared service listener port or a custom row's complete specification, and `x` to remove custom rows. Remote rows label the server listener and your-side destination; SOCKS rows show local bind address and port. `Enter` opens review; a second `Enter` starts the request. Session permits no selected services; Tunnel requires at least one. A failed start keeps edited rows available for correction, and `Esc` returns to Hosts without starting another request.
+`sshx tui connect HOST` and `sshx tui tunnel HOST` open one connection workspace for a direct HostEntry or Pair VM. It shows Session/Tunnel mode, exact route and source identity, declared service rows, and supplied direct forwarding rows; Pair review identifies both gateway and VM. Use `m` to switch mode, `Space` to select rows, `a` to add custom `-L`, `r` to add `-R`, and `d` to add `-D` rows. Use `e` to edit a declared service listener port or a custom row's complete specification, and `x` to remove custom rows. Remote rows label the server listener and your-side destination; SOCKS rows show local bind address and port. `Enter` opens review; a second `Enter` starts the request. Session permits no selected services; Tunnel requires at least one. A failed start keeps edited rows available for correction, and `Esc` returns to Hosts without starting another request.
 
 Direct Session and standalone Tunnel commands can mix declared services with custom `-L`, `-R`, and `-D` rows:
 
@@ -258,7 +271,7 @@ sshx tunnel direct start db-prod --forward 5432=5432 -L 127.0.0.1:6378:cache.int
 
 Custom listeners in direct Session and standalone Tunnel mode accept IPv4 and IPv6 loopback addresses. Specific non-loopback addresses require `--allow-bind`; wildcard binds remain rejected. Pair routes accept only declared VM services and reject custom `-L`, `-R`, or `-D` rows before startup.
 
-Session mode closes its session-bound master and forwards when the shell exits. Connections started from Hosts return to Hosts at the same HostEntry; CLI continuation returns to the connection workspace with edited rows. A standalone Tunnel remains active after leaving the TUI; use its displayed Tunnel ID to manage it.
+Session mode closes its session-bound master and forwards when the shell exits. A session started from Hosts ends sshx with ssh's exit code; CLI continuation returns to the connection workspace with edited rows. A standalone Tunnel remains active after leaving the TUI; use its displayed Tunnel ID to manage it.
 
 `--bind` selects declared `##PORT` services interactively. A requested local port conflict returns a row-specific error; sshx does not close an unrelated process or silently choose another port.
 
@@ -266,7 +279,7 @@ Session mode closes its session-bound master and forwards when the shell exits. 
 
 A **standalone tunnel** owns its detached OpenSSH master, control socket, runtime config, listeners, and Pair dependencies. Ownership is recorded in the locked registry; a PID alone never proves ownership.
 
-Open the Tunnels workspace from Hosts with `Ctrl+T`; Hosts shows the registered active count. The workspace lists persisted Tunnel IDs from earlier runs, including active, down, stopped, or stale registry evidence. It shows route, exact HostEntry source, mappings, master responsiveness, and listener readiness as separate evidence. It does not report application health. Use Page Up/Down to scroll details on smaller terminals. Select an active, responsive Tunnel and press `s` to stop it; press `r` to restart it. Unproved or unavailable actions report why and never use a PID alone.
+Open the Tunnels workspace from Hosts with `g t` in Normal input mode or `:tunnel list`; the status line shows the number of running standalone tunnels. The workspace lists persisted Tunnel IDs from earlier runs, including active, down, stopped, or stale registry evidence. It shows route, exact HostEntry source, mappings, master responsiveness, and listener readiness as separate evidence. It does not report application health. Use Page Up/Down to scroll details on smaller terminals. Select an active, responsive Tunnel and press `s` to stop it; press `r` to restart it. Unproved or unavailable actions report why and never use a PID alone.
 
 `sshx tunnel HOST` and `sshx tunnel start HOST` select the HostEntry's route automatically. Host aliases named `direct` or `paired` remain valid in the automatic form. Use `tunnel direct start HOST` or `tunnel paired start HOST` to require a route; a mismatch returns `TUNNEL_ROUTE_MISMATCH` without starting a Tunnel. Route-specific lists contain only that route's records, and status, stop, and restart reject IDs belonging to the other route before changing owned resources. All forms use the same persisted registry.
 

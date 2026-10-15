@@ -46,6 +46,9 @@ fn merge(
             }
         }
     }
+    if let Some(home) = merged.first().map(|(section, _)| *section) {
+        merged.sort_by_key(|(section, _)| (*section != home, *section));
+    }
     merged
 }
 
@@ -72,11 +75,7 @@ fn fuzzy_matches(haystack: &str, needle: &str) -> bool {
 }
 
 impl Help {
-    pub(super) fn new(
-        screen: keymap::Screen,
-        mode: InputMode,
-        availability: Availability,
-    ) -> Self {
+    pub(super) fn new(screen: keymap::Screen, mode: InputMode, availability: Availability) -> Self {
         Self {
             title: screen_title(screen),
             sections: merge(screen, mode, &availability),
@@ -188,7 +187,9 @@ impl Screen for Help {
 
     fn draw(&self, frame: &mut Frame, area: Rect, _ctx: &Ctx) {
         let width = (area.width * 4 / 5).max(area.width.min(40)).min(area.width);
-        let height = (area.height * 4 / 5).max(area.height.min(10)).min(area.height);
+        let height = (area.height * 4 / 5)
+            .max(area.height.min(10))
+            .min(area.height);
         let popup = Rect::new(
             area.x + (area.width - width) / 2,
             area.y + (area.height - height) / 2,
@@ -204,7 +205,11 @@ impl Screen for Help {
         frame.render_widget(outer, popup);
         let [filter_area, body] =
             Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(inner);
-        let cursor = if self.mode == InputMode::Insert { "▏" } else { "" };
+        let cursor = if self.mode == InputMode::Insert {
+            "▏"
+        } else {
+            ""
+        };
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled("Filter: ", Style::default().fg(Color::DarkGray)),

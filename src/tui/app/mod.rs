@@ -107,6 +107,7 @@ pub(crate) struct Ctx<'a> {
     pub home: &'a Path,
     pub entries: &'a [HostEntry],
     pub visible: Vec<&'a HostEntry>,
+    #[allow(dead_code)]
     pub roots: &'a [RegisteredRoot],
     pub usage: &'a UsageIndex,
     pub tunnels: &'a [TunnelView],
@@ -237,9 +238,10 @@ pub(crate) struct Runtime<'a> {
 pub(crate) fn run_app(
     cli: &Cli,
     home: &Path,
+    roots: Vec<RegisteredRoot>,
     initial_toast: Option<String>,
 ) -> Result<(), String> {
-    Runtime::new(cli, home, initial_toast)?.run()
+    Runtime::new(cli, home, roots, initial_toast)?.run()
 }
 
 fn input_mode(start: StartMode) -> InputMode {
@@ -270,11 +272,16 @@ fn map_key(event: KeyEvent) -> Option<Key> {
 }
 
 impl<'a> Runtime<'a> {
-    fn new(cli: &'a Cli, home: &Path, initial_toast: Option<String>) -> Result<Self, String> {
+    fn new(
+        cli: &'a Cli,
+        home: &Path,
+        roots: Vec<RegisteredRoot>,
+        initial_toast: Option<String>,
+    ) -> Result<Self, String> {
         let first_run = cli.config.is_none() && settings::load(home)?.is_empty();
         let mut data = Data {
             home: home.to_path_buf(),
-            roots: crate::registered_roots(cli)?,
+            roots,
             catalog: Catalog {
                 entries: Vec::new(),
                 diagnostics: Vec::new(),

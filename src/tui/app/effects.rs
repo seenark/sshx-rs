@@ -36,8 +36,15 @@ fn quit(cancelled: bool) -> Result<EffectResult, String> {
 }
 
 /// Session mode through the existing direct and Pair session functions. A finished session
-/// ends sshx; a master that never started returns to the finder with the error as a toast.
+/// ends sshx; a master that never started returns to the finder with the error as a toast,
+/// after rediscovery because the failure may come from sources that changed on disk.
 fn connect(runtime: &Runtime, request: &ConnectRequest) -> Result<EffectResult, String> {
+    let mut result = start_session(runtime, request)?;
+    result.refresh |= result.exit.is_none();
+    Ok(result)
+}
+
+fn start_session(runtime: &Runtime, request: &ConnectRequest) -> Result<EffectResult, String> {
     let data = &runtime.data;
     if data
         .catalog
@@ -58,13 +65,10 @@ fn connect(runtime: &Runtime, request: &ConnectRequest) -> Result<EffectResult, 
             .as_ref()
             .is_some_and(|route| !crate::entry_sources_unchanged(&route.gateway, &data.sources))
     {
-        return Ok(EffectResult {
-            refresh: true,
-            ..toast(format!(
-                "HOST_SOURCE_CHANGED: {} changed; select its current HostEntry again",
-                request.entry.source.path
-            ))
-        });
+        return Ok(toast(format!(
+            "HOST_SOURCE_CHANGED: {} changed; select its current HostEntry again",
+            request.entry.source.path
+        )));
     }
     let target = route.as_ref().map_or(&request.entry, |route| &route.vm);
     let specifications = request
@@ -109,15 +113,11 @@ fn connect(runtime: &Runtime, request: &ConnectRequest) -> Result<EffectResult, 
         ),
     };
     match outcome {
-        Ok(()) => Ok(EffectResult {
-            exit: Some(0),
+        Ok(code) => Ok(EffectResult {
+            exit: Some(code),
             ..EffectResult::default()
         }),
-        Err(error)
-            if error.contains("SESSION_EXIT:") || error.contains("SESSION_INTERRUPTED:") =>
-        {
-            Err(error)
-        }
+        Err(error) if error.starts_with("SESSION_INTERRUPTED") => Err(error),
         Err(error) => Ok(toast(error)),
     }
 }

@@ -1,6 +1,4 @@
-use super::{
-    ConnectRequest, Ctx, Effect, Outcome, Screen, ScreenStatus, cmdline::CommandLine,
-};
+use super::{ConnectRequest, Ctx, Effect, Outcome, Screen, ScreenStatus, cmdline::CommandLine};
 use crate::tui::matcher::{Row, compare_rows, matching_rows, row_label, row_rank};
 use crate::tui::widgets::block;
 use ratatui::{
@@ -39,7 +37,7 @@ impl RootFilter {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-pub(super) struct Stat {
+pub(crate) struct Stat {
     pub count: u64,
     pub last_used: Option<u64>,
 }
@@ -220,10 +218,6 @@ impl Finder {
         })
     }
 
-    fn clamp(&mut self, total: usize) {
-        self.selected = self.selected.min(total.saturating_sub(1));
-    }
-
     fn jump(&mut self, lines: &[Line], wanted: impl Fn(&FinderRow) -> bool, what: &str) -> Outcome {
         match hosts(lines).iter().position(|row| wanted(row)) {
             Some(position) => {
@@ -236,12 +230,8 @@ impl Finder {
 
     fn preview<'a>(&self, row: &FinderRow, ctx: &Ctx) -> Vec<TextLine<'a>> {
         let entry = row.row.entry;
-        let label = |text: &str| {
-            Span::styled(
-                format!("{text:<9}"),
-                Style::default().fg(Color::DarkGray),
-            )
-        };
+        let label =
+            |text: &str| Span::styled(format!("{text:<9}"), Style::default().fg(Color::DarkGray));
         let route = match sshx::pair::paired_route(ctx.entries, entry) {
             Ok(Some(route)) => format!(
                 "{} → {}",
@@ -257,7 +247,10 @@ impl Finder {
                 .iter()
                 .map(|service| match &service.name {
                     Some(name) => {
-                        format!("{name} {}→{}", service.default_local_port, service.remote_port)
+                        format!(
+                            "{name} {}→{}",
+                            service.default_local_port, service.remote_port
+                        )
                     }
                     None => format!("{}→{}", service.default_local_port, service.remote_port),
                 })
@@ -423,7 +416,14 @@ impl Screen for Finder {
         let total = hosts(&lines).len();
         ScreenStatus {
             filter: Some(self.filter.label().to_string()),
-            position: Some((if total == 0 { 0 } else { self.selected.min(total - 1) + 1 }, total)),
+            position: Some((
+                if total == 0 {
+                    0
+                } else {
+                    self.selected.min(total - 1) + 1
+                },
+                total,
+            )),
         }
     }
 
@@ -446,7 +446,11 @@ impl Screen for Finder {
         let [search_area, rows_area] =
             Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(list_area);
         self.viewport.set(usize::from(rows_area.height));
-        let cursor = if self.mode == InputMode::Insert { "▏" } else { "" };
+        let cursor = if self.mode == InputMode::Insert {
+            "▏"
+        } else {
+            ""
+        };
         frame.render_widget(
             Paragraph::new(TextLine::from(vec![
                 Span::styled("Search: ", Style::default().fg(Color::DarkGray)),
@@ -462,7 +466,7 @@ impl Screen for Finder {
                 rows_area,
             );
         } else {
-            let width = usize::from(rows_area.width);
+            let width = usize::from(rows_area.width).saturating_sub(2);
             let mut host_index = 0;
             let mut highlighted = 0;
             let items = lines
@@ -470,7 +474,10 @@ impl Screen for Finder {
                 .enumerate()
                 .map(|(position, line)| match line {
                     Line::Header(title) => ListItem::new(TextLine::from(Span::styled(
-                        title.clone(),
+                        match ctx.home.to_str() {
+                            Some(home) if !home.is_empty() => title.replacen(home, "~", 1),
+                            _ => title.clone(),
+                        },
                         Style::default()
                             .fg(Color::DarkGray)
                             .add_modifier(Modifier::BOLD),
@@ -486,7 +493,7 @@ impl Screen for Finder {
                         } else {
                             String::new()
                         };
-                        let label = format!("  {}", row.label);
+                        let label = row.label.clone();
                         let used = label.chars().count() + badge.chars().count();
                         let pad = width.saturating_sub(used).max(1);
                         ListItem::new(TextLine::from(vec![
@@ -499,7 +506,9 @@ impl Screen for Finder {
                 .collect::<Vec<_>>();
             let mut state = ListState::default().with_selected(Some(highlighted));
             frame.render_stateful_widget(
-                List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED)),
+                List::new(items)
+                    .highlight_symbol("> ")
+                    .highlight_style(Style::default().add_modifier(Modifier::REVERSED)),
                 rows_area,
                 &mut state,
             );
@@ -603,7 +612,14 @@ mod tests {
     #[test]
     fn recent_group_is_capped_but_recent_filter_lists_every_used_host() {
         let entries = (0..7)
-            .map(|index| host(&format!("id{index}"), &format!("h{index}"), "personal", "/c"))
+            .map(|index| {
+                host(
+                    &format!("id{index}"),
+                    &format!("h{index}"),
+                    "personal",
+                    "/c",
+                )
+            })
             .collect::<Vec<_>>();
         let refs = entries.iter().collect::<Vec<_>>();
         let usage = (0..7)
@@ -667,6 +683,30 @@ mod tests {
         let refs = entries.iter().collect::<Vec<_>>();
         let lines = arrange(&refs, "", RootFilter::Work, &|_| Stat::default());
         assert_eq!(render(&lines), ["# work · /w", "charlie"]);
+    }
+
+    #[test]
+    fn duplicate_aliases_keep_source_and_identity_labels() {
+        let entries = [
+            host("1111", "shared", "personal", "/one/config"),
+            host("2222", "shared", "personal", "/one/config"),
+        ];
+        let refs = entries.iter().collect::<Vec<_>>();
+        let lines = arrange(&refs, "", RootFilter::All, &|_| Stat::default());
+        let labels = lines
+            .iter()
+            .filter_map(|line| match line {
+                Line::Host(row) => Some(row.label.as_str()),
+                Line::Header(_) => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            labels,
+            [
+                "shared · /one/config:1 · 1111",
+                "shared · /one/config:1 · 2222"
+            ]
+        );
     }
 
     #[test]

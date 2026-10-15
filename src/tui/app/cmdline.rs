@@ -1,6 +1,5 @@
 use super::{
-    ConnectRequest, Ctx, Effect, ForwardRequest, Outcome, PreferenceChange, Screen,
-    help::Help,
+    ConnectRequest, Ctx, Effect, ForwardRequest, Outcome, PreferenceChange, Screen, help::Help,
 };
 use ratatui::{
     Frame,
@@ -52,7 +51,9 @@ pub(super) fn preference_change(
             other => Err(format!("startmode expects insert or normal, not `{other}`")),
         },
         "autoinfo" => Ok(PreferenceChange::AutoInfo(parse_bool(option, value)?)),
-        "password_confirm" => Ok(PreferenceChange::PasswordConfirm(parse_bool(option, value)?)),
+        "password_confirm" => Ok(PreferenceChange::PasswordConfirm(parse_bool(
+            option, value,
+        )?)),
         "bind" => Ok(PreferenceChange::Bind(validate_bind(
             value.ok_or_else(required)?,
         )?)),
@@ -63,9 +64,7 @@ pub(super) fn preference_change(
                 .ok()
                 .filter(|seconds| *seconds > 0)
                 .map(|seconds| PreferenceChange::ClipboardClear(Some(seconds)))
-                .ok_or_else(|| {
-                    format!("clipboard_clear expects off or seconds, not `{seconds}`")
-                }),
+                .ok_or_else(|| format!("clipboard_clear expects off or seconds, not `{seconds}`")),
         },
         other => Err(format!("unknown option `{other}`")),
     }
@@ -348,7 +347,10 @@ mod tests {
     #[test]
     fn tab_completes_unique_commands_and_common_prefixes() {
         assert_eq!(completion("he").as_deref(), Some("help "));
-        assert_eq!(completion("set clip").as_deref(), Some("set clipboard_clear="));
+        assert_eq!(
+            completion("set clip").as_deref(),
+            Some("set clipboard_clear=")
+        );
         assert_eq!(completion("set "), None);
         assert_eq!(completion("zz"), None);
     }

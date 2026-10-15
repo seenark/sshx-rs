@@ -35,7 +35,10 @@ fn detect(home: &Path) -> Vec<Candidate> {
         .collect::<Vec<_>>();
     included.sort();
     for path in included {
-        if !candidates.iter().any(|candidate| candidate.root.path == path) {
+        if !candidates
+            .iter()
+            .any(|candidate| candidate.root.path == path)
+        {
             candidates.push(Candidate {
                 root: RegisteredRoot {
                     scope: "personal".to_string(),
@@ -104,9 +107,7 @@ impl Screen for FirstRun {
                 }
             }
             Key::Char('s') => {
-                return Outcome::Replace(Box::new(Finder::new(input_mode(
-                    ctx.prefs.startmode,
-                ))));
+                return Outcome::Replace(Box::new(Finder::new(input_mode(ctx.prefs.startmode))));
             }
             Key::Char('q') | Key::Esc => {
                 return Outcome::Effect(Effect::Quit { cancelled: false });
@@ -131,7 +132,9 @@ impl Screen for FirstRun {
     fn draw(&self, frame: &mut Frame, area: Rect, _ctx: &Ctx) {
         let mut lines = vec![
             Line::from("No config roots are registered yet."),
-            Line::from("Tick the SSH config files sshx should read, and label each personal or work."),
+            Line::from(
+                "Tick the SSH config files sshx should read, and label each personal or work.",
+            ),
             Line::default(),
         ];
         if self.candidates.is_empty() {
