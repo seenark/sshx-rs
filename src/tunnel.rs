@@ -702,10 +702,10 @@ fn service_forward_spec(forward: &ServiceForward) -> ForwardSpec {
         kind: "L".to_string(),
         requested: forward.id.clone(),
         effective: format!(
-            "127.0.0.1:{}:{}:{}",
-            forward.local_port, forward.destination_host, forward.remote_port
+            "{}:{}:{}:{}",
+            forward.bind_address, forward.local_port, forward.destination_host, forward.remote_port
         ),
-        bind_address: "127.0.0.1".to_string(),
+        bind_address: forward.bind_address.clone(),
         local_port: Some(forward.local_port),
         remote_host: Some(forward.destination_host.clone()),
         remote_port: Some(forward.remote_port),
@@ -713,7 +713,12 @@ fn service_forward_spec(forward: &ServiceForward) -> ForwardSpec {
 }
 
 fn service_forward_from_spec(forward: &ForwardSpec) -> Result<ServiceForward, String> {
-    if forward.kind != "L" || forward.bind_address != "127.0.0.1" {
+    if forward.kind != "L"
+        || !forward
+            .bind_address
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+    {
         return Err(
             "TUNNEL_INVALID: paired registry contains non-loopback service forward".to_string(),
         );
@@ -730,6 +735,7 @@ fn service_forward_from_spec(forward: &ForwardSpec) -> Result<ServiceForward, St
         local_port: forward
             .local_port
             .ok_or_else(|| "TUNNEL_INVALID: paired forward has no local port".to_string())?,
+        bind_address: forward.bind_address.clone(),
     })
 }
 
@@ -779,8 +785,11 @@ fn paired_service_request_signature(
             for forward in forwards {
                 write!(
                     material,
-                    "\0L=127.0.0.1=127.0.0.1:{}:{}:{}",
-                    forward.local_port, forward.destination_host, forward.remote_port
+                    "\0L={0}={0}:{1}:{2}:{3}",
+                    forward.bind_address,
+                    forward.local_port,
+                    forward.destination_host,
+                    forward.remote_port
                 )
                 .expect("String writes cannot fail");
             }
@@ -949,10 +958,10 @@ pub fn parse_forwards(
     Ok(forwards)
 }
 
-/// First port above `start` that binds on 127.0.0.1 and is not in `reserved`.
-pub fn next_free_local_port(start: u16, reserved: &[u16]) -> Option<u16> {
+/// First port above `start` that binds on `bind` and is not in `reserved`.
+pub fn next_free_local_port(bind: &str, start: u16, reserved: &[u16]) -> Option<u16> {
     (start.checked_add(1)?..=u16::MAX)
-        .find(|port| !reserved.contains(port) && TcpListener::bind(("127.0.0.1", *port)).is_ok())
+        .find(|port| !reserved.contains(port) && TcpListener::bind((bind, *port)).is_ok())
 }
 
 pub fn reserve_forwards(forwards: &[ForwardSpec]) -> Result<(), String> {
@@ -1722,11 +1731,11 @@ mod tests {
     fn next_free_local_port_skips_busy_and_reserved_ports() {
         let busy = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = busy.local_addr().unwrap().port();
-        let next = next_free_local_port(port - 1, &[]);
+        let next = next_free_local_port("127.0.0.1", port - 1, &[]);
         assert!(next.is_some_and(|candidate| candidate > port));
-        let after = next_free_local_port(port - 1, &[next.unwrap()]);
+        let after = next_free_local_port("127.0.0.1", port - 1, &[next.unwrap()]);
         assert!(after.is_some_and(|candidate| candidate > next.unwrap()));
-        assert_eq!(next_free_local_port(u16::MAX, &[]), None);
+        assert_eq!(next_free_local_port("127.0.0.1", u16::MAX, &[]), None);
     }
 
     use super::{

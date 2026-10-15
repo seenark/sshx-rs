@@ -14,6 +14,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod support;
+
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 static PTY: Mutex<()> = Mutex::new(());
 
@@ -173,7 +175,7 @@ struct Tui {
     master: File,
     child: Child,
     output: Vec<u8>,
-    mark: usize,
+    seen: Vec<String>,
     _guard: std::sync::MutexGuard<'static, ()>,
 }
 
@@ -184,30 +186,8 @@ impl Drop for Tui {
     }
 }
 
-fn strip(input: &[u8]) -> String {
-    let mut output = Vec::new();
-    let mut index = 0;
-    while index < input.len() {
-        match input[index] {
-            0x1b => {
-                index += 1;
-                if input.get(index) == Some(&b'[') {
-                    index += 1;
-                    while index < input.len() && !(0x40..=0x7e).contains(&input[index]) {
-                        index += 1;
-                    }
-                }
-                index += 1;
-            }
-            b'\r' => index += 1,
-            byte => {
-                output.push(byte);
-                index += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&output).into_owned()
-}
+const ROWS: u16 = 30;
+const COLUMNS: u16 = 100;
 
 fn squeeze(text: &str) -> String {
     text.chars().filter(|c| !c.is_whitespace()).collect()
@@ -219,8 +199,8 @@ impl Tui {
         let mut master = -1;
         let mut slave = -1;
         let mut size = unsafe { std::mem::zeroed::<libc::winsize>() };
-        size.ws_col = 100;
-        size.ws_row = 30;
+        size.ws_col = COLUMNS;
+        size.ws_row = ROWS;
         let opened = unsafe {
             libc::openpty(
                 &mut master,
@@ -256,7 +236,7 @@ impl Tui {
             master,
             child,
             output: Vec::new(),
-            mark: 0,
+            seen: Vec::new(),
             _guard: guard,
         }
     }
@@ -272,26 +252,36 @@ impl Tui {
         }
     }
 
-    /// Waits for `text` (ignoring whitespace) to be drawn since the previous expectation.
+    /// The screen as the user sees it now, whitespace removed so layout never matters.
+    fn screen(&self) -> String {
+        support::render(&self.output, usize::from(ROWS), usize::from(COLUMNS))
+    }
+
+    /// Waits for `text` (ignoring whitespace) to be on the screen.
     fn expect(&mut self, text: &str) {
         let wanted = squeeze(text);
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             self.pump();
-            if squeeze(&strip(&self.output[self.mark..])).contains(&wanted) {
-                self.mark = self.output.len();
+            let screen = self.screen();
+            let found = screen.contains(&wanted);
+            if self.seen.last() != Some(&screen) {
+                self.seen.push(screen.clone());
+            }
+            if found {
                 return;
             }
             assert!(
                 Instant::now() < deadline,
-                "timed out waiting for `{text}`; screen output:\n{}",
-                strip(&self.output[self.mark..])
+                "timed out waiting for `{text}`; screen:\n{screen}"
             );
         }
     }
 
+    /// Whether any screen this terminal showed contained `text`.
     fn saw(&self, text: &str) -> bool {
-        squeeze(&strip(&self.output)).contains(&squeeze(text))
+        let wanted = squeeze(text);
+        self.seen.iter().any(|screen| screen.contains(&wanted))
     }
 
     fn send(&mut self, keys: &str) {
@@ -304,12 +294,12 @@ impl Tui {
             self.pump();
             if let Some(status) = self.child.try_wait().unwrap() {
                 self.pump();
-                return (status, strip(&self.output));
+                return (status, self.screen());
             }
             assert!(
                 Instant::now() < deadline,
-                "sshx did not exit; screen output:\n{}",
-                squeeze(&strip(&self.output))
+                "sshx did not exit; screen:\n{}",
+                self.screen()
             );
         }
     }
@@ -322,18 +312,19 @@ struct Listeners {
 }
 
 impl Listeners {
-    fn after_master(fixture: &Fixture, ports: &[u16]) -> Self {
+    fn after_master(fixture: &Fixture, bind: &str, ports: &[u16]) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&stop);
         let started = fixture.root.join("master-started");
         let ports = ports.to_vec();
+        let bind = bind.to_string();
         let thread = thread::spawn(move || {
             while !started.exists() && !flag.load(Ordering::Relaxed) {
                 thread::sleep(Duration::from_millis(5));
             }
             let _bound = ports
                 .iter()
-                .filter_map(|port| TcpListener::bind(("127.0.0.1", *port)).ok())
+                .filter_map(|port| TcpListener::bind((bind.as_str(), *port)).ok())
                 .collect::<Vec<_>>();
             while !flag.load(Ordering::Relaxed) {
                 thread::sleep(Duration::from_millis(5));
@@ -356,15 +347,63 @@ impl Drop for Listeners {
 }
 
 fn write_usage(fixture: &Fixture, key: &str, forwards: Value) {
+    write_usages(fixture, &[(key, forwards)]);
+}
+
+fn write_usages(fixture: &Fixture, hosts: &[(&str, Value)]) {
+    let hosts = hosts
+        .iter()
+        .map(|(key, forwards)| {
+            (
+                key.to_string(),
+                json!({ "last_used": 1, "count": 1, "forwards": forwards }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
     fs::write(
         fixture.config.with_file_name(".config.sshx-usage.json"),
-        json!({
-            "version": 1,
-            "hosts": { key: { "last_used": 1, "count": 1, "forwards": forwards } }
-        })
-        .to_string(),
+        json!({ "version": 1, "hosts": hosts }).to_string(),
     )
     .unwrap();
+}
+
+#[cfg(target_os = "macos")]
+const CLIPBOARD_TOOL: &str = "pbcopy";
+#[cfg(not(target_os = "macos"))]
+const CLIPBOARD_TOOL: &str = "wl-copy";
+
+/// A fake clipboard backend next to the fake `ssh`.
+fn with_clipboard(bin: PathBuf, fixture: &Fixture) -> PathBuf {
+    script(
+        &bin.join(CLIPBOARD_TOOL),
+        &format!(
+            "#!/bin/sh\ncat > '{}'\n",
+            fixture.root.join("clipboard").display()
+        ),
+    );
+    bin
+}
+
+fn clipboard(fixture: &Fixture) -> Option<String> {
+    fs::read_to_string(fixture.root.join("clipboard")).ok()
+}
+
+fn set_bind(fixture: &Fixture, bind: &str) {
+    let settings = fixture.home.join(".config/sshx/config.json");
+    fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    fs::write(
+        settings,
+        json!({ "version": 1, "roots": [], "preferences": { "bind": bind } }).to_string(),
+    )
+    .unwrap();
+}
+
+/// A loopback address besides 127.0.0.1 that this host can bind (macOS only has an alias for
+/// 127.0.0.2 when the user adds one, but always has ::1).
+fn other_loopback() -> Option<&'static str> {
+    ["127.0.0.2", "::1"]
+        .into_iter()
+        .find(|address| TcpListener::bind((*address, 0)).is_ok())
 }
 
 fn runtime_forwards(fixture: &Fixture) -> Vec<String> {
@@ -392,7 +431,7 @@ fn tab_enter_reconnects_with_last_selected_forwards_and_no_typing() {
     );
     let original = fs::read(&fixture.config).unwrap();
     let bin = session_ssh(&fixture);
-    let _listeners = Listeners::after_master(&fixture, &[first, second]);
+    let _listeners = Listeners::after_master(&fixture, "127.0.0.1", &[first, second]);
     let mut tui = Tui::start(&fixture, &bin);
     tui.expect("Search:");
     tui.send("db");
@@ -418,7 +457,7 @@ fn o_adds_a_row_and_enter_connects_with_it() {
     let fixture = fixture("Host db\n  HostName db.example\n");
     let original = fs::read(&fixture.config).unwrap();
     let bin = session_ssh(&fixture);
-    let _listeners = Listeners::after_master(&fixture, &[local]);
+    let _listeners = Listeners::after_master(&fixture, "127.0.0.1", &[local]);
     let mut tui = Tui::start(&fixture, &bin);
     tui.expect("Search:");
     tui.send("db\t");
@@ -514,7 +553,7 @@ fn busy_tunnel_port_offers_the_next_free_port_and_persists_the_choice() {
     tui.send(" tt");
     tui.expect("pick another port");
     assert!(tui.saw(&format!("✗ :{busy} port in use")));
-    let screen = squeeze(&strip(&tui.output));
+    let screen = tui.screen();
     let offered = screen
         .rsplit("use:")
         .next()
@@ -610,4 +649,230 @@ fn tunnel_command_with_a_host_and_forward_starts_it() {
         &bin,
         &["tunnel", "stop", &id, "--no-input", "--format", "json"],
     );
+}
+
+fn stop_tunnels(fixture: &Fixture, bin: &Path) {
+    let listed = cli_json(fixture, bin, &["tunnel", "list", "--format", "json"]);
+    for tunnel in listed["tunnels"].as_array().unwrap() {
+        let id = tunnel["id"].as_str().unwrap();
+        cli_json(
+            fixture,
+            bin,
+            &["tunnel", "stop", id, "--no-input", "--format", "json"],
+        );
+    }
+}
+
+const DB_WITH_SERVICE: &str =
+    "##SSHX ID=db-id\nHost db\n  HostName db.example\n  ##SSHX SERVICE 5432\n";
+
+#[test]
+fn yy_on_the_ports_screen_copies_the_ssh_command_with_the_checked_forwards() {
+    let (first, second) = (free_port(), free_port());
+    let fixture = fixture(&format!(
+        "##SSHX ID=db-id\nHost db\n  HostName db.example\n  ##SSHX SERVICE 5432 LOCAL={first}\n  ##SSHX SERVICE 6379 LOCAL={second}\n"
+    ));
+    write_usage(
+        &fixture,
+        "db-id",
+        json!([{"remote": 5432, "local": first, "declared": true}]),
+    );
+    let bin = with_clipboard(session_ssh(&fixture), &fixture);
+    let mut tui = Tui::start(&fixture, &bin);
+    tui.expect("Search:");
+    tui.send("db\t");
+    tui.expect(&format!("localhost:{second} → 6379"));
+    tui.send("yy");
+    tui.expect("copied ssh command");
+    assert_eq!(
+        clipboard(&fixture).unwrap(),
+        format!(
+            "ssh -F '{}' 'db' -L 127.0.0.1:{first}:127.0.0.1:5432",
+            fixture.config.display()
+        )
+    );
+    tui.send("q");
+    let (status, output) = tui.finish();
+    assert!(status.success(), "{status:?} {output}");
+}
+
+#[test]
+fn yi_copies_the_tunnel_id_on_the_progress_screen_and_the_list() {
+    let local = free_port();
+    let fixture = fixture(DB_WITH_SERVICE);
+    write_usage(
+        &fixture,
+        "db-id",
+        json!([{"remote": 5432, "local": local, "declared": true}]),
+    );
+    let bin = with_clipboard(tunnel_ssh(&fixture), &fixture);
+    let mut tui = Tui::start(&fixture, &bin);
+    tui.expect("Search:");
+    tui.send("db\t");
+    tui.expect(&format!("localhost:{local} → 5432"));
+    tui.send(" tt");
+    tui.expect(&format!(":{local} listener ready"));
+    let listed = cli_json(&fixture, &bin, &["tunnel", "list", "--format", "json"]);
+    let id = listed["tunnels"][0]["id"].as_str().unwrap().to_string();
+    tui.send("yi");
+    tui.expect("copied tunnel ID");
+    assert_eq!(clipboard(&fixture).as_deref(), Some(id.as_str()));
+    fs::remove_file(fixture.root.join("clipboard")).unwrap();
+    tui.send("\x1b");
+    tui.expect("x toggle");
+    tui.send(" tl");
+    tui.expect("standalone tunnels");
+    tui.send("yi");
+    tui.expect("copied tunnel ID");
+    assert_eq!(clipboard(&fixture).as_deref(), Some(id.as_str()));
+    tui.send("q");
+    let (status, output) = tui.finish();
+    assert!(status.success(), "{status:?} {output}");
+    stop_tunnels(&fixture, &bin);
+}
+
+#[test]
+fn starting_a_tunnel_whose_exact_request_is_active_shows_the_existing_tunnel() {
+    let local = free_port();
+    let fixture = fixture(DB_WITH_SERVICE);
+    write_usage(
+        &fixture,
+        "db-id",
+        json!([{"remote": 5432, "local": local, "declared": true}]),
+    );
+    let bin = tunnel_ssh(&fixture);
+    let mut tui = Tui::start(&fixture, &bin);
+    tui.expect("Search:");
+    tui.send("db\t");
+    tui.expect(&format!("localhost:{local} → 5432"));
+    tui.send(" tt");
+    tui.expect(&format!(":{local} listener ready"));
+    let listed = cli_json(&fixture, &bin, &["tunnel", "list", "--format", "json"]);
+    let id = listed["tunnels"][0]["id"].as_str().unwrap().to_string();
+    tui.send("\x1b");
+    tui.expect("x toggle");
+    tui.send(" tt");
+    tui.expect(&format!("already active as tunnel {id}"));
+    tui.expect(&format!(":{local} listener ready"));
+    assert!(!tui.saw("pick another port"));
+    tui.send("q");
+    let (status, output) = tui.finish();
+    assert!(status.success(), "{status:?} {output}");
+    let listed = cli_json(&fixture, &bin, &["tunnel", "list", "--format", "json"]);
+    assert_eq!(listed["tunnels"].as_array().unwrap().len(), 1, "{listed}");
+    stop_tunnels(&fixture, &bin);
+}
+
+#[test]
+fn bind_preference_sets_the_listen_address_of_service_forwards() {
+    let Some(bind) = other_loopback() else {
+        eprintln!("skipped: this host binds neither 127.0.0.2 nor ::1");
+        return;
+    };
+    let local = free_port();
+    let fixture = fixture("##SSHX ID=db-id\nHost db\n  HostName db.example\n");
+    set_bind(&fixture, bind);
+    write_usage(
+        &fixture,
+        "db-id",
+        json!([{"remote": 5432, "local": local, "declared": false}]),
+    );
+    let bin = session_ssh(&fixture);
+    let _listeners = Listeners::after_master(&fixture, bind, &[local]);
+    let shown = if bind.contains(':') {
+        format!("[{bind}]")
+    } else {
+        bind.to_string()
+    };
+    let mut tui = Tui::start(&fixture, &bin);
+    tui.expect("Search:");
+    tui.send("db\t");
+    tui.expect(&format!("{shown}:{local} → 5432"));
+    tui.send("\r");
+    let (status, output) = tui.finish();
+    assert!(status.success(), "{status:?} {output}");
+    assert_eq!(
+        runtime_forwards(&fixture),
+        [format!("LocalForward {shown}:{local} 127.0.0.1:5432")]
+    );
+}
+
+#[test]
+fn select_mode_tt_starts_each_row_with_its_remembered_forwards_and_reports_the_rest() {
+    let (first, second) = (free_port(), free_port());
+    let fixture = fixture(concat!(
+        "##SSHX ID=db-id\nHost db\n  HostName db.example\n  ##SSHX SERVICE 5432\n",
+        "##SSHX ID=cache-id\nHost cache\n  HostName cache.example\n  ##SSHX SERVICE 6379\n",
+        "##SSHX ID=bare-id\nHost bare\n  HostName bare.example\n",
+    ));
+    write_usages(
+        &fixture,
+        &[
+            (
+                "db-id",
+                json!([{"remote": 5432, "local": first, "declared": true}]),
+            ),
+            (
+                "cache-id",
+                json!([{"remote": 6379, "local": second, "declared": true}]),
+            ),
+        ],
+    );
+    let bin = tunnel_ssh(&fixture);
+    let mut tui = Tui::start(&fixture, &bin);
+    tui.expect("Search:");
+    tui.send("\x1b");
+    tui.expect("NORMAL");
+    tui.send("Vge");
+    tui.expect("3 selected");
+    tui.send(" tt");
+    tui.expect("bare: no remembered service forwards");
+    tui.expect(&format!(":{first} listener ready"));
+    tui.expect(&format!(":{second} listener ready"));
+    tui.send("q");
+    let (status, output) = tui.finish();
+    assert!(status.success(), "{status:?} {output}");
+    let listed = cli_json(&fixture, &bin, &["tunnel", "list", "--format", "json"]);
+    let tunnels = listed["tunnels"].as_array().unwrap();
+    assert_eq!(tunnels.len(), 2, "{listed}");
+    let mut ports = tunnels
+        .iter()
+        .map(|tunnel| tunnel["forwards"][0]["local_port"].as_u64().unwrap())
+        .collect::<Vec<_>>();
+    ports.sort_unstable();
+    let mut wanted = vec![u64::from(first), u64::from(second)];
+    wanted.sort_unstable();
+    assert_eq!(ports, wanted);
+    stop_tunnels(&fixture, &bin);
+}
+
+#[test]
+fn u_after_s_moves_usage_back_to_the_old_key() {
+    let local = free_port();
+    let original = "Host db\n  HostName db.example\n";
+    let fixture = fixture(original);
+    write_usage(
+        &fixture,
+        "db@config",
+        json!([{"remote": 80, "local": local, "declared": false}]),
+    );
+    let bin = session_ssh(&fixture);
+    let mut tui = Tui::start(&fixture, &bin);
+    tui.expect("Search:");
+    tui.send("db\t");
+    tui.expect(&format!("localhost:{local} → 80"));
+    tui.send("s");
+    tui.expect("declared service 80");
+    tui.send("u");
+    tui.expect("undid declare service 80");
+    tui.send("q");
+    let (status, output) = tui.finish();
+    assert!(status.success(), "{status:?} {output}");
+    assert_eq!(fs::read_to_string(&fixture.config).unwrap(), original);
+    let usage: Value = serde_json::from_slice(
+        &fs::read(fixture.config.with_file_name(".config.sshx-usage.json")).unwrap(),
+    )
+    .unwrap();
+    let hosts = usage["hosts"].as_object().unwrap();
+    assert_eq!(hosts.keys().collect::<Vec<_>>(), ["db@config"], "{usage}");
 }

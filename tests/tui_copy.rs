@@ -510,7 +510,7 @@ fn failure_screen_copies_the_verbose_ssh_command() {
 }
 
 #[test]
-fn failure_screen_edit_returns_to_the_finder_with_a_hint() {
+fn failure_screen_e_opens_the_edit_form_for_that_host() {
     let fixture = Fixture::new("Host direct\n  HostName direct.example\n", FAKE_SSH, QUIET);
     let mut tui = Tui::start(&fixture, &[("SSHX_AUTH_FAIL", "1")]);
     tui.expect("Search:");
@@ -519,10 +519,17 @@ fn failure_screen_edit_returns_to_the_finder_with_a_hint() {
     tui.send("\n");
     tui.expect("ssh direct failed");
     tui.send("e");
-    tui.expect("press cc to edit");
+    tui.expect("edit host");
+    tui.expect("direct.example");
+    tui.send(":q\r");
+    tui.expect("Search:");
     tui.send("\x1b");
     tui.expect("NORMAL");
     quit(tui);
+    assert_eq!(
+        fs::read_to_string(&fixture.config).unwrap(),
+        "Host direct\n  HostName direct.example\n"
+    );
 }
 
 #[test]

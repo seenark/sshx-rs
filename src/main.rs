@@ -1409,6 +1409,7 @@ fn run_connection_workspace(
             remote_port: forward.remote_port.unwrap_or(0),
             destination_host: forward.remote_host.unwrap_or_default(),
             local_port: forward.local_port.unwrap_or(0),
+            bind_address: sshx::session::LOOPBACK.to_string(),
         });
     }
     let mut route_label = format!(

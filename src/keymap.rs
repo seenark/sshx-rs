@@ -382,6 +382,7 @@ const HELP_COMMAND_LINE: &[Screen] = &[Screen::Help, Screen::CommandLine];
 const FINDER_PORTS: &[Screen] = &[Screen::Finder, Screen::Ports];
 const FINDER_HELP: &[Screen] = &[Screen::Finder, Screen::Help];
 const FINDER_TUNNELS: &[Screen] = &[Screen::Finder, Screen::Tunnels];
+const TUNNEL_ID: &[Screen] = &[Screen::Finder, Screen::Tunnels, Screen::TunnelProgress];
 const NOT_OVERLAY: &[Screen] = &[
     Screen::Finder,
     Screen::Ports,
@@ -479,7 +480,7 @@ static BINDINGS: &[Binding] = &[
     bind("y p", NORMAL, FINDER_PORTS, A::Copy(CopyTarget::SshpassCommand), S::Copy, "Copy sshpass command").req(DirectPassword),
     bind("y w", NORMAL, FINDER_PORTS, A::Copy(CopyTarget::Password), S::Copy, "Copy password").req(Password),
     bind("y h", NORMAL, FINDER_PORTS, A::Copy(CopyTarget::HostName), S::Copy, "Copy HostName").req(Row),
-    bind("y i", NORMAL, FINDER_TUNNELS, A::Copy(CopyTarget::TunnelId), S::Copy, "Copy tunnel ID").req(Tunnel),
+    bind("y i", NORMAL, TUNNEL_ID, A::Copy(CopyTarget::TunnelId), S::Copy, "Copy tunnel ID").req(Tunnel),
     bind("y", SELECT, FINDER, A::Copy(CopyTarget::SshCommand), S::Copy, "Copy ssh command per selected row").req(Row),
     bind("o", NORMAL, FINDER, A::NewHost, S::Hosts, "New host (form)"),
     bind("c c", NORMAL, FINDER, A::EditHostForm, S::Hosts, "Edit host (form)").req(Row),
@@ -1181,6 +1182,31 @@ mod tests {
             run("<tab>", InputMode::Insert, Screen::CommandLine),
             act(Complete)
         );
+    }
+
+    #[test]
+    fn tunnel_id_copy_is_bound_on_the_finder_list_and_progress_screens() {
+        let n = InputMode::Normal;
+        let tunnel = Availability {
+            tunnel_selected: true,
+            ..NONE
+        };
+        for screen in [Screen::Finder, Screen::Tunnels, Screen::TunnelProgress] {
+            let mut km = Keymap::new();
+            assert_eq!(
+                feed_seq(&mut km, "yi", n, screen, &tunnel),
+                act(Action::Copy(CopyTarget::TunnelId)),
+                "{screen:?}"
+            );
+            assert!(matches!(
+                run("yi", n, screen),
+                Step::Unavailable {
+                    reason: "no tunnel selected",
+                    ..
+                }
+            ));
+        }
+        assert_eq!(run("yi", n, Screen::Ports), Step::Unmapped);
     }
 
     #[test]

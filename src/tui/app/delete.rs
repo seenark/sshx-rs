@@ -1,4 +1,7 @@
-use super::{Ctx, Effect, EffectResult, Outcome, Runtime, Screen};
+use super::{
+    Ctx, Effect, EffectResult, Outcome, Runtime, Screen, tunnel_progress::TunnelProgress,
+    yesno::YesNo,
+};
 use crate::tui::widgets::block;
 use ratatui::{
     Frame,
@@ -135,31 +138,80 @@ impl Screen for DeleteConfirm {
     }
 }
 
-pub(super) fn delete(
-    runtime: &mut Runtime,
-    request: &DeleteRequest,
-) -> Result<EffectResult, String> {
-    let message = (|| {
-        let data = &runtime.data;
-        let entry = &request.entry;
-        if !crate::entry_sources_unchanged(entry, &data.sources) {
-            return Err(format!(
-                "HOST_SOURCE_CHANGED: {} changed; select its current HostEntry again",
-                entry.source.path
-            ));
+/// `d` in Select input mode: one combined y/N for every row that may go. Rows refused for the
+/// same reasons as a single delete (Pair members, in-use or referenced HostEntries) are listed
+/// and skipped.
+pub(super) fn begin_many(ctx: &Ctx, rows: &[(&HostEntry, &str)]) -> Outcome {
+    let mut requests: Vec<DeleteRequest> = Vec::new();
+    let mut refused = Vec::new();
+    for (entry, alias) in rows {
+        if let Some(error) = refusal(ctx, entry, alias) {
+            refused.push(format!("{alias}: {error}"));
+            continue;
         }
-        if let Some(error) = refusal(&data.ctx(None), entry, &request.alias) {
-            return Err(error);
+        let same_block = |other: &DeleteRequest| {
+            other.entry.source.path == entry.source.path
+                && other.entry.source.byte_start == entry.source.byte_start
+        };
+        if !requests.iter().any(same_block) {
+            requests.push(DeleteRequest {
+                entry: (*entry).clone(),
+                alias: (*alias).to_string(),
+            });
         }
-        let plan = plan(entry, &request.alias)?;
-        let change = plan.change();
-        mutation::apply_edit(&plan)?;
-        runtime
-            .undo
-            .push(format!("delete {}", request.alias), change);
-        Ok(format!("✓ deleted {} (u undoes)", request.alias))
-    })();
-    Ok(match message {
+    }
+    if requests.is_empty() {
+        let lines = refused.into_iter().map(|text| (false, text)).collect();
+        return Outcome::Push(Box::new(TunnelProgress::report("delete refused", lines)));
+    }
+    let aliases = requests
+        .iter()
+        .map(|request| request.alias.as_str())
+        .collect::<Vec<_>>();
+    let mut detail = vec![
+        format!("Delete {}", aliases.join(", ")),
+        "Their declared services are removed with the blocks.".to_string(),
+    ];
+    if !refused.is_empty() {
+        detail.push(String::new());
+        detail.push("Refused, not deleted:".to_string());
+        detail.extend(refused.into_iter().map(|text| format!("✗ {text}")));
+    }
+    Outcome::Push(Box::new(YesNo::new(
+        format!("Delete {} HostEntries?", requests.len()),
+        detail,
+        Effect::DeleteHosts(requests),
+    )))
+}
+
+/// Re-checks the refusals and applies the plan for one HostEntry, recording it for undo.
+fn remove(runtime: &mut Runtime, request: &DeleteRequest) -> Result<(), String> {
+    let entry = &request.entry;
+    if let Some(error) = refusal(&runtime.data.ctx(None), entry, &request.alias) {
+        return Err(error);
+    }
+    let plan = plan(entry, &request.alias)?;
+    let change = plan.change();
+    mutation::apply_edit(&plan)?;
+    runtime
+        .undo
+        .push(format!("delete {}", request.alias), change, None);
+    Ok(())
+}
+
+fn ensure_current(runtime: &Runtime, request: &DeleteRequest) -> Result<(), String> {
+    if crate::entry_sources_unchanged(&request.entry, &runtime.data.sources) {
+        Ok(())
+    } else {
+        Err(format!(
+            "HOST_SOURCE_CHANGED: {} changed; select its current HostEntry again",
+            request.entry.source.path
+        ))
+    }
+}
+
+fn done(toast: Result<String, String>) -> Result<EffectResult, String> {
+    Ok(match toast {
         Ok(toast) => EffectResult {
             toast: Some(toast),
             refresh: true,
@@ -169,5 +221,87 @@ pub(super) fn delete(
             toast: Some(error),
             ..EffectResult::default()
         },
+    })
+}
+
+pub(super) fn delete(
+    runtime: &mut Runtime,
+    request: &DeleteRequest,
+) -> Result<EffectResult, String> {
+    done(ensure_current(runtime, request).and_then(|()| {
+        remove(runtime, request)?;
+        Ok(format!("✓ deleted {} (u undoes)", request.alias))
+    }))
+}
+
+/// Removing a block moves the byte spans of the blocks around it, so each later HostEntry is
+/// looked up again after the rediscovery that follows every write.
+fn current_entry(runtime: &Runtime, request: &DeleteRequest) -> Option<HostEntry> {
+    let wanted = &request.entry;
+    let entries = &runtime.data.catalog.entries;
+    let same_file = |entry: &&HostEntry| entry.source.path == wanted.source.path;
+    entries
+        .iter()
+        .filter(same_file)
+        .find(|entry| entry.id == wanted.id)
+        .or_else(|| {
+            entries
+                .iter()
+                .filter(same_file)
+                .find(|entry| entry.aliases.contains(&request.alias))
+        })
+        .cloned()
+}
+
+/// Every source must still match discovery before the first write.
+pub(super) fn delete_many(
+    runtime: &mut Runtime,
+    requests: &[DeleteRequest],
+) -> Result<EffectResult, String> {
+    if let Some(error) = requests
+        .iter()
+        .find_map(|request| ensure_current(runtime, request).err())
+    {
+        return done(Err(error));
+    }
+    let mut deleted = Vec::new();
+    let mut failed = Vec::new();
+    for (position, request) in requests.iter().enumerate() {
+        let current = if position == 0 {
+            Some(request.entry.clone())
+        } else {
+            current_entry(runtime, request)
+        };
+        let Some(entry) = current else {
+            failed.push(format!(
+                "{}: HOST_NOT_FOUND after an earlier delete",
+                request.alias
+            ));
+            continue;
+        };
+        let request = DeleteRequest {
+            entry,
+            alias: request.alias.clone(),
+        };
+        match remove(runtime, &request) {
+            Ok(()) => {
+                deleted.push(request.alias.clone());
+                runtime.data.refresh(runtime.cli);
+            }
+            Err(error) => failed.push(format!("{}: {error}", request.alias)),
+        }
+    }
+    let mut toast = format!(
+        "✓ deleted {} of {} (u undoes one at a time)",
+        deleted.len(),
+        requests.len()
+    );
+    if !failed.is_empty() {
+        toast = format!("{toast}\n{}", failed.join("\n"));
+    }
+    done(if deleted.is_empty() {
+        Err(failed.join("\n"))
+    } else {
+        Ok(toast)
     })
 }

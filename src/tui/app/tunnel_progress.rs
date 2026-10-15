@@ -1,4 +1,4 @@
-use super::{Ctx, Effect, EffectResult, ForwardRequest, Outcome, Runtime, Screen};
+use super::{Ctx, Effect, EffectResult, ForwardRequest, Outcome, Runtime, Screen, service_bind};
 use crate::tui::widgets::block;
 use ratatui::{
     Frame,
@@ -8,9 +8,11 @@ use ratatui::{
     widgets::{Paragraph, Wrap},
 };
 use sshx::discovery::HostEntry;
-use sshx::keymap::{self, Action, Availability, InputMode, Key};
+use sshx::keymap::{self, Action, Availability, CopyTarget, InputMode, Key};
 use sshx::session::ServiceForward;
+use sshx::settings::Preferences;
 use sshx::tunnel::TunnelView;
+use std::path::Path;
 
 const NO_FORWARDS: &str = "TUNNEL_FORWARD_REQUIRED: Tunnel mode needs at least one service forward; check rows in the ports screen (⇥) first";
 
@@ -21,18 +23,27 @@ pub(crate) struct TunnelStartRequest {
     pub forwards: Vec<ForwardRequest>,
 }
 
-fn service_forward(forward: &ForwardRequest) -> ServiceForward {
+fn service_forward(forward: &ForwardRequest, bind: &str) -> ServiceForward {
     ServiceForward {
         id: forward.remote.to_string(),
         remote_port: forward.remote,
-        destination_host: "127.0.0.1".to_string(),
+        destination_host: sshx::session::LOOPBACK.to_string(),
         local_port: forward.local,
+        bind_address: bind.to_string(),
     }
 }
 
-/// Preflight problems as `(index into forwards, message)`.
-pub(super) fn issues(forwards: &[ForwardRequest]) -> Vec<(usize, String)> {
-    let services = forwards.iter().map(service_forward).collect::<Vec<_>>();
+/// Preflight problems as `(index into forwards, message)`, checked on the configured bind.
+pub(super) fn issues(forwards: &[ForwardRequest], prefs: &Preferences) -> Vec<(usize, String)> {
+    let bind = service_bind(prefs).unwrap_or_else(|_| sshx::session::LOOPBACK.to_string());
+    bound_issues(forwards, &bind)
+}
+
+fn bound_issues(forwards: &[ForwardRequest], bind: &str) -> Vec<(usize, String)> {
+    let services = forwards
+        .iter()
+        .map(|forward| service_forward(forward, bind))
+        .collect::<Vec<_>>();
     sshx::session::preflight_issues(&services)
         .into_iter()
         .filter_map(|issue| {
@@ -44,8 +55,8 @@ pub(super) fn issues(forwards: &[ForwardRequest]) -> Vec<(usize, String)> {
         .collect()
 }
 
-fn conflicts(forwards: &[ForwardRequest]) -> Vec<usize> {
-    let mut indexes = issues(forwards)
+fn conflicts(forwards: &[ForwardRequest], bind: &str) -> Vec<usize> {
+    let mut indexes = bound_issues(forwards, bind)
         .into_iter()
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
@@ -68,16 +79,73 @@ pub(super) fn remembered_forwards(ctx: &Ctx, entry: &HostEntry) -> Vec<ForwardRe
     })
 }
 
-/// Preflight the requested local ports. Without conflicts the start effect runs at once;
-/// otherwise the progress screen resolves them before anything reaches the registry.
-pub(super) fn begin(entry: &HostEntry, alias: &str, forwards: Vec<ForwardRequest>) -> Outcome {
+/// ADR 0001 §5: a request identical to an active tunnel reuses it instead of reserving its ports again.
+fn already_active(
+    prefs: &Preferences,
+    home: &Path,
+    entries: &[HostEntry],
+    request: &TunnelStartRequest,
+) -> Result<bool, String> {
+    let route = sshx::pair::paired_route(entries, &request.entry)?;
+    let target = route.as_ref().map_or(&request.entry, |route| &route.vm);
+    let forwards = super::resolve_forwards(prefs, target, &request.forwards)?;
+    Ok(match &route {
+        Some(route) => {
+            let gateway = route
+                .gateway
+                .aliases
+                .first()
+                .ok_or_else(|| "PAIR_INVALID: gateway has no alias".to_string())?;
+            sshx::tunnel::has_active_paired_request(route, home, gateway, &request.alias, &forwards)
+        }
+        None => {
+            let specs = sshx::tunnel::parse_forwards(&direct_specs(&forwards), &[], &[], false)?;
+            sshx::tunnel::has_active_direct_request(&request.entry, home, &request.alias, &specs)
+        }
+    })
+}
+
+fn direct_specs(forwards: &[ServiceForward]) -> Vec<String> {
+    forwards
+        .iter()
+        .map(|forward| {
+            let mut specification = String::new();
+            sshx::session::write_local_forward_spec(&mut specification, forward);
+            specification
+        })
+        .collect()
+}
+
+/// Preflight the requested local ports. A request identical to an active tunnel skips preflight
+/// (its own listeners would read as busy) and goes straight to the start effect, which returns
+/// the existing tunnel. Without conflicts the start effect runs at once; otherwise the progress
+/// screen resolves them before anything reaches the registry.
+pub(super) fn begin(
+    ctx: &Ctx,
+    entry: &HostEntry,
+    alias: &str,
+    forwards: Vec<ForwardRequest>,
+) -> Outcome {
     if forwards.is_empty() {
         return Outcome::Toast(NO_FORWARDS.to_string());
     }
-    let mut preflight = Preflight {
+    let bind = match service_bind(ctx.prefs) {
+        Ok(bind) => bind,
+        Err(error) => return Outcome::Toast(error),
+    };
+    let request = TunnelStartRequest {
         entry: entry.clone(),
         alias: alias.to_string(),
         forwards,
+    };
+    if already_active(ctx.prefs, ctx.home, ctx.entries, &request).unwrap_or(false) {
+        return Outcome::Effect(Effect::TunnelStart(Box::new(request)));
+    }
+    let mut preflight = Preflight {
+        entry: request.entry,
+        alias: request.alias,
+        forwards: request.forwards,
+        bind,
         log: Vec::new(),
         step: Step::Choose(0),
         error: None,
@@ -86,9 +154,57 @@ pub(super) fn begin(entry: &HostEntry, alias: &str, forwards: Vec<ForwardRequest
         Outcome::Stay => Outcome::Push(Box::new(TunnelProgress {
             alias: alias.to_string(),
             state: State::Preflight(preflight),
+            reused: false,
         })),
         other => other,
     }
+}
+
+/// Standalone tunnels for several rows at once (`space t t` in Select input mode).
+pub(crate) struct TunnelBatch {
+    pub starts: Vec<TunnelStartRequest>,
+    pub skipped: Vec<String>,
+}
+
+/// Each row starts with its remembered forwards. Rows without any, or whose local ports are
+/// busy, are reported and not started; start those alone to resolve conflicts.
+pub(super) fn begin_many(ctx: &Ctx, rows: &[(&HostEntry, &str)]) -> Outcome {
+    let bind = match service_bind(ctx.prefs) {
+        Ok(bind) => bind,
+        Err(error) => return Outcome::Toast(error),
+    };
+    let mut batch = TunnelBatch {
+        starts: Vec::new(),
+        skipped: Vec::new(),
+    };
+    for (entry, alias) in rows {
+        let forwards = remembered_forwards(ctx, entry);
+        if forwards.is_empty() {
+            batch.skipped.push(format!(
+                "{alias}: no remembered service forwards; not started (⇥ picks some)"
+            ));
+            continue;
+        }
+        let request = TunnelStartRequest {
+            entry: (*entry).clone(),
+            alias: (*alias).to_string(),
+            forwards,
+        };
+        if !already_active(ctx.prefs, ctx.home, ctx.entries, &request).unwrap_or(false)
+            && let Some((_, message)) = bound_issues(&request.forwards, &bind).into_iter().next()
+        {
+            batch
+                .skipped
+                .push(format!("{alias}: {message}; not started"));
+            continue;
+        }
+        batch.starts.push(request);
+    }
+    if batch.starts.is_empty() {
+        let lines = batch.skipped.into_iter().map(|text| (false, text));
+        return Outcome::Push(Box::new(TunnelProgress::report("tunnels", lines.collect())));
+    }
+    Outcome::Effect(Effect::TunnelStartMany(Box::new(batch)))
 }
 
 enum Step {
@@ -100,6 +216,7 @@ struct Preflight {
     entry: HostEntry,
     alias: String,
     forwards: Vec<ForwardRequest>,
+    bind: String,
     log: Vec<String>,
     step: Step,
     error: Option<String>,
@@ -107,7 +224,7 @@ struct Preflight {
 
 impl Preflight {
     fn advance(&mut self) -> Outcome {
-        match conflicts(&self.forwards).first() {
+        match conflicts(&self.forwards, &self.bind).first() {
             Some(&index) => {
                 self.step = Step::Choose(index);
                 Outcome::Stay
@@ -131,7 +248,7 @@ impl Preflight {
             .filter(|(other, _)| *other != index)
             .map(|(_, forward)| forward.local)
             .collect::<Vec<_>>();
-        sshx::tunnel::next_free_local_port(self.forwards[index].local, &reserved)
+        sshx::tunnel::next_free_local_port(&self.bind, self.forwards[index].local, &reserved)
     }
 
     fn substitute(&mut self, index: usize, port: u16) -> Outcome {
@@ -201,11 +318,14 @@ impl Preflight {
 enum State {
     Preflight(Preflight),
     Finished(Result<TunnelView, String>),
+    Report(Vec<Evidence>),
 }
 
 pub(super) struct TunnelProgress {
     alias: String,
     state: State,
+    /// The request matched a tunnel that was already active, so no new one was started.
+    reused: bool,
 }
 
 impl TunnelProgress {
@@ -214,6 +334,21 @@ impl TunnelProgress {
         Self {
             alias: alias.to_string(),
             state: State::Finished(result),
+            reused: false,
+        }
+    }
+
+    /// A list of per-row results (batch starts, refused deletes); `true` lines are marked ✓.
+    pub(super) fn report(title: &str, lines: Vec<(bool, String)>) -> Self {
+        Self {
+            alias: title.to_string(),
+            state: State::Report(
+                lines
+                    .into_iter()
+                    .map(|(ok, text)| Evidence { ok, text })
+                    .collect(),
+            ),
+            reused: false,
         }
     }
 }
@@ -244,12 +379,17 @@ fn evidence(view: &TunnelView) -> Vec<Evidence> {
             .iter()
             .filter(|forward| forward.flag() != 'R')
             .filter_map(|forward| forward.listener())
-            .map(|(_, port)| {
+            .map(|(bind, port)| {
                 let ready = view.listener_status == "bound";
+                let host = if bind == sshx::session::LOOPBACK {
+                    ""
+                } else {
+                    bind.as_str()
+                };
                 Evidence {
                     ok: ready,
                     text: format!(
-                        ":{port} listener {}",
+                        "{host}:{port} listener {}",
                         if ready {
                             "ready"
                         } else {
@@ -292,17 +432,24 @@ impl Screen for TunnelProgress {
     }
 
     fn availability(&self, _ctx: &Ctx) -> Availability {
-        Availability::default()
+        Availability {
+            tunnel_selected: matches!(self.state, State::Finished(Ok(_))),
+            ..Availability::default()
+        }
     }
 
+    /// Only the preflight hands off to the start effect; finished screens stay open after a copy.
     fn dismiss_on_outcome(&self) -> bool {
-        true
+        matches!(self.state, State::Preflight(_))
     }
 
     fn on_action(&mut self, action: Action, _count: usize, _ctx: &Ctx) -> Outcome {
-        match action {
-            Action::Back => Outcome::Pop,
-            Action::Quit => Outcome::Effect(Effect::Quit { cancelled: false }),
+        match (action, &self.state) {
+            (Action::Back, _) => Outcome::Pop,
+            (Action::Quit, _) => Outcome::Effect(Effect::Quit { cancelled: false }),
+            (Action::Copy(CopyTarget::TunnelId), State::Finished(Ok(view))) => {
+                Outcome::Effect(Effect::CopyTunnelId(view.id.clone()))
+            }
             _ => Outcome::Stay,
         }
     }
@@ -325,7 +472,11 @@ impl Screen for TunnelProgress {
     }
 
     fn draw(&self, frame: &mut Frame, area: Rect, _ctx: &Ctx) {
-        let outer = block(format!(" tunnel · {} ", self.alias), Color::Cyan);
+        let title = match self.state {
+            State::Report(_) => format!(" {} ", self.alias),
+            _ => format!(" tunnel · {} ", self.alias),
+        };
+        let outer = block(title, Color::Cyan);
         let inner = outer.inner(area);
         frame.render_widget(outer, area);
         let dim = Style::default().fg(Color::DarkGray);
@@ -340,7 +491,15 @@ impl Screen for TunnelProgress {
                 let forward = &preflight.forwards[index];
                 lines.push(Line::from(vec![
                     mark(false),
-                    Span::raw(format!(":{} port in use", forward.local)),
+                    Span::raw(format!(
+                        "{}:{} port in use",
+                        if preflight.bind == sshx::session::LOOPBACK {
+                            ""
+                        } else {
+                            preflight.bind.as_str()
+                        },
+                        forward.local
+                    )),
                     Span::styled(format!("  (remote {})", forward.remote), dim),
                 ]));
                 match &preflight.step {
@@ -374,6 +533,15 @@ impl Screen for TunnelProgress {
                 }
             }
             State::Finished(Ok(view)) => {
+                if self.reused {
+                    lines.push(Line::from(vec![
+                        mark(true),
+                        Span::raw(format!(
+                            "this request is already active as tunnel {}; nothing new started",
+                            view.id
+                        )),
+                    ]));
+                }
                 lines.extend(
                     evidence(view)
                         .into_iter()
@@ -387,6 +555,13 @@ impl Screen for TunnelProgress {
             }
             State::Finished(Err(error)) => {
                 lines.push(Line::from(vec![mark(false), Span::raw(error.clone())]));
+            }
+            State::Report(report) => {
+                lines.extend(
+                    report
+                        .iter()
+                        .map(|line| Line::from(vec![mark(line.ok), Span::raw(line.text.as_str())])),
+                );
             }
         }
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
@@ -403,14 +578,46 @@ pub(super) fn start(
     runtime: &Runtime,
     request: &TunnelStartRequest,
 ) -> Result<EffectResult, String> {
+    let data = &runtime.data;
+    let reused =
+        already_active(&data.prefs, &data.home, &data.catalog.entries, request).unwrap_or(false);
     match open(runtime, request) {
         Err(error) if interrupted(&error) => Err(error),
-        result => Ok(EffectResult {
-            push: Some(Box::new(TunnelProgress::finished(&request.alias, result))),
-            refresh: true,
-            ..EffectResult::default()
-        }),
+        result => {
+            let mut screen = TunnelProgress::finished(&request.alias, result);
+            screen.reused = reused;
+            Ok(EffectResult {
+                push: Some(Box::new(screen)),
+                refresh: true,
+                ..EffectResult::default()
+            })
+        }
     }
+}
+
+/// Starts each request in turn and reports every outcome, started or not, on one screen.
+pub(super) fn start_many(runtime: &Runtime, batch: &TunnelBatch) -> Result<EffectResult, String> {
+    let mut lines = Vec::new();
+    for request in &batch.starts {
+        match open(runtime, request) {
+            Err(error) if interrupted(&error) => return Err(error),
+            Err(error) => lines.push((false, format!("{}: {error}", request.alias))),
+            Ok(view) => {
+                lines.push((true, format!("{} → tunnel {}", request.alias, view.id)));
+                lines.extend(
+                    evidence(&view)
+                        .into_iter()
+                        .map(|line| (line.ok, format!("  {}", line.text))),
+                );
+            }
+        }
+    }
+    lines.extend(batch.skipped.iter().map(|text| (false, text.clone())));
+    Ok(EffectResult {
+        push: Some(Box::new(TunnelProgress::report("tunnels", lines))),
+        refresh: true,
+        ..EffectResult::default()
+    })
 }
 
 fn open(runtime: &Runtime, request: &TunnelStartRequest) -> Result<TunnelView, String> {
@@ -435,12 +642,7 @@ fn open(runtime: &Runtime, request: &TunnelStartRequest) -> Result<TunnelView, S
         ));
     }
     let target = route.as_ref().map_or(&request.entry, |route| &route.vm);
-    let specifications = request
-        .forwards
-        .iter()
-        .map(|forward| format!("{}={}", forward.remote, forward.local))
-        .collect::<Vec<_>>();
-    let forwards = sshx::session::resolve_forwards(target, &specifications)?;
+    let forwards = super::resolve_forwards(&data.prefs, target, &request.forwards)?;
     let response = match &route {
         Some(route) => {
             let gateway_alias = route
@@ -462,14 +664,7 @@ fn open(runtime: &Runtime, request: &TunnelStartRequest) -> Result<TunnelView, S
             )?
         }
         None => {
-            let local = forwards
-                .iter()
-                .map(|forward| {
-                    let mut specification = String::new();
-                    sshx::session::write_local_forward_spec(&mut specification, forward);
-                    specification
-                })
-                .collect::<Vec<_>>();
+            let local = direct_specs(&forwards);
             sshx::tunnel::start(
                 &request.entry,
                 &data.home,
@@ -493,11 +688,15 @@ fn open(runtime: &Runtime, request: &TunnelStartRequest) -> Result<TunnelView, S
 #[cfg(test)]
 mod tests {
     use super::{ForwardRequest, begin, conflicts, evidence};
-    use crate::tui::app::{Effect, Outcome};
+    use crate::tui::app::{Ctx, Effect, Outcome};
     use sshx::discovery::{HostEntry, SourceIdentity};
     use sshx::session::ForwardSpec;
+    use sshx::settings::Preferences;
     use sshx::tunnel::TunnelView;
+    use sshx::usage::UsageIndex;
+    use std::collections::HashMap;
     use std::net::TcpListener;
+    use std::path::Path;
 
     fn forward(remote: u16, local: u16) -> ForwardRequest {
         ForwardRequest { remote, local }
@@ -566,33 +765,71 @@ mod tests {
         }
     }
 
+    fn with_ctx<R>(run: impl FnOnce(&Ctx) -> R) -> R {
+        let usage = UsageIndex::default();
+        let prefs = Preferences::default();
+        let counts = HashMap::new();
+        run(&Ctx {
+            home: Path::new("/nonexistent-home"),
+            entries: &[],
+            visible: Vec::new(),
+            roots: &[],
+            usage: &usage,
+            tunnels: &[],
+            prefs: &prefs,
+            service_counts: &counts,
+            now: 0,
+            toast: None,
+        })
+    }
+
     #[test]
     fn busy_and_duplicate_local_ports_are_conflicts() {
         let busy = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let busy_port = busy.local_addr().unwrap().port();
         let (first, second) = (free_port(), free_port());
-        assert_eq!(conflicts(&[forward(1, first), forward(2, busy_port)]), [1]);
-        assert!(conflicts(&[forward(1, first), forward(2, second)]).is_empty());
-        assert_eq!(conflicts(&[forward(1, first), forward(2, first)]), [0, 1]);
+        let bind = "127.0.0.1";
+        assert_eq!(
+            conflicts(&[forward(1, first), forward(2, busy_port)], bind),
+            [1]
+        );
+        assert!(conflicts(&[forward(1, first), forward(2, second)], bind).is_empty());
+        assert_eq!(
+            conflicts(&[forward(1, first), forward(2, first)], bind),
+            [0, 1]
+        );
+    }
+
+    #[test]
+    fn conflicts_are_checked_on_the_configured_bind() {
+        let busy = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let busy_port = busy.local_addr().unwrap().port();
+        let elsewhere = "127.0.0.2";
+        if TcpListener::bind((elsewhere, 0)).is_err() {
+            return;
+        }
+        assert!(conflicts(&[forward(1, busy_port)], elsewhere).is_empty());
     }
 
     #[test]
     fn clear_ports_start_immediately_and_busy_ports_open_the_screen() {
         let free = free_port();
-        assert!(matches!(
-            begin(&entry(), "db", vec![forward(5432, free)]),
-            Outcome::Effect(Effect::TunnelStart(_))
-        ));
-        let busy = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let busy_port = busy.local_addr().unwrap().port();
-        assert!(matches!(
-            begin(&entry(), "db", vec![forward(5432, busy_port)]),
-            Outcome::Push(_)
-        ));
-        assert!(matches!(
-            begin(&entry(), "db", Vec::new()),
-            Outcome::Toast(_)
-        ));
+        with_ctx(|ctx| {
+            assert!(matches!(
+                begin(ctx, &entry(), "db", vec![forward(5432, free)]),
+                Outcome::Effect(Effect::TunnelStart(_))
+            ));
+            let busy = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let busy_port = busy.local_addr().unwrap().port();
+            assert!(matches!(
+                begin(ctx, &entry(), "db", vec![forward(5432, busy_port)]),
+                Outcome::Push(_)
+            ));
+            assert!(matches!(
+                begin(ctx, &entry(), "db", Vec::new()),
+                Outcome::Toast(_)
+            ));
+        });
     }
 
     #[test]

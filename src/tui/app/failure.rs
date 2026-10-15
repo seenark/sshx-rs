@@ -1,4 +1,4 @@
-use super::{ConnectRequest, Ctx, Effect, Outcome, Screen, copy::CopyRequest};
+use super::{ConnectRequest, Ctx, Effect, Outcome, Screen, copy::CopyRequest, host_form::HostForm};
 use crate::tui::widgets::block;
 use ratatui::{
     Frame,
@@ -55,6 +55,36 @@ impl Failure {
             None => vec![Span::raw(self.request.alias.clone())],
         }
     }
+
+    /// The HostEntry that failed: the gateway for a gateway hop, otherwise the selected one.
+    /// The form replaces this screen, since a saved edit makes the request stale.
+    fn edit(&self, ctx: &Ctx) -> Outcome {
+        let selected = &self.request.entry;
+        let Some(entry) = ctx
+            .entries
+            .iter()
+            .find(|entry| entry.id == selected.id && entry.source.path == selected.source.path)
+        else {
+            return Outcome::Toast(format!(
+                "HOST_NOT_FOUND: {} changed on disk",
+                self.request.alias
+            ));
+        };
+        let form = match (
+            self.failure.hop,
+            sshx::pair::paired_route(ctx.entries, entry),
+        ) {
+            (Hop::Gateway, Ok(Some(route))) => {
+                let alias = route.gateway.aliases.first().cloned().unwrap_or_default();
+                HostForm::edit(ctx, &route.gateway, &alias)
+            }
+            _ => HostForm::edit(ctx, entry, &self.request.alias),
+        };
+        match form {
+            Ok(form) => Outcome::Replace(Box::new(form)),
+            Err(error) => Outcome::Toast(error),
+        }
+    }
 }
 
 impl Screen for Failure {
@@ -75,11 +105,11 @@ impl Screen for Failure {
         true
     }
 
-    fn on_action(&mut self, action: Action, _count: usize, _ctx: &Ctx) -> Outcome {
+    fn on_action(&mut self, action: Action, _count: usize, ctx: &Ctx) -> Outcome {
         match action {
             Action::Back => Outcome::Pop,
             Action::Retry => Outcome::Effect(Effect::Connect(Box::new(self.request.clone()))),
-            Action::EditHostForm => Outcome::Toast("press cc to edit".to_string()),
+            Action::EditHostForm => self.edit(ctx),
             Action::Copy(CopyTarget::VerboseSshCommand) => {
                 Outcome::Effect(Effect::Copy(Box::new(CopyRequest {
                     target: CopyTarget::VerboseSshCommand,

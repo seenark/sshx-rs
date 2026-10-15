@@ -31,7 +31,7 @@ fn parse_bool(option: &str, value: Option<&str>) -> Result<bool, String> {
     }
 }
 
-fn validate_bind(value: &str) -> Result<String, String> {
+pub(super) fn validate_bind(value: &str) -> Result<String, String> {
     let address = if value.contains(':') && !value.starts_with('[') {
         format!("[{value}]")
     } else {
@@ -209,7 +209,7 @@ impl CommandLine {
                     } else {
                         forward_requests(&entry, &forwards)?
                     };
-                    Ok(tunnel_progress::begin(&entry, &alias, forwards))
+                    Ok(tunnel_progress::begin(ctx, &entry, &alias, forwards))
                 });
                 match started {
                     Ok(Outcome::Push(screen)) => Outcome::Replace(screen),

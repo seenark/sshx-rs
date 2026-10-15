@@ -10,6 +10,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod support;
+
+#[cfg(target_os = "macos")]
+const CLIPBOARD_TOOL: &str = "pbcopy";
+#[cfg(not(target_os = "macos"))]
+const CLIPBOARD_TOOL: &str = "wl-copy";
+
 const ORIGINAL: &str = concat!(
     "##SSHX ID=11111111-1111-4111-8111-111111111111\n",
     "Host alpha\n",
@@ -61,6 +68,31 @@ impl Fixture {
 
     fn text(&self) -> String {
         fs::read_to_string(&self.config).unwrap()
+    }
+
+    /// A fake clipboard backend ahead of the real `PATH`; returns the `PATH` to run sshx with.
+    fn clipboard_path(&self) -> String {
+        let bin = self.root.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let tool = bin.join(CLIPBOARD_TOOL);
+        fs::write(
+            &tool,
+            format!(
+                "#!/bin/sh\ncat > '{}'\n",
+                self.root.join("clipboard").display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+        format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        )
+    }
+
+    fn clipboard(&self) -> Option<String> {
+        fs::read_to_string(self.root.join("clipboard")).ok()
     }
 
     /// The finder in Normal input mode.
@@ -349,6 +381,109 @@ fn delete_is_refused_while_a_standalone_tunnel_uses_the_host() {
 }
 
 #[test]
+fn select_mode_copies_one_ssh_command_per_selected_row() {
+    let fixture = Fixture::new("select-copy", ORIGINAL);
+    let path = fixture.clipboard_path();
+    let mut terminal = fixture.open(&[("PATH", &path)]);
+    terminal.send(b"V");
+    terminal.expect("SELECT");
+    terminal.send(b"j");
+    terminal.expect("2 selected");
+    terminal.send(b"y");
+    terminal.expect("copied 2 ssh commands");
+    terminal.expect("NORMAL");
+    let config = fixture.config.display();
+    assert_eq!(
+        fixture.clipboard().unwrap(),
+        format!("ssh -F '{config}' 'alpha'\nssh -F '{config}' 'beta'")
+    );
+    terminal.send(b"q");
+    assert_eq!(terminal.finish(), Some(0));
+}
+
+#[test]
+fn select_mode_esc_and_v_leave_without_acting() {
+    let fixture = Fixture::new("select-leave", ORIGINAL);
+    let mut terminal = fixture.open(&[]);
+    terminal.send(b"V");
+    terminal.expect("SELECT");
+    terminal.send(b"j");
+    terminal.expect("2 selected");
+    terminal.send(b"\x1b");
+    terminal.expect("NORMAL");
+    terminal.send(b"V");
+    terminal.expect("SELECT");
+    terminal.send(b"k");
+    terminal.expect("2 selected");
+    terminal.send(b"V");
+    terminal.expect("NORMAL");
+    assert!(!terminal.seen_contains("not available"));
+    assert_eq!(fixture.text(), ORIGINAL);
+    terminal.send(b"q");
+    assert_eq!(terminal.finish(), Some(0));
+}
+
+#[test]
+fn select_mode_deletes_every_selected_row_after_one_confirmation() {
+    let fixture = Fixture::new("select-delete", ORIGINAL);
+    let mut terminal = fixture.open(&[]);
+    terminal.send(b"Vj");
+    terminal.expect("2 selected");
+    terminal.send(b"d");
+    terminal.expect("Delete 2 HostEntries");
+    terminal.expect("Delete alpha, beta");
+    assert_eq!(fixture.text(), ORIGINAL);
+    terminal.send(b"y");
+    terminal.expect("deleted 2 of 2");
+    assert_eq!(fixture.text().trim(), "");
+    terminal.send(b"u");
+    terminal.expect("undid delete");
+    terminal.send(b"q");
+    assert_eq!(terminal.finish(), Some(0));
+}
+
+#[test]
+fn select_mode_delete_lists_refused_pair_members_and_deletes_the_rest() {
+    let alone = ORIGINAL.replace(
+        "Host beta",
+        "##SSHX ID=22222222-2222-4222-8222-222222222222\nHost beta",
+    );
+    let text = format!("{alone}{PAIRED}");
+    let fixture = Fixture::new("select-refused", &text);
+    let mut terminal = fixture.open(&[]);
+    terminal.send(b"Vge");
+    terminal.expect("4 selected");
+    terminal.send(b"d");
+    terminal.expect("Delete 2 HostEntries");
+    terminal.expect("Refused, not deleted");
+    terminal.expect("✗ gw: DELETE_REFERENCED");
+    terminal.expect("✗ vm: DELETE_REFERENCED");
+    assert_eq!(fixture.text(), text);
+    terminal.send(b"y");
+    terminal.expect("deleted 2 of 2");
+    assert_eq!(fixture.text(), PAIRED);
+    terminal.send(b"q");
+    assert_eq!(terminal.finish(), Some(0));
+}
+
+#[test]
+fn select_mode_delete_of_only_refused_rows_shows_the_refusals_and_changes_nothing() {
+    let fixture = Fixture::new("select-all-refused", PAIRED);
+    let mut terminal = fixture.open(&[]);
+    terminal.send(b"Vj");
+    terminal.expect("2 selected");
+    terminal.send(b"d");
+    terminal.expect("delete refused");
+    terminal.expect("✗ gw: DELETE_REFERENCED");
+    terminal.expect("✗ vm: DELETE_REFERENCED");
+    assert_eq!(fixture.text(), PAIRED);
+    terminal.send(b"\x1b");
+    terminal.expect("Search:");
+    terminal.send(b"q");
+    assert_eq!(terminal.finish(), Some(0));
+}
+
+#[test]
 fn u_restores_the_file_and_ctrl_r_redoes() {
     let fixture = Fixture::new("undo", ORIGINAL);
     let mut terminal = fixture.open(&[]);
@@ -585,74 +720,6 @@ impl Drop for Terminal {
 const ROWS: u16 = 40;
 const COLUMNS: u16 = 120;
 
-/// Replays the escape stream onto a character grid and returns its text without whitespace.
-/// Handles the cursor moves, erases and alternate-screen switch ratatui emits.
 fn render(raw: &[u8]) -> String {
-    let (rows, columns) = (usize::from(ROWS), usize::from(COLUMNS));
-    let blank = || vec![vec![' '; columns]; rows];
-    let mut grid = blank();
-    let (mut row, mut column) = (0usize, 0usize);
-    let text = String::from_utf8_lossy(raw);
-    let mut characters = text.chars();
-    while let Some(character) = characters.next() {
-        match character {
-            '\x1b' => match characters.next() {
-                Some('[') => {
-                    let mut parameters = String::new();
-                    let mut last = ' ';
-                    for next in characters.by_ref() {
-                        if ('\x40'..='\x7e').contains(&next) {
-                            last = next;
-                            break;
-                        }
-                        parameters.push(next);
-                    }
-                    let numbers = parameters
-                        .split(';')
-                        .map(|part| part.trim_start_matches('?').parse::<usize>().unwrap_or(0))
-                        .collect::<Vec<_>>();
-                    let first = numbers.first().copied().unwrap_or(0).max(1);
-                    match last {
-                        'H' | 'f' => {
-                            row = first - 1;
-                            column = numbers.get(1).copied().unwrap_or(0).max(1) - 1;
-                        }
-                        'A' => row = row.saturating_sub(first),
-                        'B' => row += first,
-                        'C' => column += first,
-                        'D' => column = column.saturating_sub(first),
-                        'J' => grid = blank(),
-                        'K' => {
-                            if let Some(line) = grid.get_mut(row) {
-                                line.iter_mut().skip(column).for_each(|cell| *cell = ' ');
-                            }
-                        }
-                        'h' if parameters == "?1049" => grid = blank(),
-                        _ => {}
-                    }
-                }
-                Some(']') => {
-                    for next in characters.by_ref() {
-                        if next == '\x07' {
-                            break;
-                        }
-                    }
-                }
-                _ => {}
-            },
-            '\r' => column = 0,
-            '\n' => row += 1,
-            control if control.is_control() => {}
-            printable => {
-                if let Some(cell) = grid.get_mut(row).and_then(|line| line.get_mut(column)) {
-                    *cell = printable;
-                }
-                column += 1;
-            }
-        }
-    }
-    grid.into_iter()
-        .flatten()
-        .filter(|character| !character.is_whitespace())
-        .collect()
+    support::render(raw, usize::from(ROWS), usize::from(COLUMNS))
 }

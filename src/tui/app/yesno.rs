@@ -63,7 +63,13 @@ impl Screen for YesNo {
 
     fn draw(&self, frame: &mut Frame, area: Rect, _ctx: &Ctx) {
         let width = 64.min(area.width);
-        let height = u16::try_from(self.detail.len() + 4)
+        let inner = usize::from(width.saturating_sub(2)).max(1);
+        let wrapped: usize = self
+            .detail
+            .iter()
+            .map(|line| line.chars().count().div_ceil(inner).max(1))
+            .sum();
+        let height = u16::try_from(wrapped + 4)
             .unwrap_or(u16::MAX)
             .min(area.height);
         let [row] = Layout::vertical([Constraint::Length(height)])
