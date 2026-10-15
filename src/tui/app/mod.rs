@@ -23,10 +23,12 @@ use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
 };
+use sshx::connect::{PairedCredentials, PairedSessionCredentials, StandaloneCredentials};
 use sshx::discovery::{Catalog, HostEntry, discover_roots};
 use sshx::keymap::{
     self, Action, Availability, ForwardArg, InputMode, Key, Keymap, MenuEntry, Step,
 };
+use sshx::mutation::MutationKind;
 use sshx::session::ServiceForward;
 use sshx::settings::{self, Preferences, RegisteredRoot, StartMode};
 use sshx::tunnel::{TunnelRoute, TunnelView};
@@ -85,19 +87,109 @@ pub(crate) enum Pick {
     #[default]
     Session,
     Tunnel,
+    /// `--bind`: Enter opens the ports screen, whose Enter then connects.
+    Ports,
     Action(crate::HostAction),
     Show,
     Edit,
     Delete,
 }
 
-/// Finder behavior chosen by the CLI command, and `--forward` values every ports screen
-/// starts with.
+/// `-L`, `-R` and `-D` from the command line. They are fixed: every direct Session or Tunnel
+/// started in this run opens them next to the ports screen's service forwards.
+#[derive(Clone, Default)]
+pub(crate) struct FixedForwards {
+    pub local: Vec<String>,
+    pub remote: Vec<String>,
+    pub dynamic: Vec<String>,
+    pub allow_bind: bool,
+}
+
+impl FixedForwards {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.local.is_empty() && self.remote.is_empty() && self.dynamic.is_empty()
+    }
+
+    pub(crate) fn specs(&self) -> Result<Vec<sshx::session::ForwardSpec>, String> {
+        sshx::tunnel::parse_forwards(&self.local, &self.remote, &self.dynamic, self.allow_bind)
+    }
+
+    /// One display line per forward, as the ports screen lists them.
+    pub(crate) fn rows(&self) -> Vec<String> {
+        self.specs()
+            .unwrap_or_default()
+            .iter()
+            .map(|spec| format!("-{} {} (from command line)", spec.flag(), spec.effective))
+            .collect()
+    }
+
+    /// Pair routes accept only service forwards.
+    pub(crate) fn check_direct_route(&self) -> Result<(), String> {
+        if self.is_empty() {
+            Ok(())
+        } else {
+            Err(
+                "PAIR_FORWARD_INVALID: Pair routes accept only REMOTE[=LOCAL] service forwards"
+                    .to_string(),
+            )
+        }
+    }
+}
+
+/// `--preview` on a host form or delete confirmation: the review is printed, nothing is written.
+#[derive(Clone, Copy)]
+pub(crate) enum Preview {
+    Create,
+    Edit(MutationKind),
+}
+
+/// Finder behavior chosen by the CLI command, `--forward` values every ports screen starts
+/// with, and the forwards fixed on the command line.
 #[derive(Clone, Default)]
 pub(crate) struct Intent {
     pub pick: Pick,
     pub preselect: Vec<ForwardArg>,
     pub prefill: Prefill,
+    pub fixed: FixedForwards,
+    pub preview: Option<Preview>,
+}
+
+/// Password attempts retained across retries of one HostEntry, so a descriptor that was read
+/// once is reused instead of read again.
+#[derive(Default)]
+pub(crate) struct Credentials {
+    session: Option<(String, PairedSessionCredentials)>,
+    tunnel: Option<(String, StandaloneCredentials)>,
+}
+
+impl Credentials {
+    pub(crate) fn paired_session(
+        &mut self,
+        id: &str,
+        input: impl FnOnce() -> PairedCredentials,
+    ) -> &mut PairedSessionCredentials {
+        if self.session.as_ref().is_some_and(|(held, _)| held != id) {
+            self.session = None;
+        }
+        &mut self
+            .session
+            .get_or_insert_with(|| (id.to_string(), PairedSessionCredentials::new(input())))
+            .1
+    }
+
+    pub(crate) fn standalone(
+        &mut self,
+        id: &str,
+        password_fd: Option<i32>,
+    ) -> &mut StandaloneCredentials {
+        if self.tunnel.as_ref().is_some_and(|(held, _)| held != id) {
+            self.tunnel = None;
+        }
+        &mut self
+            .tunnel
+            .get_or_insert_with(|| (id.to_string(), StandaloneCredentials::new(password_fd)))
+            .1
+    }
 }
 
 /// A HostEntry located again in the app's own discovery.
@@ -366,6 +458,7 @@ pub(crate) struct Runtime<'a> {
     which_key: Option<WhichKey>,
     toast: Option<String>,
     undo: undo::UndoStack,
+    credentials: Credentials,
 }
 
 pub(crate) fn run_app(
@@ -462,6 +555,7 @@ impl<'a> Runtime<'a> {
             keymap: Keymap::new(),
             which_key: None,
             undo: undo::UndoStack::default(),
+            credentials: Credentials::default(),
             toast: match (initial_toast, discovery_error) {
                 (Some(toast), Some(error)) => Some(format!("{toast}\n{error}")),
                 (toast, error) => toast.or(error),

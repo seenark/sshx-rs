@@ -935,23 +935,23 @@ fn run_picker_app(
         Some(action) => tui::Pick::Action(action),
         None if matches!(cli.command, Command::Show(_)) => tui::Pick::Show,
         None if tunnel => tui::Pick::Tunnel,
+        None if cli.bind => tui::Pick::Ports,
         None => tui::Pick::Session,
     };
-    let starts_operation = matches!(pick, tui::Pick::Session | tui::Pick::Tunnel);
-    if starts_operation {
-        if !cli.local_forwards.is_empty()
-            || !cli.remote_forwards.is_empty()
-            || !cli.dynamic_forwards.is_empty()
-        {
-            return Err("TUI_FORWARD_UNSUPPORTED: -L, -R and -D forwards are not available on the ports screen; pass the HostEntry selector to run without the TUI".to_string());
+    let starts_operation = matches!(
+        pick,
+        tui::Pick::Session | tui::Pick::Tunnel | tui::Pick::Ports
+    );
+    let fixed = if starts_operation {
+        tui::FixedForwards {
+            local: cli.local_forwards.clone(),
+            remote: cli.remote_forwards.clone(),
+            dynamic: cli.dynamic_forwards.clone(),
+            allow_bind: cli.allow_bind,
         }
-        if cli.password_fd.is_some()
-            || cli.gateway_password_fd.is_some()
-            || cli.vm_password_fd.is_some()
-        {
-            return Err("TUI_PASSWORD_FD_UNSUPPORTED: password descriptors are not read by the TUI; pass the HostEntry selector to run without the TUI".to_string());
-        }
-    }
+    } else {
+        tui::FixedForwards::default()
+    };
     let preselect = cli
         .forwards
         .iter()
@@ -979,6 +979,9 @@ fn run_picker_app(
         let selected = select_connect_entry(&filtered, selector, cli, label)?;
         let route = sshx::pair::paired_route(&catalog.entries, selected.entry)?;
         check_start_route(cli, route.is_some())?;
+        if route.is_some() {
+            fixed.check_direct_route()?;
+        }
         if !cli.bind {
             let target = route.as_ref().map_or(selected.entry, |route| &route.vm);
             requested_forwards(target, cli)?;
@@ -989,6 +992,7 @@ fn run_picker_app(
         intent: tui::Intent {
             pick,
             preselect,
+            fixed,
             ..tui::Intent::default()
         },
         screen,
@@ -1611,12 +1615,6 @@ fn run_host_create_app(
     roots: &[RegisteredRoot],
     candidates: &[&RegisteredRoot],
 ) -> Result<(), String> {
-    if cli.preview {
-        return Err(
-            "PREVIEW_TUI_CONFLICT: the host form already previews the exact block; use --preview without the TUI"
-                .to_string(),
-        );
-    }
     let only = match candidates {
         [root] => Some(*root),
         _ => None,
@@ -1644,6 +1642,7 @@ fn run_host_create_app(
                 file: file.map(|file| file.to_string_lossy().into_owned()),
                 ..tui::Prefill::default()
             },
+            preview: cli.preview.then_some(tui::Preview::Create),
             ..tui::Intent::default()
         },
         screen: tui::StartScreen::NewHost,
@@ -1830,12 +1829,6 @@ fn run_host_mutation_app(
     operation: MutationKind,
     selected: Option<Selection<'_>>,
 ) -> Result<(), String> {
-    if cli.preview {
-        return Err(
-            "PREVIEW_TUI_CONFLICT: the host form already previews the exact block; use --preview without the TUI"
-                .to_string(),
-        );
-    }
     let delete = operation == MutationKind::Delete;
     let screen = match selected {
         None => tui::StartScreen::Finder,
@@ -1863,7 +1856,8 @@ fn run_host_mutation_app(
                 clear_port: cli.clear_port,
                 clear_password: cli.clear_password,
             },
-            preselect: Vec::new(),
+            preview: cli.preview.then_some(tui::Preview::Edit(operation)),
+            ..tui::Intent::default()
         },
         screen,
     };

@@ -1,5 +1,5 @@
 use super::{
-    Ctx, Effect, EffectResult, Outcome, Runtime, Screen, tunnel_progress::TunnelProgress,
+    Ctx, Effect, EffectResult, Outcome, Preview, Runtime, Screen, tunnel_progress::TunnelProgress,
     yesno::YesNo,
 };
 use crate::tui::widgets::block;
@@ -24,6 +24,7 @@ pub(super) struct DeleteConfirm {
     request: DeleteRequest,
     block: Vec<String>,
     services: usize,
+    review: Option<String>,
 }
 
 /// Why the HostEntry may not be deleted right now: Pair membership first, then the existing
@@ -54,7 +55,19 @@ impl DeleteConfirm {
         if let Some(error) = refusal(ctx, entry, alias) {
             return Err(error);
         }
-        let block = plan(entry, alias)?
+        let mut plan = plan(entry, alias)?;
+        let review = match ctx.intent.preview {
+            Some(Preview::Edit(operation)) => {
+                plan.operation = operation;
+                Some(sshx::output::render_edit(
+                    &plan,
+                    sshx::output::OutputFormat::Human,
+                    false,
+                )?)
+            }
+            _ => None,
+        };
+        let block = plan
             .files
             .iter()
             .flat_map(|file| {
@@ -71,6 +84,7 @@ impl DeleteConfirm {
             },
             block,
             services: ctx.service_count(entry),
+            review,
         })
     }
 }
@@ -94,10 +108,13 @@ impl Screen for DeleteConfirm {
 
     fn on_action(&mut self, action: Action, _count: usize, _ctx: &Ctx) -> Outcome {
         match action {
-            Action::Confirm => Outcome::Effect(Effect::DeleteHost(Box::new(DeleteRequest {
-                entry: self.request.entry.clone(),
-                alias: self.request.alias.clone(),
-            }))),
+            Action::Confirm => Outcome::Effect(match &self.review {
+                Some(review) => Effect::Print(review.clone()),
+                None => Effect::DeleteHost(Box::new(DeleteRequest {
+                    entry: self.request.entry.clone(),
+                    alias: self.request.alias.clone(),
+                })),
+            }),
             Action::Back => Outcome::Pop,
             _ => Outcome::Stay,
         }
@@ -131,7 +148,11 @@ impl Screen for DeleteConfirm {
             )));
         }
         lines.push(Line::styled(
-            "y delete   n cancel   u undoes it afterwards",
+            if self.review.is_some() {
+                "preview only: y prints the review, nothing is deleted   n cancel"
+            } else {
+                "y delete   n cancel   u undoes it afterwards"
+            },
             Style::default().fg(Color::DarkGray),
         ));
         frame.render_widget(Paragraph::new(lines), inner);

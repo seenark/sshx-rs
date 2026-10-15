@@ -3,6 +3,7 @@ use super::{
     failure::Failure, finder::Finder, host_form, input_mode, tunnels::Tunnels, undo,
 };
 use crate::tui::CANCELLED;
+use sshx::connect::PairedCredentials;
 use sshx::discovery::scope_for_path;
 use sshx::keymap;
 use sshx::settings::{self, RegisteredRoot};
@@ -94,13 +95,14 @@ fn quit(cancelled: bool) -> Result<EffectResult, String> {
 /// ends sshx; a master that failed to start shows the failure screen, and any other error
 /// (interruptions included) returns to the finder as a toast, after rediscovery because the
 /// failure may come from sources that changed on disk.
-fn connect(runtime: &Runtime, request: &ConnectRequest) -> Result<EffectResult, String> {
+fn connect(runtime: &mut Runtime, request: &ConnectRequest) -> Result<EffectResult, String> {
     let mut result = start_session(runtime, request)?;
     result.refresh |= result.exit.is_none();
     Ok(result)
 }
 
-fn start_session(runtime: &Runtime, request: &ConnectRequest) -> Result<EffectResult, String> {
+fn start_session(runtime: &mut Runtime, request: &ConnectRequest) -> Result<EffectResult, String> {
+    let cli = runtime.cli;
     let data = &runtime.data;
     if data
         .catalog
@@ -131,6 +133,15 @@ fn start_session(runtime: &Runtime, request: &ConnectRequest) -> Result<EffectRe
     {
         return Ok(changed());
     }
+    if route.is_some()
+        && let Err(error) = data.intent.fixed.check_direct_route()
+    {
+        return Ok(toast(error));
+    }
+    let direct = match data.intent.fixed.specs() {
+        Ok(direct) => direct,
+        Err(error) => return Ok(toast(error)),
+    };
     let target = route.as_ref().map_or(&request.entry, |route| &route.vm);
     let forwards = if request.forwards.is_empty() {
         Vec::new()
@@ -151,12 +162,12 @@ fn start_session(runtime: &Runtime, request: &ConnectRequest) -> Result<EffectRe
                 false,
                 gateway_alias,
                 &request.alias,
-                &mut sshx::connect::PairedSessionCredentials::new(
-                    sshx::connect::PairedCredentials {
-                        gateway_password_fd: None,
-                        vm_password_fd: None,
-                    },
-                ),
+                runtime
+                    .credentials
+                    .paired_session(&request.entry.id, || PairedCredentials {
+                        gateway_password_fd: cli.gateway_password_fd,
+                        vm_password_fd: cli.vm_password_fd.or(cli.password_fd),
+                    }),
                 &forwards,
                 true,
             )
@@ -166,9 +177,9 @@ fn start_session(runtime: &Runtime, request: &ConnectRequest) -> Result<EffectRe
             &data.home,
             false,
             &request.alias,
-            None,
+            cli.password_fd,
             &forwards,
-            &[],
+            &direct,
             true,
         ),
     };

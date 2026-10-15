@@ -421,7 +421,7 @@ impl Screen for Finder {
                         alias: alias.to_string(),
                         forwards: Vec::new(),
                     }))),
-                    Pick::Tunnel => open(Ports::open(ctx, entry, alias)),
+                    Pick::Tunnel | Pick::Ports => open(Ports::open(ctx, entry, alias)),
                     Pick::Action(action) => {
                         Outcome::Effect(Effect::HostAction(Box::new(HostActionRequest {
                             action,

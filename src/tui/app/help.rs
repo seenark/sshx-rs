@@ -61,6 +61,7 @@ fn screen_title(screen: keymap::Screen) -> &'static str {
         keymap::Screen::Tunnels => "Tunnels",
         keymap::Screen::TunnelProgress => "Tunnel progress",
         keymap::Screen::Failure => "Failure",
+        keymap::Screen::FirstRun => "First run",
         keymap::Screen::Help => "Help",
         keymap::Screen::CommandLine => "Command line",
     }

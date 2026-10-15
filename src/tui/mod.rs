@@ -9,7 +9,8 @@ mod terminal;
 mod widgets;
 
 pub(crate) use app::{
-    AppStart, HostRef, Intent, Pick, Prefill, StartScreen, run_app, run_app_with,
+    AppStart, FixedForwards, HostRef, Intent, Pick, Prefill, Preview, StartScreen, run_app,
+    run_app_with,
 };
 pub(crate) use doctor::{DoctorAction, doctor_workspace};
 pub(crate) use pair_setup::{PairSetupAction, PairSetupDraft, pair_setup_workspace};

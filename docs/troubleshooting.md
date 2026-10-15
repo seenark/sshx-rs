@@ -123,7 +123,6 @@ CI and local tests use fixtures, temporary HOME/config trees, controlled command
 
 ## TUI continuations
 
-- `TUI_FORWARD_UNSUPPORTED` / `TUI_PASSWORD_FD_UNSUPPORTED`: the ports screen only models `REMOTE[=LOCAL]` service forwards and never reads password descriptors. Run the command with a HostEntry selector (without `tui`) to use `-L`, `-R`, `-D`, or `--password-fd`.
-- `PREVIEW_TUI_CONFLICT`: the host form already previews the exact block while you type. Use `--preview` with a complete CLI command instead.
 - `TUNNEL_ROUTE_MISMATCH` after choosing a host: `tunnel direct start` needs a direct HostEntry and `tunnel paired start` a Pair VM.
+- `PAIR_FORWARD_INVALID` after `sshx tui connect VM -L ...`: a Pair route accepts only `REMOTE[=LOCAL]` service forwards; `-L`, `-R` and `-D` need a direct HostEntry.
 - A ports screen with no rows still connects with `Enter`; press `o` to add a `REMOTE[=LOCAL]` row first.

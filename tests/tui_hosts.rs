@@ -97,7 +97,8 @@ impl Fixture {
 
     /// The finder in Normal input mode.
     fn open(&self, env: &[(&str, &str)]) -> Terminal {
-        let mut terminal = Terminal::open(&self.home, &self.config, env);
+        let config = self.config.to_str().unwrap();
+        let mut terminal = Terminal::open(&self.home, &["--config", config], env);
         terminal.expect("Search:");
         terminal.send(b"\x1b");
         terminal.expect("NORMAL");
@@ -151,6 +152,68 @@ fn new_host_form_creates_the_block_on_write() {
     );
     terminal.send(b":q\r");
     terminal.expect("Search:");
+    terminal.send(b"q");
+    assert_eq!(terminal.finish(), Some(0));
+}
+
+#[test]
+fn new_host_form_with_preview_prints_the_review_and_leaves_the_file_unchanged() {
+    let fixture = Fixture::new("create-preview", ORIGINAL);
+    let mut terminal = fixture.open_with(&["tui", "host", "create", "--preview"]);
+    terminal.expect("preview only");
+    terminal.send(b"igamma\rjigamma.example\r");
+    terminal.expect("+  HostName gamma.example");
+    terminal.send(b":w\r");
+    assert_eq!(terminal.finish(), Some(0));
+    let printed = String::from_utf8_lossy(&terminal.raw).into_owned();
+    assert!(printed.contains("Preview host entry"), "{printed}");
+    assert!(printed.contains("+Host gamma"), "{printed}");
+    assert_eq!(fixture.text(), ORIGINAL);
+}
+
+#[test]
+fn edit_form_with_preview_prints_the_update_review_and_leaves_the_file_unchanged() {
+    let fixture = Fixture::new("update-preview", ORIGINAL);
+    let mut terminal = fixture.open_with(&["tui", "host", "update", "alpha", "--preview"]);
+    terminal.expect("edit host");
+    terminal.send(b"ji");
+    terminal.send(&[0x7f; 13]);
+    terminal.send(b"new.example\r");
+    terminal.expect("+  HostName new.example");
+    terminal.send(b":wq\r");
+    assert_eq!(terminal.finish(), Some(0));
+    let printed = String::from_utf8_lossy(&terminal.raw).into_owned();
+    assert!(printed.contains("(update)"), "{printed}");
+    assert!(printed.contains("+  HostName new.example"), "{printed}");
+    assert_eq!(fixture.text(), ORIGINAL);
+}
+
+#[test]
+fn delete_confirmation_with_preview_prints_the_review_and_deletes_nothing() {
+    let fixture = Fixture::new("delete-preview", ORIGINAL);
+    let mut terminal = fixture.open_with(&["tui", "host", "delete", "alpha", "--preview"]);
+    terminal.expect("preview only");
+    terminal.send(b"y");
+    assert_eq!(terminal.finish(), Some(0));
+    let printed = String::from_utf8_lossy(&terminal.raw).into_owned();
+    assert!(printed.contains("(delete)"), "{printed}");
+    assert!(printed.contains("-  CustomDirective keep-me"), "{printed}");
+    assert_eq!(fixture.text(), ORIGINAL);
+}
+
+#[test]
+fn first_run_esc_does_not_quit_and_question_mark_lists_its_keys() {
+    let fixture = Fixture::new("first-run", ORIGINAL);
+    let mut terminal = Terminal::open(&fixture.home, &[], &[]);
+    terminal.expect("Welcome to sshx");
+    terminal.send(b"\x1b");
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(terminal.child.try_wait().unwrap().is_none(), "esc quit");
+    terminal.send(b"?");
+    terminal.expect("Tick or untick config file");
+    terminal.expect("Label personal");
+    terminal.send(b"\x1b");
+    terminal.expect_gone("Tick or untick config file");
     terminal.send(b"q");
     assert_eq!(terminal.finish(), Some(0));
 }
@@ -594,6 +657,15 @@ fn ce_opens_the_editor_at_the_host_line_and_rediscovers() {
     assert_eq!(terminal.finish(), Some(0));
 }
 
+impl Fixture {
+    fn open_with(&self, args: &[&str]) -> Terminal {
+        let config = self.config.to_str().unwrap();
+        let mut full = vec!["--config", config];
+        full.extend_from_slice(args);
+        Terminal::open(&self.home, &full, &[])
+    }
+}
+
 struct Terminal {
     child: std::process::Child,
     master: File,
@@ -602,7 +674,7 @@ struct Terminal {
 }
 
 impl Terminal {
-    fn open(home: &Path, config: &Path, environment: &[(&str, &str)]) -> Self {
+    fn open(home: &Path, args: &[&str], environment: &[(&str, &str)]) -> Self {
         let mut master = -1;
         let mut slave = -1;
         let mut size = libc::winsize {
@@ -625,8 +697,7 @@ impl Terminal {
         );
         let slave = unsafe { File::from_raw_fd(slave) };
         let child = Command::new(env!("CARGO_BIN_EXE_sshx"))
-            .arg("--config")
-            .arg(config)
+            .args(args)
             .env("HOME", home)
             .envs(environment.iter().copied())
             .stdin(Stdio::from(slave.try_clone().unwrap()))
@@ -678,6 +749,15 @@ impl Terminal {
             if Instant::now() >= deadline || self.child.try_wait().unwrap().is_some() {
                 panic!("PTY did not show {marker}: {screen}");
             }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn expect_gone(&mut self, marker: &str) {
+        let unwanted = marker.split_whitespace().collect::<String>();
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while self.snapshot().contains(&unwanted) {
+            assert!(Instant::now() < deadline, "PTY still shows {marker}");
             std::thread::sleep(Duration::from_millis(10));
         }
     }
