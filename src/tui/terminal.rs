@@ -94,11 +94,20 @@ pub(super) fn with_terminal<T>(
     }
 }
 
+thread_local! {
+    /// A byte read while probing for an escape sequence that belongs to the next key.
+    static PENDING: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
+}
+
 pub(super) fn read_key(input: &mut File, prefix: &str) -> Result<KeyEvent, String> {
     let mut byte = [0u8; 1];
-    input
-        .read_exact(&mut byte)
-        .map_err(|error| format!("{prefix}: cannot read terminal input: {error}"))?;
+    if let Some(pending) = PENDING.take() {
+        byte[0] = pending;
+    } else {
+        input
+            .read_exact(&mut byte)
+            .map_err(|error| format!("{prefix}: cannot read terminal input: {error}"))?;
+    }
     let code = match byte[0] {
         b'\r' | b'\n' => KeyCode::Enter,
         b'\t' => KeyCode::Tab,
@@ -120,10 +129,15 @@ pub(super) fn read_key(input: &mut File, prefix: &str) -> Result<KeyEvent, Strin
             if prefix_byte == b'O' {
                 return Ok(match read_escape_byte(input, prefix)? {
                     Some(b'P') => KeyEvent::new(KeyCode::F(1), KeyModifiers::empty()),
+                    None => {
+                        PENDING.set(Some(b'O'));
+                        KeyEvent::new(KeyCode::Esc, KeyModifiers::empty())
+                    }
                     _ => KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
                 });
             }
             if prefix_byte != b'[' {
+                PENDING.set(Some(prefix_byte));
                 return Ok(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
             }
             let Some(sequence_byte) = read_escape_byte(input, prefix)? else {
@@ -219,5 +233,19 @@ mod tests {
         let f1 = KeyEvent::new(KeyCode::F(1), KeyModifiers::empty());
         assert_eq!(decode(b"\x1bOP"), f1);
         assert_eq!(decode(b"\x1b[11~"), f1);
+    }
+
+    #[test]
+    fn key_typed_right_after_escape_is_kept() {
+        let path = std::env::temp_dir().join(format!("sshx-key-esc-{}", std::process::id()));
+        std::fs::write(&path, b"\x1b?").unwrap();
+        let mut input = std::fs::File::open(&path).unwrap();
+        let mut next = || read_key(&mut input, "TEST").unwrap();
+        assert_eq!(next(), KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+        assert_eq!(
+            next(),
+            KeyEvent::new(KeyCode::Char('?'), KeyModifiers::empty())
+        );
+        std::fs::remove_file(path).unwrap();
     }
 }
