@@ -1,3 +1,4 @@
+mod app;
 mod connection;
 mod connection_view;
 mod doctor;
@@ -13,6 +14,7 @@ mod terminal;
 mod tunnels;
 mod widgets;
 
+pub(crate) use app::run_app;
 pub(crate) use connection::{ConnectionMode, connection_workspace};
 pub(crate) use doctor::{DoctorAction, doctor_workspace};
 pub(crate) use host_create::{HostCreateAction, host_create_workspace};
