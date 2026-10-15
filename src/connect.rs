@@ -3,6 +3,7 @@ use crate::mutation::{self, UpdateRequest};
 use crate::pair::PairedRoute;
 use crate::permissions;
 use crate::session::{self, ServiceForward};
+use crate::usage;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, IsTerminal, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -652,6 +653,11 @@ fn open_session(
             }
         }
     };
+    let _ = usage::record(
+        entry,
+        &usage::used_from_service_forwards(entry, forwards),
+        usage::now(),
+    );
     let mut service = SessionService::new();
     let master_index = service.add(runtime, master);
     if let Some(attempt) = attempt.as_ref()
@@ -791,6 +797,11 @@ fn open_paired_session(
         },
     )?;
     let vm_index = service.add(vm_runtime, vm_master);
+    let _ = usage::record(
+        &route.vm,
+        &usage::used_from_service_forwards(&route.vm, forwards),
+        usage::now(),
+    );
 
     if let Some(attempt) = credentials.gateway_attempt.as_ref() {
         save_replacement_for(service.runtime(gateway_index), attempt, no_input, "gateway")?;

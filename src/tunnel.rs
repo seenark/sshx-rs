@@ -2,6 +2,7 @@ use crate::connect;
 use crate::discovery::HostEntry;
 use crate::pair::{self, PairedRoute};
 use crate::session::{self, ServiceForward};
+use crate::usage;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -280,6 +281,11 @@ pub fn start(
         drop(runtime);
         return Err(error);
     }
+    let _ = usage::record(
+        entry,
+        &usage::used_from_specs(entry, &registry.tunnels[index].forwards),
+        usage::now(),
+    );
     let response_record = registry.tunnels[index].clone();
     let response = TunnelResponse {
         operation: "start".to_string(),
@@ -434,6 +440,11 @@ pub fn start_paired(
         drop(runtime);
         return Err(error);
     }
+    let _ = usage::record(
+        &route.vm,
+        &usage::used_from_service_forwards(&route.vm, forwards),
+        usage::now(),
+    );
     let response_record = registry.tunnels[index].clone();
     let response = TunnelResponse {
         operation: "start".to_string(),
