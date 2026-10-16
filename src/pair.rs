@@ -772,52 +772,95 @@ pub fn transit_candidates(
         .collect())
 }
 
-fn forward_matcher(
-    gateway: &ParsedEntry,
-    vm: &ParsedEntry,
-) -> impl Fn(&LocalForward) -> bool + use<> {
-    let vm_port = vm.port;
-    let vm_address = vm.loopback_address;
-    let vm_localhost = vm.localhost;
-    let valid_port = !vm.invalid_port;
-    let listener_matches = move |forward: &LocalForward| {
-        let Some((address, port)) = forward.listener else {
-            return false;
-        };
-        let is_localhost = |address: IpAddr| {
-            address == IpAddr::V4(Ipv4Addr::LOCALHOST) || address == IpAddr::V6(Ipv6Addr::LOCALHOST)
-        };
-        port == vm_port
-            && match (address, vm_address) {
-                (Some(listener), Some(vm)) => {
-                    listener == vm
-                        || (listener.is_unspecified() && listener.is_ipv4() == vm.is_ipv4())
-                }
-                (None, Some(vm)) => is_localhost(vm),
-                (Some(listener), None) => {
-                    vm_localhost && (is_localhost(listener) || listener.is_unspecified())
-                }
-                (None, None) => vm_localhost,
-            }
+/// The gateway forward listens where the VM's loopback `HostName` and `Port` point.
+fn listener_matches(forward: &LocalForward, vm: &ParsedEntry) -> bool {
+    let Some((address, port)) = forward.listener else {
+        return false;
     };
-    let mapped = valid_port && gateway.forwards.iter().any(listener_matches);
+    let is_localhost = |address: IpAddr| {
+        address == IpAddr::V4(Ipv4Addr::LOCALHOST) || address == IpAddr::V6(Ipv6Addr::LOCALHOST)
+    };
+    !vm.invalid_port
+        && port == vm.port
+        && match (address, vm.loopback_address) {
+            (Some(listener), Some(vm)) => {
+                listener == vm || (listener.is_unspecified() && listener.is_ipv4() == vm.is_ipv4())
+            }
+            (None, Some(vm)) => is_localhost(vm),
+            (Some(listener), None) => {
+                vm.localhost && (is_localhost(listener) || listener.is_unspecified())
+            }
+            (None, None) => vm.localhost,
+        }
+}
+
+fn forward_matcher<'v>(
+    gateway: &ParsedEntry,
+    vm: &'v ParsedEntry,
+) -> impl Fn(&LocalForward) -> bool + use<'v> {
+    let mapped = gateway
+        .forwards
+        .iter()
+        .any(|forward| listener_matches(forward, vm));
     move |candidate: &LocalForward| {
-        valid_port
+        !vm.invalid_port
             && if mapped {
-                listener_matches(candidate)
+                listener_matches(candidate, vm)
             } else {
-                candidate.port == vm_port
+                candidate.port == vm.port
             }
     }
 }
 
+fn eligible(entry: &ParsedEntry) -> bool {
+    !entry.gateway_marker && !entry.paired_vm_marker && !entry.proxy_command && !entry.proxy_jump
+}
+
 pub fn setup_eligible(entry: &HostEntry) -> bool {
-    parse_entry(entry).is_ok_and(|entry| {
-        !entry.gateway_marker
-            && !entry.paired_vm_marker
-            && !entry.proxy_command
-            && !entry.proxy_jump
-    })
+    parse_entry(entry).is_ok_and(|entry| eligible(&entry))
+}
+
+/// `(vm, gateway)` indexes for HostEntries that look like an unpaired VM: a loopback `HostName`
+/// and `Port` that exactly one `LocalForward` of an eligible gateway in the same file listens on.
+/// The nearest such block above the VM wins (else the nearest below), because a gateway is
+/// usually written right before its VM.
+pub fn suggested_gateways(entries: &[HostEntry]) -> Vec<(usize, usize)> {
+    let parsed = entries
+        .iter()
+        .map(|entry| parse_entry(entry).ok().filter(eligible))
+        .collect::<Vec<_>>();
+    let mut found = Vec::new();
+    for (vm_index, vm) in entries.iter().enumerate() {
+        let Some(vm_data) = &parsed[vm_index] else {
+            continue;
+        };
+        let gateway = entries
+            .iter()
+            .enumerate()
+            .filter(|(index, gateway)| {
+                *index != vm_index
+                    && gateway.source.path == vm.source.path
+                    && !same_entry(gateway, vm)
+                    && parsed[*index].as_ref().is_some_and(|data| {
+                        data.forwards
+                            .iter()
+                            .filter(|forward| listener_matches(forward, vm_data))
+                            .count()
+                            == 1
+                    })
+            })
+            .min_by_key(|(_, gateway)| {
+                let start = gateway.source.byte_start;
+                (
+                    start > vm.source.byte_start,
+                    start.abs_diff(vm.source.byte_start),
+                )
+            });
+        if let Some((gateway_index, _)) = gateway {
+            found.push((vm_index, gateway_index));
+        }
+    }
+    found
 }
 
 pub fn deletion_reference(entry: &HostEntry, entries: &[HostEntry]) -> Option<String> {
@@ -1190,7 +1233,7 @@ fn is_boundary(bytes: &[u8], line: (usize, usize, usize)) -> bool {
 }
 #[cfg(test)]
 mod tests {
-    use super::{diagnostics, paired_route, records};
+    use super::{diagnostics, paired_route, records, suggested_gateways};
     use crate::discovery::{DiscoveryRoot, HostEntry, SourceIdentity, discover_roots};
     use std::fs;
 
@@ -1362,5 +1405,28 @@ mod tests {
                 .any(|finding| finding.message.contains("used by multiple HostEntries")),
             "{findings:?}"
         );
+    }
+
+    #[test]
+    fn each_vm_is_suggested_the_nearest_gateway_listening_on_its_port() {
+        // Several gateways forward the same local port; only position tells their VMs apart.
+        let config = concat!(
+            "Host gw-a\n  HostName a.example\n  LocalForward 2222 10.0.0.1:22\n",
+            "Host vm-a\n  HostName 127.0.0.1\n  Port 2222\n",
+            "Host gw-b\n  HostName b.example\n  LocalForward 2222 10.0.0.2:22\n",
+            "Host vm-b\n  HostName localhost\n  Port 2222\n",
+            "Host remote\n  HostName 10.0.0.3\n  Port 2222\n",
+        );
+        let path =
+            std::env::temp_dir().join(format!("sshx-pair-suggest-{}.conf", std::process::id()));
+        fs::write(&path, config).unwrap();
+        let catalog = discover_roots(&[DiscoveryRoot::new(&path, "personal", None)]).unwrap();
+        let alias = |index: usize| catalog.entries[index].aliases[0].as_str();
+        let found = suggested_gateways(&catalog.entries)
+            .into_iter()
+            .map(|(vm, gateway)| (alias(vm), alias(gateway)))
+            .collect::<Vec<_>>();
+        fs::remove_file(path).unwrap();
+        assert_eq!(found, [("vm-a", "gw-a"), ("vm-b", "gw-b")]);
     }
 }

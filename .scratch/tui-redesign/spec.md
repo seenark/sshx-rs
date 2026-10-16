@@ -110,7 +110,8 @@ A modal TUI in the style of Helix and Neovim:
 
 59. As an sshx user, I want `o` to open a single-screen form for a new HostEntry, so that I don't answer a question sequence.
 60. As an sshx user, I want only alias and host required, with user and port showing their defaults, so that a minimal host takes seconds.
-61. As an sshx user, I want a `via` field with fuzzy search over existing HostEntries that writes `ProxyJump`, so that jump hosts are easy to set.
+61. As an sshx user, I want a `via` field with fuzzy search over existing HostEntries that pairs the HostEntry with that gateway after a review, so that jump hosts are easy to set and sshx can connect through them. (Revised: `via` first wrote `ProxyJump`, which direct connect rejects with `UNSUPPORTED_DIRECTIVE`.)
+61a. As an sshx user, I want a VM whose loopback `HostName:Port` matches one gateway `LocalForward` in the same file marked `↳? gateway`, with `Enter` offering to pair and connect (`y`), connect directly (`d`), or cancel (`n`), and `c p` to pair without connecting, so that I never have to remember which gateway a VM needs.
 62. As an sshx user editing a gateway or VM, I want a read-only `pair: gateway → VM` line instead of `via`, so that I don't break the Pair route.
 63. As an sshx user, I want a `pass` field that stores the password through the existing password-safety checks, so that insecure files are refused.
 64. As an sshx user, I want a `file` field to pick the config root or included file to write into, so that hosts land where I keep them.
@@ -224,7 +225,7 @@ A modal TUI in the style of Helix and Neovim:
 ### Host form, delete, undo
 
 - The form drives the existing reviewed mutation engine (create, update, delete plans). The live preview replaces the separate mutation review screen for this path. The engine underneath is unchanged.
-- `via` writes `ProxyJump` (OpenSSH directive pass-through) and is hidden on Pair members, which show a read-only Pair line instead. Pair creation stays in the existing pair setup flow.
+- `via` names a Pair gateway, prefilled with the suggested gateway. `:w` writes the other field changes, then opens the Pair review, which applies the existing journaled Pair setup mutation. `via` is hidden on Pair members, which show a read-only Pair line instead. The form no longer writes `ProxyJump`; `ce` edits it by hand.
 - Password storage keeps the existing file-mode check.
 - Edits rewrite only the HostEntry's byte span.
 - `ce` launches `$EDITOR +<line> <file>` and rediscovers when it exits.
@@ -303,7 +304,6 @@ A modal TUI in the style of Helix and Neovim:
 - OSC 52 clipboard fallback.
 - Light/dark themes. The terminal's default colors are used.
 - sshpass copy for Pairs.
-- Creating Pairs from the host form. Pair setup keeps its existing flow.
 - Undo for Pair mutations, and undo across sshx processes.
 - Returning to the finder after a session ends.
 - Settings downgrade support for older sshx binaries.

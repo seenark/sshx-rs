@@ -34,6 +34,7 @@ pub(super) fn execute(runtime: &mut Runtime, effect: Effect) -> Result<EffectRes
         Effect::DeleteHosts(requests) => delete::delete_many(runtime, &requests),
         Effect::TunnelStartMany(batch) => super::tunnel_progress::start_many(runtime, &batch),
         Effect::HostAction(request) => host_action(runtime, &request),
+        Effect::Pair(request) => super::pair::apply(runtime, &request),
         Effect::Print(text) => {
             print!("{text}");
             quit(false)
@@ -95,7 +96,10 @@ fn quit(cancelled: bool) -> Result<EffectResult, String> {
 /// ends sshx; a master that failed to start shows the failure screen, and any other error
 /// (interruptions included) returns to the finder as a toast, after rediscovery because the
 /// failure may come from sources that changed on disk.
-fn connect(runtime: &mut Runtime, request: &ConnectRequest) -> Result<EffectResult, String> {
+pub(super) fn connect(
+    runtime: &mut Runtime,
+    request: &ConnectRequest,
+) -> Result<EffectResult, String> {
     let mut result = start_session(runtime, request)?;
     result.refresh |= result.exit.is_none();
     Ok(result)

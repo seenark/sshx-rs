@@ -603,3 +603,34 @@ fn pair_vm_failure_names_the_vm_hop() {
     tui.expect("NORMAL");
     quit(tui);
 }
+
+#[test]
+fn enter_on_a_vm_behind_a_gateway_pairs_it_and_connects_through_the_gateway() {
+    let fixture = Fixture::new(
+        concat!(
+            "Host gateway\n  HostName gateway.example\n  LocalForward 2222 vm.internal:22\n",
+            "Host vm\n  HostName 127.0.0.1\n  Port 2222\n",
+        ),
+        FAKE_PAIRED_SSH,
+        QUIET,
+    );
+    let mut tui = Tui::start(&fixture, &[]);
+    tui.expect("Search:");
+    tui.send("vm");
+    tui.expect("↳? gateway");
+    tui.send("\r");
+    tui.expect("vm looks like a VM behind gateway.");
+    tui.send("y");
+    let (status, output) = tui.finish();
+    assert!(status.success(), "status={status:?} output={output}");
+    assert!(output.contains("paired-shell"), "{output}");
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("masters")).unwrap(),
+        "GATEWAY\nVM\n"
+    );
+    let config = fs::read_to_string(&fixture.config).unwrap();
+    assert!(
+        config.contains("##SSHX TRANSIT=vm.internal:22\n"),
+        "{config}"
+    );
+}

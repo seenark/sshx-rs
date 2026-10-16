@@ -833,6 +833,7 @@ mod tests {
             tunnels: &[],
             prefs: &prefs,
             service_counts: &counts,
+            via: &std::collections::HashMap::new(),
             intent: &intent,
             now: 0,
             toast: None,

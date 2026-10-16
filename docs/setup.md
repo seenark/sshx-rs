@@ -103,7 +103,8 @@ sshx doctor --format json
 
 - Empty search shows a RECENT group (from per-HostEntry usage state), then every HostEntry grouped by config root. A typed query sorts by fuzzy rank, then use frequency, then alias. Duplicate aliases keep their source and ID labels. `⇄N` counts declared services.
 - A preview pane shows the route (direct, or `gateway → VM` for a Pair), HostName, declared services, and last use. It collapses below 70 columns.
-- `Enter` opens Session mode immediately with no service forwards and no prompts. After the session ends, sshx exits with ssh's exit code.
+- Rows show `↳ gateway` for a Pair VM and `↳? gateway` for a VM that looks unpaired (see [Pair from the Hosts TUI](#pair-from-the-hosts-tui)).
+- `Enter` opens Session mode immediately with no service forwards and no prompts. After the session ends, sshx exits with ssh's exit code. On a `↳?` row it first offers to pair the VM with that gateway.
 - Movement: `j`/`k` or arrows, counts such as `5j`, `gg`, `ge`, `^d`, `^u`. `g r`, `g p`, `g w` jump to the recent, personal, and work groups; `g t` opens the tunnel list. `space f p|w|r` filter to the personal root, work root, or recent HostEntries; repeating a filter clears it.
 - A which-key box opens on every prefix key (`space`, `g`, `y`, `d`, `c`, `Z`); `Esc` or `Backspace` goes up one level. `?` (Normal input mode, or Insert with an empty search) and `F1` open help, grouped by section and filterable.
 - `:` opens a command line with `Tab` completion: `:q`, `:help`, `:ssh HOST [REMOTE[=LOCAL]...]`, `:set OPTION[=VALUE]`, `:root add|remove PATH`, `:tunnel list`. `:set` persists `startmode` (`insert`|`normal`), `autoinfo` (`false` hides the which-key box), `bind` (loopback only), `clipboard_clear` (`off` or seconds), and `password_confirm` in the sshx settings file.
@@ -246,6 +247,28 @@ sshx connect vm-alias
 ```
 
 Gateway and VM passwords can be supplied separately with `--gateway-password-fd` and `--vm-password-fd`. A paired route never replaces the source `LocalForward`, `HostName`, or `Port` in the user's config.
+
+### Pair from the Hosts TUI
+
+A VM looks unpaired when its `HostName` is loopback or `localhost` and exactly one `LocalForward` of a gateway in the same file listens on its address and `Port`, for example:
+
+```
+Host pdms-analytics
+  HostName 61.47.34.14
+  LocalForward 2222 192.168.100.111:22
+
+Host pdms-analytics-vm
+  HostName 127.0.0.1
+  Port 2222
+```
+
+When several gateways forward the same local port, the nearest gateway written above the VM is suggested. The finder marks the VM `↳? pdms-analytics`.
+
+- `Enter` on that row shows the inferred transit and the `##SSHX` lines Pair setup adds: `y` pairs and connects through the gateway, `d` connects directly as before, `n` cancels.
+- `c p` reviews the same Pair without connecting. With no suggested gateway it opens the host form on `via`.
+- In the host form, `via` names the Pair gateway and is filled in with the suggestion. `:w` writes any other field changes, then reviews the Pair. `via` no longer writes `ProxyJump`.
+
+After `y`, the Pair lives in the config files: every later `Enter`, `sshx connect`, or tunnel on the VM goes through the gateway, and the gateway stays a normal HostEntry you can connect to on its own. Pair setup is journaled and is not on the `u` undo stack; unlink it from `sshx tui pair list`.
 
 ## Service forwards
 

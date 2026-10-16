@@ -1,5 +1,8 @@
 use super::{
-    Ctx, Effect, EffectResult, Outcome, Preview, Runtime, Screen, help::Help, undo::Rekey,
+    Ctx, Effect, EffectResult, Outcome, Preview, Runtime, Screen,
+    help::Help,
+    pair::{Opened, PairConfirm, gateway_by_alias},
+    undo::Rekey,
 };
 use crate::tui::matcher::matching_rows;
 use crate::tui::widgets::{block, password_backspace, password_insert};
@@ -63,7 +66,8 @@ impl Field {
             Field::Alias | Field::Host => "required",
             Field::User => "ssh default",
             Field::Port => "22",
-            Field::Via | Field::Key | Field::Pass => "none",
+            Field::Key | Field::Pass => "none",
+            Field::Via => "no gateway (pick one to pair)",
             Field::File => "",
         }
     }
@@ -109,6 +113,8 @@ pub(crate) struct SaveRequest {
     write: HostWrite,
     alias: String,
     close: bool,
+    /// Gateway alias from `via`; its Pair is reviewed once the HostEntry is written.
+    pair_with: Option<String>,
 }
 
 pub(crate) struct EditorRequest {
@@ -277,19 +283,26 @@ impl HostForm {
             .port
             .map(|port| port.to_string())
             .unwrap_or_default();
-        values[Field::Via as usize] = current.proxy_jump.unwrap_or_default();
+        // `via` names a Pair gateway; a likely one is filled in so pairing is one `:w` away.
+        let suggested = ctx
+            .suggested_gateway(entry)
+            .and_then(|gateway| gateway.aliases.first().cloned())
+            .unwrap_or_default();
         values[Field::Key as usize] = current.identity_file.unwrap_or_default();
         values[Field::File as usize] = entry.source.path.clone();
         if current.has_password {
             values[Field::Pass as usize] = STORED_PASSWORD.to_string();
         }
+        // `via` is pairing, not a directive: its baseline is always empty.
+        let original = values.clone();
+        values[Field::Via as usize] = suggested;
         let mut form = Self {
             mode: InputMode::Normal,
             command: None,
             edit: Some(Edit {
                 entry: Box::new(entry.clone()),
                 alias: alias.to_string(),
-                original: values.clone(),
+                original,
                 had_password: current.has_password,
             }),
             fields: Field::ALL
@@ -306,6 +319,14 @@ impl HostForm {
         };
         form.refresh();
         Ok(form)
+    }
+
+    /// Opens on `via`, for `c p` on a HostEntry no gateway was found for.
+    pub(super) fn focus_via(mut self) -> Self {
+        if let Some(index) = self.fields.iter().position(|field| *field == Field::Via) {
+            self.focus = index;
+        }
+        self
     }
 
     /// Values from CLI flags; `file` only applies to a new HostEntry.
@@ -390,6 +411,16 @@ impl HostForm {
         }
     }
 
+    /// The gateway alias typed into `via` that the HostEntry is not yet paired with.
+    fn pair_with(&self) -> Option<String> {
+        let via = self.text(Field::Via);
+        let original = self
+            .edit
+            .as_ref()
+            .map_or("", |edit| edit.original[Field::Via as usize].as_str());
+        (!via.is_empty() && via != original).then(|| via.to_string())
+    }
+
     /// The write the form describes, `None` when an edit changes nothing.
     fn build(&self) -> Result<Option<HostWrite>, String> {
         let port = self.port()?;
@@ -413,7 +444,6 @@ impl HostForm {
                 port,
                 new_password,
             );
-            request.proxy_jump = optional(Field::Via).map(str::to_string);
             request.identity_file = optional(Field::Key).map(str::to_string);
             return Ok(Some(HostWrite::Create(Box::new(request))));
         };
@@ -435,8 +465,6 @@ impl HostForm {
             ..UpdateRequest::default()
         };
         (request.user, request.clear_user) = self.change(Field::User, original(Field::User));
-        (request.proxy_jump, request.clear_proxy_jump) =
-            self.change(Field::Via, original(Field::Via));
         (request.identity_file, request.clear_identity_file) =
             self.change(Field::Key, original(Field::Key));
         if self.text(Field::Port) != original(Field::Port).trim() {
@@ -452,12 +480,10 @@ impl HostForm {
             && request.user.is_none()
             && request.port.is_none()
             && request.password.is_none()
-            && request.proxy_jump.is_none()
             && request.identity_file.is_none()
             && !(request.clear_user
                 || request.clear_port
                 || request.clear_password
-                || request.clear_proxy_jump
                 || request.clear_identity_file);
         Ok((!unchanged).then(|| HostWrite::Update {
             request: Box::new(request),
@@ -466,17 +492,39 @@ impl HostForm {
     }
 
     fn refresh(&mut self) {
+        let pair = self.pair_with().map(|gateway| {
+            format!(
+                "then pair: {gateway} → {} (reviewed next)",
+                self.text(Field::Alias)
+            )
+        });
         self.preview = match self.build() {
             Ok(Some(write)) => write.preview(),
+            Ok(None) if pair.is_some() => Ok(Vec::new()),
             Ok(None) => Ok(vec!["no changes".to_string()]),
             Err(error) => Err(error),
-        };
+        }
+        .map(|mut lines| {
+            lines.extend(pair);
+            lines
+        });
     }
 
     fn save(&self, close: bool, ctx: &Ctx) -> Outcome {
+        let pair_with = self.pair_with();
         match self.build() {
             Err(error) => Outcome::Toast(error),
-            Ok(None) => Outcome::Toast("no changes to write".to_string()),
+            Ok(None) => match (&self.edit, pair_with) {
+                (Some(edit), Some(gateway)) => {
+                    match gateway_by_alias(ctx, &gateway).and_then(|gateway| {
+                        PairConfirm::new(ctx, gateway, &edit.entry, &edit.alias, Opened::Pair)
+                    }) {
+                        Ok(confirm) => Outcome::Replace(Box::new(confirm)),
+                        Err(error) => Outcome::Toast(error),
+                    }
+                }
+                _ => Outcome::Toast("no changes to write".to_string()),
+            },
             Ok(Some(write)) => match ctx.intent.preview {
                 Some(preview) => match write.review(preview) {
                     Ok(text) => Outcome::Effect(Effect::Print(text)),
@@ -486,6 +534,7 @@ impl HostForm {
                     write,
                     alias: self.text(Field::Alias).to_string(),
                     close,
+                    pair_with,
                 }))),
             },
         }
@@ -818,7 +867,23 @@ pub(super) fn save(runtime: &mut Runtime, request: &SaveRequest) -> Result<Effec
     if runtime.stack.len() > 1 {
         runtime.stack.pop();
     }
-    if !request.close {
+    if let Some(gateway) = &request.pair_with {
+        runtime.data.refresh(runtime.cli);
+        let ctx = runtime.data.ctx(None);
+        let confirm = ctx
+            .entries
+            .iter()
+            .find(|entry| entry.id == id && entry.aliases.contains(&request.alias))
+            .ok_or_else(|| format!("PAIR_SELECTION: {} is no longer current", request.alias))
+            .and_then(|vm| {
+                let gateway = gateway_by_alias(&ctx, gateway)?;
+                PairConfirm::new(&ctx, gateway, vm, &request.alias, Opened::Pair)
+            });
+        match confirm {
+            Ok(confirm) => result.push = Some(Box::new(confirm)),
+            Err(error) => result.toast = Some(format!("✓ saved {}; {error}", request.alias)),
+        }
+    } else if !request.close {
         runtime.data.refresh(runtime.cli);
         let ctx = runtime.data.ctx(None);
         result.push = ctx

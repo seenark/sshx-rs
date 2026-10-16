@@ -302,25 +302,48 @@ fn edit_of_a_host_without_id_adds_one_and_keeps_everything_else() {
     assert_eq!(terminal.finish(), Some(0));
 }
 
+const UNPAIRED: &str = concat!(
+    "Host gw\n",
+    "  HostName gateway.example\n",
+    "  LocalForward 2222 vm.internal:22\n",
+    "Host vm\n",
+    "  HostName 127.0.0.1\n",
+    "  Port 2222\n",
+);
+
 #[test]
-fn via_picks_an_existing_alias_and_writes_proxy_jump() {
-    let fixture = Fixture::new("via", ORIGINAL);
+fn via_offers_the_gateway_and_pairs_after_review() {
+    let fixture = Fixture::new("via", UNPAIRED);
     let mut terminal = fixture.open(&[]);
-    terminal.send(b"o");
-    terminal.expect("new host");
-    terminal.send(b"igamma\rjigamma.example\r");
-    terminal.expect("HostName gamma.example");
-    terminal.send(b"jjji");
-    terminal.send(b"alph");
-    terminal.expect("↳ alpha");
-    terminal.send(b"\r");
-    terminal.expect("+  ProxyJump alpha");
-    terminal.send(b":wq\r");
-    terminal.expect("Search:");
-    assert_eq!(
-        without_new_id(&fixture.text(), ORIGINAL),
-        "Host gamma\n  HostName gamma.example\n  ProxyJump alpha\n"
-    );
+    terminal.expect("↳? gw");
+    terminal.send(b"j");
+    terminal.send(b"cc");
+    terminal.expect("edit host · vm");
+    terminal.expect("then pair: gw → vm (reviewed next)");
+    terminal.send(b":w\r");
+    terminal.expect("Connect to vm through gw.");
+    terminal.expect("transit vm.internal:22");
+    terminal.send(b"y");
+    terminal.expect("✓ paired gw → vm");
+    terminal.expect("↳ gw");
+    let text = fixture.text();
+    assert!(text.contains("##SSHX GATEWAY="), "{text}");
+    assert!(text.contains("##SSHX TRANSIT=vm.internal:22\n"), "{text}");
+    assert!(!text.contains("ProxyJump"), "{text}");
+    terminal.send(b"q");
+    assert_eq!(terminal.finish(), Some(0));
+}
+
+#[test]
+fn declining_the_pair_review_leaves_the_files_alone() {
+    let fixture = Fixture::new("via-declined", UNPAIRED);
+    let mut terminal = fixture.open(&[]);
+    terminal.send(b"j");
+    terminal.send(b"cp");
+    terminal.expect("Connect to vm through gw.");
+    terminal.send(b"n");
+    terminal.expect("↳? gw");
+    assert_eq!(fixture.text(), UNPAIRED);
     terminal.send(b"q");
     assert_eq!(terminal.finish(), Some(0));
 }
