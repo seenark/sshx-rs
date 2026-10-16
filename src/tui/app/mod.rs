@@ -7,6 +7,7 @@ mod finder;
 mod first_run;
 mod help;
 mod host_form;
+mod pair;
 mod ports;
 mod status;
 mod tunnel_progress;
@@ -267,6 +268,7 @@ pub(crate) enum Effect {
     DeleteHosts(Vec<delete::DeleteRequest>),
     TunnelStartMany(Box<tunnel_progress::TunnelBatch>),
     HostAction(Box<effects::HostActionRequest>),
+    Pair(Box<pair::PairRequest>),
     Print(String),
 }
 
@@ -333,6 +335,7 @@ pub(crate) struct Ctx<'a> {
     pub tunnels: &'a [TunnelView],
     pub prefs: &'a Preferences,
     pub service_counts: &'a HashMap<String, usize>,
+    pub via: &'a HashMap<String, Via>,
     pub intent: &'a Intent,
     pub now: u64,
     pub toast: Option<&'a str>,
@@ -356,6 +359,21 @@ impl Ctx<'_> {
             last_used: self.usage.last_used(entry).filter(|time| *time > 0),
         }
     }
+
+    /// The gateway `pair::suggested_gateways` found for an unpaired VM.
+    pub(crate) fn suggested_gateway(&self, entry: &HostEntry) -> Option<&HostEntry> {
+        match self.via.get(&entry.id)? {
+            Via::Suggested(index) => self.entries.get(*index),
+            Via::Paired(_) => None,
+        }
+    }
+}
+
+/// The gateway in front of a HostEntry: its Pair's gateway alias, or the index of the gateway
+/// `pair::suggested_gateways` found for an unpaired VM.
+pub(crate) enum Via {
+    Paired(String),
+    Suggested(usize),
 }
 
 struct Data {
@@ -368,6 +386,7 @@ struct Data {
     tunnels: Vec<TunnelView>,
     prefs: Preferences,
     service_counts: HashMap<String, usize>,
+    via: HashMap<String, Via>,
     intent: Intent,
     tunnel_route: Option<TunnelRoute>,
 }
@@ -387,6 +406,7 @@ impl Data {
             tunnels: &self.tunnels,
             prefs: &self.prefs,
             service_counts: &self.service_counts,
+            via: &self.via,
             intent: &self.intent,
             now: sshx::usage::now(),
             toast,
@@ -434,6 +454,15 @@ impl Data {
                 (count > 0).then(|| (entry.id.clone(), count))
             })
             .collect();
+        self.via = sshx::pair::records(&self.catalog.entries)
+            .into_iter()
+            .map(|record| (record.vm_id, Via::Paired(record.gateway_alias)))
+            .collect();
+        for (vm, gateway) in sshx::pair::suggested_gateways(&self.catalog.entries) {
+            self.via
+                .entry(self.catalog.entries[vm].id.clone())
+                .or_insert(Via::Suggested(gateway));
+        }
         self.refresh_tunnels();
         error
     }
@@ -531,6 +560,7 @@ impl<'a> Runtime<'a> {
             tunnels: Vec::new(),
             prefs: settings::load_preferences(home)?,
             service_counts: HashMap::new(),
+            via: HashMap::new(),
             intent: start.intent,
             tunnel_route: match &start.screen {
                 StartScreen::Tunnels { route, .. } => *route,

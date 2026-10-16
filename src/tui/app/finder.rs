@@ -1,10 +1,11 @@
 use super::{
-    ConnectRequest, Ctx, Effect, Outcome, Pick, Screen, ScreenStatus,
+    ConnectRequest, Ctx, Effect, Outcome, Pick, Screen, ScreenStatus, Via,
     cmdline::CommandLine,
     copy::CopyRequest,
     delete::{self, DeleteConfirm},
     effects::HostActionRequest,
     host_form::{EditorRequest, HostForm, open},
+    pair::{Opened, PairConfirm},
     ports::Ports,
     tunnel_progress, tunnels,
 };
@@ -284,7 +285,13 @@ impl Finder {
                 route.gateway.aliases.first().map_or("?", String::as_str),
                 row.row.alias
             ),
-            Ok(None) => "direct".to_string(),
+            Ok(None) => match ctx.suggested_gateway(entry) {
+                Some(gateway) => format!(
+                    "direct; looks like a VM behind {} (c p pairs)",
+                    gateway.aliases.first().map_or("?", String::as_str)
+                ),
+                None => "direct".to_string(),
+            },
             Err(error) => error,
         };
         let services = match sshx::session::declared_services(entry) {
@@ -416,11 +423,20 @@ impl Screen for Finder {
                 };
                 let (entry, alias) = (row.row.entry, row.row.alias);
                 return match ctx.intent.pick {
-                    Pick::Session => Outcome::Effect(Effect::Connect(Box::new(ConnectRequest {
-                        entry: entry.clone(),
-                        alias: alias.to_string(),
-                        forwards: Vec::new(),
-                    }))),
+                    Pick::Session => match ctx.suggested_gateway(entry) {
+                        Some(gateway) => open(PairConfirm::new(
+                            ctx,
+                            gateway,
+                            entry,
+                            alias,
+                            Opened::Connect,
+                        )),
+                        None => Outcome::Effect(Effect::Connect(Box::new(ConnectRequest {
+                            entry: entry.clone(),
+                            alias: alias.to_string(),
+                            forwards: Vec::new(),
+                        }))),
+                    },
                     Pick::Tunnel | Pick::Ports => open(Ports::open(ctx, entry, alias)),
                     Pick::Action(action) => {
                         Outcome::Effect(Effect::HostAction(Box::new(HostActionRequest {
@@ -480,6 +496,21 @@ impl Screen for Finder {
                         Outcome::Effect(Effect::EditInEditor(Box::new(EditorRequest::new(entry))))
                     }
                     _ => open(DeleteConfirm::new(ctx, entry, alias)),
+                };
+            }
+            Action::PairHost => {
+                let Some(row) = rows.get(self.selected.min(last)) else {
+                    return Outcome::Stay;
+                };
+                let (entry, alias) = (row.row.entry, row.row.alias);
+                return match (ctx.via.get(&entry.id), ctx.suggested_gateway(entry)) {
+                    (Some(Via::Paired(gateway)), _) => {
+                        Outcome::Toast(format!("{alias} is already paired behind {gateway}"))
+                    }
+                    (_, Some(gateway)) => {
+                        open(PairConfirm::new(ctx, gateway, entry, alias, Opened::Pair))
+                    }
+                    _ => open(HostForm::edit(ctx, entry, alias).map(HostForm::focus_via)),
                 };
             }
             Action::Undo => return Outcome::Effect(Effect::Undo),
@@ -657,13 +688,33 @@ impl Screen for Finder {
                         } else {
                             String::new()
                         };
+                        let via = match ctx.via.get(&row.row.entry.id) {
+                            Some(Via::Paired(gateway)) => format!("  ↳ {gateway}"),
+                            Some(Via::Suggested(index)) => format!(
+                                "  ↳? {}",
+                                ctx.entries[*index]
+                                    .aliases
+                                    .first()
+                                    .map_or("", String::as_str)
+                            ),
+                            None => String::new(),
+                        };
                         let label = row.label.clone();
-                        let used =
-                            marker.chars().count() + label.chars().count() + badge.chars().count();
+                        let used = marker.chars().count()
+                            + label.chars().count()
+                            + via.chars().count()
+                            + badge.chars().count();
                         let pad = width.saturating_sub(used).max(1);
                         ListItem::new(TextLine::from(vec![
                             Span::styled(marker, Style::default().fg(Color::Yellow)),
                             Span::raw(label),
+                            Span::styled(
+                                via,
+                                Style::default().fg(match ctx.via.get(&row.row.entry.id) {
+                                    Some(Via::Suggested(_)) => Color::Yellow,
+                                    _ => Color::DarkGray,
+                                }),
+                            ),
                             Span::raw(" ".repeat(pad)),
                             Span::styled(badge, Style::default().fg(Color::Cyan)),
                         ]))

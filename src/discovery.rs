@@ -507,8 +507,20 @@ fn parse_file(path: &Path) -> Result<ParsedFile, DiscoveryError> {
                     .find(|alias| !alias.starts_with('!') && !has_magic(alias))
                     .cloned()
             });
+        // Same block rule as pair metadata: the `##SSHX` run right above `Host` belongs to it, and
+        // a trailing `##SSHX` run belongs to the next Host.
+        let is_metadata = |index: usize| lines[index].text.trim().starts_with("##SSHX");
+        let metadata_start = (block_start..line_index)
+            .rev()
+            .take_while(|index| is_metadata(*index) || lines[*index].text.trim().is_empty())
+            .last()
+            .unwrap_or(line_index);
+        let mut metadata_end = end_line_index;
+        while metadata_end > line_index + 1 && is_metadata(metadata_end - 1) {
+            metadata_end -= 1;
+        }
         let persistent_id =
-            (block_start..end_line_index).find_map(|index| sshx_id(&lines[index].text));
+            (metadata_start..metadata_end).find_map(|index| sshx_id(&lines[index].text));
         let byte_start = lines[line_index].start;
         let byte_end = end_line_index
             .checked_sub(1)
@@ -875,7 +887,7 @@ fn display_path(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::wildcard_match;
+    use super::{parse_file, wildcard_match};
 
     #[test]
     fn wildcard_matching_supports_glob_tokens() {
@@ -884,5 +896,38 @@ mod tests {
         assert!(wildcard_match("[ab].conf", "a.conf"));
         assert!(wildcard_match("host[12].conf", "host2.conf"));
         assert!(!wildcard_match("[ab].conf", "c.conf"));
+    }
+
+    #[test]
+    fn metadata_above_the_next_host_is_not_claimed_by_the_previous_one() {
+        let path = std::env::temp_dir().join(format!("sshx-discovery-ids-{}", std::process::id()));
+        std::fs::write(
+            &path,
+            concat!(
+                "Host plain\n",
+                "  HostName plain.example\n",
+                "# comment\n",
+                "\n",
+                "##SSHX VM=22222222-2222-4222-8222-222222222222\n",
+                "##SSHX ID=11111111-1111-4111-8111-111111111111\n",
+                "Host gateway\n",
+                "  HostName gateway.example\n",
+            ),
+        )
+        .unwrap();
+        let ids = parse_file(&path)
+            .unwrap()
+            .hosts
+            .into_iter()
+            .map(|host| host.persistent_id)
+            .collect::<Vec<_>>();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            ids,
+            [
+                None,
+                Some("11111111-1111-4111-8111-111111111111".to_string())
+            ]
+        );
     }
 }

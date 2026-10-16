@@ -212,6 +212,7 @@ pub enum Action {
     EditHostForm,
     EditHostInEditor,
     DeleteHost,
+    PairHost,
     Undo,
     Redo,
     CommandLine,
@@ -497,6 +498,7 @@ static BINDINGS: &[Binding] = &[
     bind("o", NORMAL, FINDER, A::NewHost, S::Hosts, "New host (form)"),
     bind("c c", NORMAL, FINDER, A::EditHostForm, S::Hosts, "Edit host (form)").req(Row),
     bind("c e", NORMAL, FINDER, A::EditHostInEditor, S::Hosts, "Edit host in $EDITOR").req(Row),
+    bind("c p", NORMAL, FINDER, A::PairHost, S::Hosts, "Pair with a gateway").req(Row),
     bind("d d", NORMAL, FINDER, A::DeleteHost, S::Hosts, "Delete host").req(Row),
     bind("d", SELECT, FINDER, A::DeleteHost, S::Hosts, "Delete selected hosts").req(Row),
     bind("u", NORMAL, FINDER_PORTS, A::Undo, S::Hosts, "Undo"),
@@ -539,7 +541,7 @@ static BINDINGS: &[Binding] = &[
     bind("Z Z", NORMAL, FORM, A::WriteQuit, S::Form, "Save and close form").cmd("wq"),
 
     // Delete confirmation
-    bind("y", NORMAL, CONFIRM, A::Confirm, S::Hosts, "Confirm delete"),
+    bind("y", NORMAL, CONFIRM, A::Confirm, S::Hosts, "Confirm"),
     bind("n", NORMAL, CONFIRM, A::Back, S::Hosts, "Cancel"),
 
     // Failure
@@ -1116,6 +1118,7 @@ mod tests {
         assert_eq!(run("yy", n, f), act(Copy(CopyTarget::SshCommand)));
         assert_eq!(run("cc", n, f), act(EditHostForm));
         assert_eq!(run("ce", n, f), act(EditHostInEditor));
+        assert_eq!(run("cp", n, f), act(PairHost));
         assert_eq!(run("dd", n, f), act(DeleteHost));
         assert_eq!(run("o", n, f), act(NewHost));
         assert_eq!(run("u", n, f), act(Undo));
@@ -1273,7 +1276,7 @@ mod tests {
             ("g", "Goto", vec!["g", "e", "r", "p", "w", "t"]),
             ("y", "Yank", vec!["y", "p", "w", "h", "i"]),
             ("d", "Delete", vec!["d"]),
-            ("c", "Change", vec!["c", "e"]),
+            ("c", "Change", vec!["c", "e", "p"]),
         ] {
             let mut km = Keymap::new();
             let Step::Pending { title: t, entries } = feed_seq(&mut km, prefix, n, f, &ROW) else {
@@ -1593,6 +1596,7 @@ mod tests {
             EditHostForm,
             EditHostInEditor,
             DeleteHost,
+            PairHost,
             Undo,
             Redo,
             CommandLine,
