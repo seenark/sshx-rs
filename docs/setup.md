@@ -37,7 +37,7 @@ sshx --version
 To pin a version:
 
 ```sh
-mise use -g github:seenark/sshx-rs@0.2.1
+mise use -g github:seenark/sshx-rs@0.3.0
 ```
 
 By default, mise's unpinned latest resolution excludes releases younger than 24 hours. The unpinned command may select an older eligible stable release or find none immediately after publication. An explicit version pin bypasses this age filter and can install the newly published version immediately, without changing the default policy. See mise's [minimum release age security policy](https://mise.jdx.dev/security.html#minimum-release-age) and [setting reference](https://mise.jdx.dev/configuration/settings.html#minimum_release_age).

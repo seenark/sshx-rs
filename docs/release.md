@@ -22,8 +22,8 @@ The smoke test checks:
 Package a previously built target directly:
 
 ```sh
-./scripts/package-release.sh 0.2.1 x86_64-unknown-linux-gnu dist
-./scripts/verify-release-archive.sh 0.2.1 x86_64-unknown-linux-gnu dist
+./scripts/package-release.sh 0.3.0 x86_64-unknown-linux-gnu dist
+./scripts/verify-release-archive.sh 0.3.0 x86_64-unknown-linux-gnu dist
 ```
 
 Supported targets:
